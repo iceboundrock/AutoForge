@@ -346,16 +346,25 @@ def settle(labels, need: Callable[[object], int] = lambda _: 1):
     """The settled verdict, or ``None`` when the labels leave it unknown.
 
     A curator's proposal never settles anything. Adjudicators must agree, at
-    least ``need(verdict)`` of them (two for a critical defect); a disagreement
-    stays unknown unless arbiters, all of one verdict, settle it.
+    least ``need(verdict)`` of them (two for a critical defect, either way, and
+    for a match to one); a disagreement stays unknown unless arbiters, all of
+    one verdict, settle it. An arbiter decides between adjudicators and never
+    stands in for one: a verdict that needs two adjudicators is settled by
+    arbitration only when two adjudicators gave it, while one that needs one
+    is the arbiters' to give.
     """
+    votes = Counter(verdict_of(label) for label in labels if counted(label, "adjudicator"))
     arbiters = {verdict_of(label) for label in labels if counted(label, "arbiter")}
     if arbiters:
-        return next(iter(arbiters)) if len(arbiters) == 1 else None
-    votes = [verdict_of(label) for label in labels if counted(label, "adjudicator")]
-    if len(set(votes)) != 1:
+        if len(arbiters) != 1:
+            return None
+        verdict = next(iter(arbiters))
+        required = need(verdict)
+        return verdict if required <= 1 or votes[verdict] >= required else None
+    if len(votes) != 1:
         return None
-    return votes[0] if len(votes) >= need(votes[0]) else None
+    verdict, count = next(iter(votes.items()))
+    return verdict if count >= need(verdict) else None
 
 
 def critical_needs_two(severity: str) -> Callable[[object], int]:
@@ -598,28 +607,37 @@ def plain(text: str) -> str:
 # an HTML tag. ``rendered`` models what CommonMark (with GitHub's footnotes)
 # shows of a text, so the record check reads each value both as written and as
 # rendered. It is a model, not a renderer: what it does not model it reads as
-# prose. Its work is linear in the text, but for a link's destination and
-# title, which it scans within ``MARKUP_BUDGET`` times the text's length.
+# prose. It reads a text's blocks line by line as cmark does (``blocks``): the
+# block quotes and list items each line continues, and in them the code
+# blocks, HTML blocks, headings and paragraphs; then the inline markup of each
+# paragraph and heading, which never runs from one block into another, and of
+# each HTML block. Its work is linear in the text, but for a link's destination
+# and title, which it scans within ``MARKUP_BUDGET`` times the text's length.
 
-# One of a line's block quote and list markers, before the block the line
-# holds: a block quote's ``>``, or a list item's bullet or number.
-MARKER = re.compile(r"[ \t]{0,3}(?:(>)[ \t]?|([-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$))")
-# A code fence (its run, then its info string), and a line no paragraph
-# continues past: an ATX heading or a thematic break.
+# A line, its line ending included. CommonMark ends a line at a line feed, a
+# carriage return or both (``rendered`` makes each a line feed), and at
+# nothing else.
+LINE = re.compile(r"[^\n]*\n|[^\n]+\Z")
+SPACES = re.compile(r" *")
+# A code fence: its run, then its info string.
 FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
-HEADING = re.compile(
-    r" {0,3}(?:#{1,6}(?:[ \t].*)?|(?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})"
-)
-# The underline that makes the paragraph above it a heading (a line of ``-``
-# is ``HEADING``'s thematic break, which ends a paragraph as well).
-SETEXT = re.compile(r" {0,3}=+[ \t]*")
-# How any of those three can start, which most lines do not.
-OPENING = re.compile(r" {0,3}[#*\-_=`~]")
+# A line that is a block of its own: an ATX heading or a thematic break; and
+# the underline that makes the paragraph above it a heading.
+ATX = re.compile(r" {0,3}#{1,6}(?: .*)?")
+THEMATIC = {char: re.compile(rf"(?:{re.escape(char)} *)+") for char in "-_*"}
+UNDERLINE = re.compile(r" {0,3}(?:=+|-+) *")
+# A list item's marker, a bullet or a number of up to nine digits and its
+# delimiter, before a space or the line's end.
+LIST_MARKER = re.compile(r"(?:[-+*]|([0-9]{1,9})[.)])(?= |$)")
+# The characters any block but a paragraph or indented code starts with.
+OPENERS = frozenset(">#`~<=-_*+0123456789")
 # A link reference definition (CommonMark 4.7) starts with its label and a
 # colon, the label on one line or several, never ``^`` first (a footnote's);
 # then its destination, in angle brackets or bare, and an optional title, each
 # after spaces and at most one line break, the last of them ending its line.
-DEFINITION = re.compile(r" {0,3}\[((?:[^\[\]\\]|\\.){1,999})\]:", re.DOTALL)
+# cmark reads one where a paragraph's line, its indentation stripped, starts
+# with its ``[``.
+DEFINITION = re.compile(r"\[((?:[^\[\]\\]|\\.){1,999})\]:", re.DOTALL)
 POINTY = re.compile(r"<(?:[^<>\\\n\r]|\\[^\n\r])*>")
 TITLE = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|\((?:[^()\\]|\\.)*\)", re.DOTALL)
 LINE_REST = re.compile(r"[ \t]*(?=\n|\Z)")
@@ -628,17 +646,56 @@ LABEL = r"((?:[^\[\]\\\n]|\\.)+)"
 FOOTNOTE = re.compile(rf" {{0,3}}\[\^{LABEL}\]:")
 # A full reference's label, just after its link text: ``[text][label]``.
 REFERENCE = re.compile(r"\[((?:[^\[\]\\]|\\.){0,999})\]", re.DOTALL)
-# A raw HTML open or closing tag, as CommonMark defines one.
+# Raw HTML as CommonMark defines it. A tag is an open tag (its name, its
+# attributes, each set apart by whitespace, and an optional ``/``) or a
+# closing tag (its name alone). Whitespace is spaces and tabs and, in a
+# paragraph, at most one line ending; at an HTML block's start, which reads
+# its own line, none.
+TAG_NAME = r"[A-Za-z][A-Za-z0-9-]*"
+ATTRIBUTE_VALUE = r"[^ \t\n\"'=<>`]+|'[^']*'|\"[^\"]*\""
+
+
+def tag_grammar(optional: str, required: str) -> str:
+    """An open or a closing tag, ``optional`` and ``required`` its whitespace."""
+    attribute = (
+        rf"{required}[A-Za-z_:][A-Za-z0-9_.:-]*(?:{optional}={optional}(?:{ATTRIBUTE_VALUE}))?"
+    )
+    return rf"<{TAG_NAME}(?:{attribute})*{optional}/?>|</{TAG_NAME}{optional}>"
+
+
+# Inline raw HTML: a tag, a processing instruction, a declaration or a CDATA
+# section (an HTML comment is ``comments``'s).
 TAG = re.compile(
-    r"</?[A-Za-z][A-Za-z0-9-]*"
-    r"(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?)*"
-    r"\s*/?>"
+    tag_grammar(r"[ \t]*(?:\n[ \t]*)?", r"(?:[ \t]+(?:\n[ \t]*)?|\n[ \t]*)")
+    + r"|<\?.*?\?>|<![A-Za-z][^>]*>|<!\[CDATA\[.*?\]\]>",
+    re.DOTALL,
 )
+# How each kind of HTML block starts and what line ends it (CommonMark 4.6):
+# ``None`` for a blank line.
+VERBATIM = "pre|script|style|textarea"
+BLOCK_NAMES = (
+    "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd"
+    "|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset"
+    "|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol"
+    "|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr"
+    "|track|ul"
+)
+HTML_BLOCKS: tuple[tuple[re.Pattern, re.Pattern | None], ...] = (
+    (re.compile(rf"<(?:{VERBATIM})(?:[ >]|$)", re.I), re.compile(rf"</(?:{VERBATIM})>", re.I)),
+    (re.compile(r"<!--"), re.compile(r"-->")),
+    (re.compile(r"<\?"), re.compile(r"\?>")),
+    (re.compile(r"<![A-Za-z]"), re.compile(r">")),
+    (re.compile(r"<!\[CDATA\["), re.compile(r"\]\]>")),
+    (re.compile(rf"</?(?:{BLOCK_NAMES})(?:[ >]|/>|$)", re.I), None),
+)
+# The seventh kind: a whole tag of any other name alone on its line, which
+# cannot interrupt a paragraph.
+LINE_TAG = tag_grammar(r"[ \t]*", r"[ \t]+")
+HTML_LINE = re.compile(rf"(?!</?(?i:{VERBATIM})(?![A-Za-z0-9-]))(?:{LINE_TAG}) *$")
 BACKTICKS = re.compile(r"`+")
-PARAGRAPH_BREAK = re.compile(r"\n[ \t\r]*(?=\n|$)")
 # What the inline scan stops at: an escape (a backslash before ASCII
-# punctuation), a bracket, a paragraph break.
-INLINE = re.compile(r"\\[!-/:-@\[-`{-~]|[\[\]]|\n[ \t\r]*(?=\n|$)")
+# punctuation) or a bracket.
+INLINE = re.compile(r"\\[!-/:-@\[-`{-~]|[\[\]]")
 SPACE = re.compile(r"[ \t]*(?:\r\n|\n|\r)?[ \t]*")
 # A bare destination's run up to a parenthesis, a backslash, a space or an
 # ASCII control character, any of which it stops at.
@@ -657,7 +714,7 @@ def label_key(label: str) -> str:
 def code_spans(text: str, breaks: list[int]) -> list[tuple[int, int]]:
     """Where ``text``'s code spans stand: each a run of backticks up to the next
     run of the same length in its paragraph, which a renderer shows as written.
-    ``breaks`` are where the text's paragraph breaks start."""
+    ``breaks`` are where each paragraph's or heading's last line ends."""
     runs = [match.span() for match in BACKTICKS.finditer(text)]
     following: list[int | None] = [None] * len(runs)
     last: dict[int, int] = {}
@@ -735,43 +792,71 @@ def link_end(text: str, at: int, bound: int) -> tuple[int | None, int]:
     return (end + 1 if end < size and text[end] == ")" else None), end - at
 
 
-def comments(text: str) -> list[tuple[int, int]]:
+def segments(size: int, breaks: list[int]) -> Iterable[tuple[int, int]]:
+    """The spans ``breaks`` cut a text of ``size`` characters into: each
+    paragraph's or heading's own, with what lies between it and the next."""
+    return zip([0, *breaks], [*breaks, size], strict=True)
+
+
+def comments(text: str, breaks: list[int]) -> list[tuple[int, int]]:
     """Where ``text``'s HTML comments stand, each from ``<!--`` to the next
-    ``-->``: none after an opening that nothing closes."""
-    spans, at = [], 0
-    while (start := text.find("<!--", at)) != -1 and (end := text.find("-->", start + 4)) != -1:
-        spans.append((start, end + 3))
-        at = end + 3
+    ``-->`` of its block: none after an opening its block does not close."""
+    spans = []
+    for start, stop in segments(len(text), breaks):
+        at = start
+        while (begin := text.find("<!--", at, stop)) != -1 and (
+            end := text.find("-->", begin + 4, stop)
+        ) != -1:
+            spans.append((begin, end + 3))
+            at = end + 3
     return spans
 
 
-def inline_markup(text: str, links: set, notes: set) -> list[tuple[int, int]]:
-    """The spans of ``text`` outside code that a renderer does not show: raw
-    HTML tags and comments, a link's or image's destination and title, a
-    defined reference's label and a defined footnote's marker."""
-    breaks = [match.start() for match in PARAGRAPH_BREAK.finditer(text)]
+def raw_markup(text: str) -> list[tuple[int, int]]:
+    """The spans of HTML blocks' ``text`` a renderer does not show: their tags
+    and comments. Nothing else of an HTML block is markup."""
+    hushed = comments(text, [])
+    flat = list(text)
+    for start, end in hushed:
+        flat[start:end] = "-" * (end - start)
+    return [match.span() for match in TAG.finditer("".join(flat))] + hushed
+
+
+def inline_markup(text: str, breaks: list[int], links: set, notes: set) -> list[tuple[int, int]]:
+    """The spans of paragraphs' and headings' ``text`` outside code that a
+    renderer does not show: raw HTML tags and comments, a link's or image's
+    destination and title, a defined reference's label and a defined
+    footnote's marker. ``breaks`` are where each block's last line ends, which
+    none of them runs past."""
     flat = list(text)
     for start, end in code_spans(text, breaks):
         flat[start:end] = "`" * (end - start)
-    hushed = comments("".join(flat))
+    hushed = comments("".join(flat), breaks)
     for start, end in hushed:
         flat[start:end] = "-" * (end - start)  # nothing in a comment is shown
     masked = "".join(flat)
-    out = [match.span() for match in TAG.finditer(masked)]
+    out = [
+        match.span()
+        for start, stop in segments(len(masked), breaks)
+        for match in TAG.finditer(masked, start, stop)
+    ]
     starts = [start for start, _ in out]
     ends = [end for _, end in out]
     budget = MARKUP_BUDGET * len(text) + 4096
     openers: list[tuple[int, bool]] = []  # each open bracket, and whether an image's
     floor = at = 0  # brackets before ``floor`` open no link; read up to ``at``
+    block = 0  # the index of the break that ends the block being read
     for match in INLINE.finditer(masked):
         i = match.start()
+        while block < len(breaks) and breaks[block] < i:
+            openers.clear()  # a link never spans two blocks
+            block += 1
+        bound = breaks[block] if block < len(breaks) else len(text)
         tag = bisect_right(starts, i) - 1
         if i < at or (tag >= 0 and i < ends[tag]):
             continue
         token = match.group()
-        if token.startswith("\n"):
-            openers.clear()  # a link never spans a paragraph break
-        elif token == "[":
+        if token == "[":
             openers.append((i, masked[i - 1 : i] == "!"))
         elif token == "]" and openers:
             start, image = openers.pop()
@@ -784,12 +869,10 @@ def inline_markup(text: str, links: set, notes: set) -> list[tuple[int, int]]:
             ):
                 out.append((start, i + 1))
             elif masked.startswith("(", i + 1):
-                paragraph = bisect_left(breaks, i)
-                bound = breaks[paragraph] if paragraph < len(breaks) else len(text)
                 end, read = link_end(masked, i + 2, bound)
                 budget -= read
                 require(budget >= 0, "a value the reviewer reads is within the markup bound")
-                if end is not None:
+                if end is not None and end <= bound:
                     out.append((i + 1, end))
                     at = end
                     if not image:
@@ -797,7 +880,7 @@ def inline_markup(text: str, links: set, notes: set) -> list[tuple[int, int]]:
             elif (
                 (reference := REFERENCE.match(masked, i + 1))
                 and len(reference[1]) <= MAX_LABEL
-                and not PARAGRAPH_BREAK.search(reference[1])
+                and reference.end() <= bound
                 and label_key(reference[1]) in links
             ):
                 out.append((i + 1, reference.end()))
@@ -807,35 +890,22 @@ def inline_markup(text: str, links: set, notes: set) -> list[tuple[int, int]]:
     return out + hushed
 
 
-def containers(body: str) -> tuple[int, int, bool]:
-    """A line's block quote and list markers: where its content starts past
-    them, how many block quotes it is in, and whether its first list marker
-    opens an item that can interrupt a paragraph (a bullet, or the number 1,
-    holding something, as CommonMark has it)."""
-    match = MARKER.match(body)
-    if match is None:
-        return 0, 0, False
-    at = depth = 0
-    first = None
-    while match:
-        at = match.end()
-        if match[1]:
-            depth += 1
-        elif first is None:
-            first = match[2]
-        match = MARKER.match(body, at)
-    item = (
-        first is not None and (first in "-+*" or int(first[:-1]) == 1) and bool(body[at:].strip())
-    )
-    return at, depth, item
-
-
-def fence_opening(content: str) -> re.Match | None:
-    """The code fence ``content`` opens, if it opens one."""
-    if not OPENING.match(content):
-        return None
-    opened = FENCE.fullmatch(content)
+def fence_opening(body: str, at: int) -> re.Match | None:
+    """The code fence ``body`` opens at ``at``, if it opens one."""
+    opened = FENCE.fullmatch(body, at)
     return None if opened is None or (opened[1][0] == "`" and "`" in opened[2]) else opened
+
+
+def html_block(body: str, at: int, interrupting: bool) -> tuple[re.Pattern | None] | None:
+    """The HTML block ``body`` starts at ``at``, if it starts one, as what ends
+    it (``None``: a blank line). ``interrupting``: the line would otherwise
+    continue a paragraph, which the seventh kind cannot interrupt."""
+    if not body.startswith("<", at):
+        return None
+    for start, ending in HTML_BLOCKS:
+        if start.match(body, at):
+            return (ending,)
+    return None if interrupting or not HTML_LINE.match(body, at) else (None,)
 
 
 def definition(text: str, at: int) -> tuple[str, int] | None:
@@ -874,65 +944,280 @@ def definition(text: str, at: int) -> tuple[str, int] | None:
     return None if rest is None else (label[1], rest.end())
 
 
-def definitions(
-    lines: list[str], index: int, at: int, lead: int, depth: int, drop: list, links: set
-) -> int:
-    """The link reference definitions a paragraph whose first line is
-    ``lines[index]``, at offset ``at``, its content from ``lead`` and in
-    ``depth`` block quotes, starts with: each label joins ``links`` and each
-    definition, all its lines, joins ``drop``. Returns how many lines they
-    span.
+# A paragraph's line: its place in the text read inline, where its content
+# starts and its line ends, and its content as cmark keeps it.
+Row = tuple[int, int, int, str]
 
-    The paragraph's lines run to a blank line, or to a line that opens
-    another block: a fence, a heading, a thematic break, a setext underline,
-    a list item that can interrupt it or a block quote it is not in. A line
-    in fewer block quotes than the first continues it lazily.
-    """
-    first = lines[index].rstrip("\r\n")
-    if not first[lead : lead + 4].lstrip(" ").startswith("["):
+
+def resolve(rows: list[Row], drop: list, links: set) -> int:
+    """The link reference definitions the paragraph of ``rows`` starts with:
+    each label joins ``links`` and each definition, all its lines, joins
+    ``drop``. Returns how many of the rows they span."""
+    if not rows or not rows[0][3].startswith("["):
         return 0
-    contents = [first[lead:]]
-    spans = [(at + lead, at + len(first))]
-    offset = at + len(lines[index])
-    # A label is decided within its 999 characters (escapes count two), so
-    # the paragraph is read on only once one has closed.
-    size, decided = len(contents[0]), False
-    for following in range(index + 1, len(lines)):
-        if not decided and size > 2 * MAX_LABEL + 8:
-            if DEFINITION.match("\n".join(contents)) is None:
-                return 0
-            decided = True
-        line = lines[following]
-        body = line.rstrip("\r\n")
-        start, inside, item = containers(body)
-        content = body[start:]
-        if (
-            inside > depth
-            or item
-            or not content.strip()
-            or (
-                OPENING.match(content) is not None
-                and (
-                    HEADING.fullmatch(content) is not None
-                    or (inside == depth and SETEXT.fullmatch(content) is not None)
-                    or fence_opening(content) is not None
-                )
-            )
-        ):
-            break
-        contents.append(content)
-        spans.append((offset + start, offset + len(body)))
-        offset += len(line)
-        size += len(content) + 1
-    text = "\n".join(contents)
+    text = "\n".join(row[3] for row in rows)
     consumed = position = 0
-    while consumed < len(contents) and (found := definition(text, position)):
+    while consumed < len(rows) and (found := definition(text, position)):
         label, stop = found
         links.add(label_key(label))
         last = consumed + text.count("\n", position, stop)
-        drop.append((spans[consumed][0], spans[last][1]))
+        drop.append((rows[consumed][1], rows[last][2]))
         consumed, position = last + 1, stop + 1
     return consumed
+
+
+@dataclass
+class Item:
+    """An open list item: how far its content is indented past its parent's
+    content, and whether it holds a block yet."""
+
+    width: int
+    filled: bool
+
+
+@dataclass
+class Blocks:
+    """A text's blocks, as ``blocks`` reads them."""
+
+    prose: list[str]  # each line as paragraphs and headings show it inline
+    raw: dict[int, str]  # each line of an HTML block, as it shows it, by line
+    breaks: list[int]  # where each paragraph's or heading's last line ends
+    drop: list[tuple[int, int]]  # what the blocks themselves do not show
+    links: set[str]  # the reference labels the text defines
+    notes: set[str]  # and its footnotes
+
+
+def blank(line: str) -> str:
+    """``line`` as spaces, its line ending kept."""
+    body = line.removesuffix("\n")
+    return " " * len(body) + line[len(body) :]
+
+
+def blocks(text: str) -> Blocks:
+    """``text``'s blocks (its line endings line feeds, its tabs spaces), read
+    line by line as cmark reads them (CommonMark's appendix, "A parsing
+    strategy").
+
+    Each line first continues the block quotes and list items it can: a quote
+    by its ``>``, an item by its indentation (or a blank line, once the item
+    holds a block). It then closes the code, HTML or paragraph open in them,
+    or continues it: a fence up to its closing fence, read only past the
+    fence's own containers, an indented code block while its lines are
+    indented, an HTML block up to its end. What the line does not continue
+    closes: a fence or a code block ends where its container ends, and only
+    a paragraph continues lazily, by a line that opens nothing. The line may
+    then open block quotes and list items, and a block: a fence, an HTML
+    block, a heading or a thematic break, an indented code block (never
+    interrupting a paragraph), or a paragraph. A paragraph's lines, its
+    indentation stripped, start with its link reference definitions, read
+    when it closes, or when an underline would make it a heading: it is one
+    only if more than definitions remain.
+
+    Every line of ``prose``, and of ``raw`` (an HTML block's lines alone),
+    keeps its offsets: what the line does not show inline (its container
+    markers, its code, a definition) is spaces, and in ``prose`` so is all but
+    a paragraph or a heading.
+    """
+    scan = Blocks(prose=[], raw={}, breaks=[], drop=[], links=set(), notes=set())
+    prose, raw = scan.prose, scan.raw
+    stack: list[Item | None] = []  # the open containers, a block quote as None
+    quotes: list[int] = []  # where the stack's block quotes stand in it
+    leaf: str | None = None  # the open block: "paragraph", "fence", "html" or "code"
+    fence = ("", 0)  # the open fence's character and length
+    ending: re.Pattern | None = None  # what ends the open HTML block
+    rows: list[Row] = []  # the open paragraph's lines
+
+    def definitions() -> int:
+        consumed = resolve(rows, scan.drop, scan.links)
+        for index, *_ in rows[:consumed]:
+            prose[index] = blank(prose[index])
+        return consumed
+
+    def close_paragraph() -> None:
+        definitions()
+        scan.breaks.append(rows[-1][2])
+        rows.clear()
+
+    def indentation(body: str, at: int) -> int:
+        if not body.startswith(" ", at):
+            return 0
+        return SPACES.match(body, at).end() - at  # type: ignore[union-attr]
+
+    at = 0
+    for line in LINE.findall(text):
+        body = line.removesuffix("\n")
+        end = at + len(body)
+        newline = line[len(body) :]
+        # The open block quotes and list items the line continues.
+        pos = matched = 0
+        while matched < len(stack):
+            container = stack[matched]
+            spaces = indentation(body, pos)
+            if container is None:
+                if spaces > 3 or not body.startswith(">", pos + spaces):
+                    break
+                pos += spaces + 1
+                if body.startswith(" ", pos):
+                    pos += 1
+            elif spaces >= container.width:
+                pos += container.width
+            elif pos + spaces == len(body):
+                # Blank from here: each item continues up to the next block
+                # quote, which does not, but for one that holds nothing yet
+                # (only the innermost can), so a blank line costs no more
+                # however deep its items are nested.
+                later = bisect_left(quotes, matched)
+                matched = quotes[later] if later < len(quotes) else len(stack)
+                if matched == len(stack) and not stack[-1].filled:  # type: ignore[union-attr]
+                    matched -= 1
+                pos = len(body)
+                break
+            else:
+                break
+            matched += 1
+        complete = matched == len(stack)
+        # The open fence, HTML block or indented code the line continues.
+        if complete and leaf == "fence":
+            closing = FENCE.fullmatch(body, pos)
+            if (
+                closing
+                and closing[1][0] == fence[0]
+                and len(closing[1]) >= fence[1]
+                and not closing[2].strip(" ")
+            ):
+                leaf = None
+            prose.append(blank(line))
+            at += len(line)
+            continue
+        if complete and leaf == "html":
+            if ending is not None or body[pos:].strip(" "):
+                prose.append(blank(line))
+                raw[len(prose) - 1] = " " * pos + body[pos:] + newline
+                if ending is not None and ending.search(body, pos):
+                    leaf = None
+                at += len(line)
+                continue
+            leaf = None  # a blank line ends it, and is a blank line
+        if complete and leaf == "code":
+            if indentation(body, pos) >= 4 or not body[pos:].strip(" "):
+                prose.append(blank(line))
+                at += len(line)
+                continue
+            leaf = None
+        # The block quotes, list items and block the line opens.
+        tip = leaf == "paragraph"
+        interrupting = complete and tip  # the line would continue the paragraph
+        opened: list[Item | None] = []
+        start = None
+        opening = None
+        # No thematic break starts before where one failed: a run of its
+        # character and spaces, from any later start, fails where it did.
+        unbroken = 0
+        while True:
+            spaces = indentation(body, pos)
+            first = pos + spaces
+            if spaces >= 4 or first == len(body):
+                break
+            char = body[first]  # which block it can open, most lines none
+            if char not in OPENERS:
+                break
+            if char == ">":
+                opened.append(None)
+                pos = first + 1
+                if body.startswith(" ", pos):
+                    pos += 1
+                interrupting = False
+                continue
+            if char == "#" and ATX.fullmatch(body, pos):
+                start = "heading"
+            elif char in "`~" and (opening := fence_opening(body, pos)):
+                start = "fence"
+            elif char == "<" and (found := html_block(body, first, interrupting)):
+                start, ending = "html", found[0]
+            elif interrupting and char in "=-" and UNDERLINE.fullmatch(body, pos):
+                start = "underline"
+            elif (
+                first >= unbroken
+                and (run := THEMATIC.get(char))
+                and (
+                    (unbroken := run.match(body, first).end()) == len(body)  # type: ignore[union-attr]
+                    and body.count(body[first], first) >= 3
+                )
+            ):
+                start = "heading"
+            elif marker := LIST_MARKER.match(body, first):
+                gap = indentation(body, marker.end())
+                empty = marker.end() + gap == len(body)
+                if interrupting and (empty or (marker[1] is not None and int(marker[1]) != 1)):
+                    break  # it cannot interrupt the paragraph
+                padding = 1 if empty or gap >= 5 else gap
+                opened.append(Item(width=marker.end() - pos + padding, filled=False))
+                pos = marker.end() + min(gap, padding)
+                interrupting = False
+                continue
+            break
+        rest = body[pos:]
+        shown = " " * pos + rest + newline
+        empty_rest = not rest.strip(" ")
+        if tip and not opened and start is None and not empty_rest:
+            # The paragraph continues, lazily when its containers do not.
+            rows.append((len(prose), at + pos, end, rest if not complete else rest.lstrip(" ")))
+            prose.append(shown)
+            at += len(line)
+            continue
+        if start == "underline":
+            if definitions() == len(rows):
+                # Only definitions: the underline is the paragraph's first text.
+                rows[:] = [(len(prose), at + pos, end, rest.lstrip(" "))]
+                prose.append(shown)
+                at += len(line)
+                continue
+            rows.clear()  # a heading, which ends at its underline
+            leaf = None
+        # What the line does not continue closes.
+        if leaf == "paragraph":
+            close_paragraph()
+        del stack[matched:]
+        del quotes[bisect_left(quotes, matched) :]
+        leaf = None
+        if (opened or not empty_rest) and stack and stack[-1] is not None:
+            stack[-1].filled = True
+        for index, container in enumerate(opened):
+            if container is not None:
+                container.filled = index < len(opened) - 1 or not empty_rest
+            if container is None:
+                quotes.append(len(stack))
+            stack.append(container)
+        if start == "fence":
+            leaf, fence = "fence", (opening[1][0], len(opening[1]))  # type: ignore[index]
+            # Its info string names a language, which no reader sees.
+            scan.drop.append((at + opening.start(2), end))  # type: ignore[union-attr]
+            prose.append(blank(line))
+        elif start == "html":
+            leaf = "html"
+            if ending is not None and ending.search(body, pos):
+                leaf = None
+            prose.append(blank(line))
+            raw[len(prose) - 1] = shown
+        elif start is not None:  # a heading, its underline or a thematic break
+            scan.breaks.append(end)
+            prose.append(shown)
+        elif not empty_rest and indentation(body, pos) >= 4:
+            leaf = "code"
+            prose.append(blank(line))
+        else:
+            if not empty_rest:
+                leaf = "paragraph"
+                first = pos + indentation(body, pos)
+                rows[:] = [(len(prose), at + pos, end, body[first:])]
+                if note := FOOTNOTE.match(body, first):
+                    scan.notes.add(label_key(note[1]))
+                    scan.drop.append((at + first, at + note.end()))
+            prose.append(shown)
+        at += len(line)
+    if leaf == "paragraph":
+        close_paragraph()
+    return scan
 
 
 def rendered(text: str) -> str:
@@ -941,72 +1226,21 @@ def rendered(text: str) -> str:
     What it removes adds letters no reader of the rendered text sees: a link's
     or image's destination and title, a defined reference's label and its
     definition (on one line or several), a defined footnote's marker, raw HTML
-    tags and comments, and a code fence's info string. Code (a span or a
-    fenced block) is shown as written. A definition starts a paragraph, never
-    continues one: after a blank line, a heading, a fence, or where a list item
-    or a block quote interrupts the paragraph. Each removal keeps the line
-    breaks it held, so the text keeps its lines.
+    tags and comments, and a code fence's info string. Code (a span, a fenced
+    or an indented block) is shown as written, and so is the rest of an HTML
+    block. The blocks are read as cmark reads them (``blocks``): a fence ends
+    at its closing fence or where the block quote or list item holding it
+    ends, so what follows it there is prose. Each removal keeps the line
+    breaks it held, so the text keeps its lines; its line endings are line
+    feeds and its tabs spaces, and a byte order mark it starts with, which
+    cmark skips, is gone, none of which a reader sees.
     """
-    drop: list[tuple[int, int]] = []
-    links: set[str] = set()
-    notes: set[str] = set()
-    prose = []  # the text with every fenced line and definition blanked, its offsets kept
-    lines = text.splitlines(keepends=True)
-    fence = None
-    paragraph: int | None = None  # the open paragraph's block quote depth
-    # The line after a paragraph's definitions, which starts no other.
-    index = at = 0
-    tried = -1
-    while index < len(lines):
-        line = lines[index]
-        body = line.rstrip("\r\n")
-        lead, depth, item = containers(body)
-        content = body[lead:]
-        if fence is not None:
-            closing = FENCE.fullmatch(content)
-            if (
-                closing
-                and closing[1][0] == fence[0]
-                and len(closing[1]) >= len(fence)
-                and not closing[2].strip()
-            ):
-                fence = None
-            prose.append(" " * len(body) + line[len(body) :])
-            paragraph = None
-        elif opened := fence_opening(content):
-            fence = opened[1]
-            # Its info string names a language, which no reader sees.
-            drop.append((at + lead + opened.start(2), at + len(body)))
-            prose.append(" " * len(body) + line[len(body) :])
-            paragraph = None
-        elif not content.strip() or (OPENING.match(content) and HEADING.fullmatch(content)):
-            prose.append(line)
-            paragraph = None
-        elif paragraph is not None and depth <= paragraph and not item:
-            # The paragraph continues, or its underline makes it a heading.
-            prose.append(line)
-            if depth == paragraph and OPENING.match(content) and SETEXT.fullmatch(content):
-                paragraph = None
-        elif index != tried and (
-            consumed := definitions(lines, index, at, lead, depth, drop, links)
-        ):
-            for held in lines[index : index + consumed]:
-                shown = held.rstrip("\r\n")
-                prose.append(" " * len(shown) + held[len(shown) :])
-                at += len(held)
-            index += consumed
-            tried = index
-            paragraph = None
-            continue
-        else:
-            if match := FOOTNOTE.match(content):
-                notes.add(label_key(match[1]))
-                drop.append((at + lead, at + lead + match.end()))
-            prose.append(line)
-            paragraph = depth
-        at += len(line)
-        index += 1
-    drop += inline_markup("".join(prose), links, notes)
+    text = text.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n").expandtabs(4)
+    scan = blocks(text)
+    drop = scan.drop + inline_markup("".join(scan.prose), scan.breaks, scan.links, scan.notes)
+    if scan.raw:
+        lines = enumerate(scan.prose)
+        drop += raw_markup("".join(scan.raw.get(index) or blank(row) for index, row in lines))
     kept, at = [], 0
     for start, end in sorted(drop):
         if end <= at:
@@ -1662,6 +1896,44 @@ def check_merges(corpus) -> None:
             )
 
 
+def round_starts(corpus, cases: dict) -> dict[tuple[int, int], list[datetime]]:
+    """When each review round of a PR the corpus holds read its input: the
+    cutoff of every case of that round, by PR and round."""
+    rounds: dict[tuple[int, int], list[datetime]] = {}
+    for case_id, case in sorted(corpus["cases"].items()):
+        origin = case["provenance"]
+        if origin["pr"] is not None and origin["round"] is not None:
+            rounds.setdefault((origin["pr"], origin["round"]), []).append(cases[case_id].cutoff)
+    return rounds
+
+
+def check_discoveries(corpus, cases: dict) -> None:
+    """A review's discovery is dated no earlier than the round it credits.
+
+    A defect a review round found was reported by that round, so not before
+    the round read its input: when the corpus holds a case of the round a
+    discovery names (its PR's, by its number), the discovery's day is no
+    earlier than that case's cutoff's day, the round's captured start. A
+    discovery dated before it would date the answer before anyone reported
+    it, and so a variant's exposure to it (``exposure``), and is refused
+    rather than read either way. An earlier disclosure of the defect (at a
+    previous revision, say) is the case's exposure evidence, its
+    ``public_by``, never its discovery.
+    """
+    rounds = round_starts(corpus, cases)
+    for _, case in sorted(corpus["cases"].items()):
+        pr = case["provenance"]["pr"]
+        for _, defect in sorted(case["defects"].items()):
+            found = defect["discovery"]
+            if found["round"] is None:
+                continue
+            discovered = day(found["discovered"])
+            require(
+                all(start.date() <= discovered for start in rounds.get((pr, found["round"]), [])),
+                "a review's discovery is no earlier than its round",
+            )
+
+
 def captured_records(corpus, cases: dict) -> list[tuple]:
     """Every record retained in the corpus and captured, each as its case,
     the earliest the corpus shows it can exist, its form, the record, its
@@ -1675,11 +1947,7 @@ def captured_records(corpus, cases: dict) -> list[tuple]:
     before a commit its binding names: ``check_later_records`` reads that
     from what a case withholds, ``check_record_dates`` from git.
     """
-    rounds: dict[tuple[int, int], list[datetime]] = {}
-    for case_id, case in corpus["cases"].items():
-        origin = case["provenance"]
-        if origin["pr"] is not None and origin["round"] is not None:
-            rounds.setdefault((origin["pr"], origin["round"]), []).append(cases[case_id].cutoff)
+    rounds = round_starts(corpus, cases)
     found = []
     for case_id, case in sorted(corpus["cases"].items()):
         cutoff, pr = cases[case_id].cutoff, case["provenance"]["pr"]
@@ -1790,6 +2058,7 @@ def check_corpus(corpus) -> Corpus:
     check_defects(corpus)
     check_records(corpus)
     check_merges(corpus)
+    check_discoveries(corpus, cases)
     check_later_records(corpus, cases)
     check_clusters(corpus, cases)
     inputs = [case.input for case in cases.values()]

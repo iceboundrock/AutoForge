@@ -345,6 +345,66 @@ def test_a_disagreement_stays_unknown_until_an_arbiter_settles_it(corpus):
         check_corpus(corpus)
 
 
+def test_an_arbiter_never_stands_in_for_a_critical_defects_second_adjudicator(corpus, subs):
+    d3 = corpus["cases"]["gamma-revert"]["defects"]["d3"]
+
+    def critical():
+        return describe(corpus)["labels"]["defects_by_severity"]["critical"]
+
+    def recall():
+        report = scored(corpus, deepcopy(subs))
+        return metric(report, "baseline", "recall/severity/critical")["observations"]
+
+    unsettled = recall()
+    assert critical()["unknown"] == 1
+    # One adjudicator each way and an arbiter of either verdict: a critical
+    # defect needs two adjudicators of its verdict, which no arbiter supplies,
+    # so it stays unknown and its weight out of recall.
+    for verdict in ("confirmed", "rejected"):
+        d3["labels"] = [
+            label("adjudicator-1", "confirmed"),
+            label("adjudicator-3", "rejected"),
+            label("arbiter-1", verdict, role="arbiter"),
+        ]
+        assert critical()["unknown"] == 1
+        assert recall() == unsettled
+    # Two adjudicators of the arbiters' verdict, and the arbiters settle it.
+    d3["labels"].insert(1, label("adjudicator-2", "confirmed"))
+    d3["labels"][-1] = label("arbiter-1", "confirmed", role="arbiter")
+    assert critical()["confirmed"] == 3
+    assert recall() != unsettled
+
+
+def test_an_arbiter_never_stands_in_for_a_critical_matchs_second_adjudicator(corpus, subs):
+    corpus["cases"]["gamma-revert"]["defects"]["d3"]["labels"].append(
+        label("adjudicator-3", "confirmed")
+    )
+    run = run_of(subs, "baseline", "gamma-revert")
+
+    def precision():
+        return metric(scored(corpus, deepcopy(subs)), "baseline", "precision")["observations"]
+
+    def match(by, defect=None, role="adjudicator"):
+        verdict = "false" if defect is None else "match"
+        return label(by, verdict, role=role, defect=defect, match=True)
+
+    # F3 matched to the confirmed critical d3 by two adjudicators, or by one.
+    matched = precision()
+    run["findings"][2]["labels"] = [match("adjudicator-4", "d3")]
+    alone = precision()
+    assert alone != matched
+    # One adjudicator each way and an arbiter matching it: still one short.
+    run["findings"][2]["labels"] += [match("adjudicator-5"), match("arbiter-1", "d3", "arbiter")]
+    assert precision() == alone
+    run["findings"][2]["labels"].insert(1, match("adjudicator-6", "d3"))
+    assert precision() == matched
+    # A match to a defect that is not critical stays the arbiters' to settle.
+    run["findings"][0]["labels"] = [match("adjudicator-4", "d1"), match("adjudicator-5")]
+    assert precision() != matched
+    run["findings"][0]["labels"].append(match("arbiter-1", "d1", "arbiter"))
+    assert precision() == matched
+
+
 @pytest.mark.parametrize(
     ("extra", "rule"),
     [
@@ -2189,6 +2249,11 @@ def linked(text: str, markup: str) -> str:
     return "\n".join(row.replace("src/a.py", markup) for row in body(text))
 
 
+def referenced(text: str) -> str:
+    """A record's answer, its ``src/a.py`` a reference link defined below it."""
+    return linked(text, "[src/a.py][file]") + "\n\n[file]: https://example.invalid/a.py"
+
+
 # The answer a review record holds, without its binding statement, presented
 # otherwise: its wording, and so what it tells a reviewer, unchanged.
 PRESENTED = [
@@ -2245,6 +2310,16 @@ PRESENTED = [
     lambda text: (
         linked(text, "[src/a.py][file]") + "\n\nLinks\n=====\n[file]:\nhttps://example.invalid/a.py"
     ),
+    # ...below a code fence a block quote opens, which ends with the quote: the
+    # answer after it is prose, its reference link rendered. So is an answer
+    # after a fence a list item holds, opened on its marker's line or below
+    # it, after a deeper quote's fence line inside a fence, which does not
+    # close it, or after an HTML block that holds a fence's line.
+    lambda text: "> ```\n> quoted code\n" + referenced(text),
+    lambda text: "- ```\n  listed code\n" + referenced(text),
+    lambda text: "Steps:\n\n1. Run\n\n   ```\n   make check\n" + referenced(text),
+    lambda text: "```\n> ```\n```\n" + referenced(text),
+    lambda text: "<div>\n```\n</div>\n\n" + referenced(text),
 ]
 
 
@@ -2415,6 +2490,48 @@ def test_no_value_the_reviewer_reads_holds_a_merge_or_lineage_record(history):
         ("[r]:\n> /url\n\n[a][r]", "[r]:\n> /url\n\n[a][r]"),
         ("- [r]:\n- /url\n\n[a][r]", "- [r]:\n- /url\n\n[a][r]"),
         ("p\n2. [r]: /url\n\n[a][r]", "p\n2. [r]: /url\n\n[a][r]"),
+        # A fence ends at its closing fence, read past the fence's own block
+        # quotes and list items only, or where they end: a quoted fence where
+        # its quote does, a list item's, opened on the item's line or below it,
+        # where the item does. Up to there its lines are code, a legitimate
+        # quoted code block's as any other's.
+        ("> ```python\n> [a](b)\n> ```\n[c](d)", "> ```\n> [a](b)\n> ```\n[c]"),
+        ("> ```\n> [a](b)\n[c](d)", "> ```\n> [a](b)\n[c]"),
+        ("> ```\n>> [a](b)\n> ```\n[c](d)", "> ```\n>> [a](b)\n> ```\n[c]"),
+        ("- ```\n  [a](b)\n\n  [c](d)\n[e](f)", "- ```\n  [a](b)\n\n  [c](d)\n[e]"),
+        ("- a\n\n  ```\n  [a](b)\n[c](d)", "- a\n\n  ```\n  [a](b)\n[c]"),
+        ("> - a\n>\n>   ```\n>   [a](b)\n> [c](d)", "> - a\n>\n>   ```\n>   [a](b)\n> [c]"),
+        ("- > ```\n  > [a](b)\n  [c](d)", "- > ```\n  > [a](b)\n  [c]"),
+        ("```\n> ```\n[a](b)\n```\n[c](d)", "```\n> ```\n[a](b)\n```\n[c]"),
+        ("-\n\n  ```\nx\n  ```\n[a](b)", "-\n\n  ```\nx\n  ```\n[a]"),
+        # ...and none opens in an HTML block, indented as code, or past a list
+        # marker's first four spaces (its item then holds indented code). A
+        # tab stops at every fourth column, and only a line feed or a carriage
+        # return ends a line.
+        ("<div>\n```\n</div>\n\n[a](b)", "\n```\n\n\n[a]"),
+        ("    ```\n[a](b)", "    ```\n[a]"),
+        ("-     ```\n[a](b)", "-     ```\n[a]"),
+        ("-\t```\n\t[a](b)\n[c](d)", "-   ```\n    [a](b)\n[c]"),
+        ("> ```\r> [a](b)\r[c](d)", "> ```\n> [a](b)\n[c]"),
+        ("a\u2028```\n[a](b)", "a\u2028```\n[a]"),
+        ("\ufeff```\n[a](b)\n```\n[c](d)", "```\n[a](b)\n```\n[c]"),
+        # Inline markup stays in its block: a comment or a tag a blank line
+        # cuts is text, and so is a closing tag with attributes, a tag set
+        # apart by a space that is not ASCII, or a link a heading opens. An
+        # HTML block shows all but its tags and comments, the lines of a
+        # comment that opens one included.
+        ("x <!--\n\nR1<b>R2 -->", "x <!--\n\nR1R2 -->"),
+        ('<b title="\n\nR1<i>R2\n\n">', '<b title="\n\nR1R2\n\n">'),
+        ('</a title="R1<i>R2">', '</a title="R1R2">'),
+        ("<b\u00a0title=x>", "<b\u00a0title=x>"),
+        ("R1<?x?>R2 R3<!X y>R4 R5<![CDATA[z]]>R6", "R1R2 R3R4 R5R6"),
+        ("# [a](\nb)", "# [a](\nb)"),
+        ("<div>\n[x](y<b>z)\n</div>", "\n[x](yz)\n"),
+        ("R1\n<!--\n\nx\n\n-->R2", "R1\n\n\n\n\nR2"),
+        # A paragraph's lines lose their indentation before definitions are
+        # read; an underline after definitions alone is the paragraph's text.
+        ("[r]: /1\n      [s]: /2\n\n[a][r][b][s]", "\n\n\n[a][b]"),
+        ("[r]: /a\n---\n[s]: /b\n\n[a][r][b][s]", "\n---\n[s]: /b\n\n[a][b][s]"),
         # A backslash escapes punctuation alone, and an escaped bracket stays
         # in a label; a destination ends at a space, not at other blanks.
         ("[a](b\\ c) d", "[a](b\\ c) d"),
@@ -3409,6 +3526,49 @@ def test_a_defect_found_before_its_merge_is_no_post_merge_discovery(history, sub
     report = score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
     assert metric(report, "baseline", "recall/discovery/post_merge")["observations"] == [0, 0, 1]
     assert report["variants"]["baseline"]["training_exposure"]["possible"] == 1
+
+
+def test_a_later_rounds_discovery_is_no_earlier_than_that_round(history, subs):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    # Round 2 of the PR read its input on January 4, and its R2-F1 found
+    # round 1's d1: a later review's discovery, the day round 2 reported it.
+    second_round(repo, ids, corpus)
+    case = corpus["cases"]["round1"]
+    d1 = case["defects"]["d1"]
+    d1["labels"] = [label("adjudicator-1", "confirmed", decided="2026-01-20")]
+    d1["discovery"].update(source="later_review", round=2, finding="R2-F1")
+    lineaged(case, "d1")
+    subs["variants"]["baseline"]["knowledge_cutoff"] = "2026-01-03"
+    planned = ["round1", "round2"]
+    report = score(corpus, recorded(corpus, subs, planned), repo.path)
+    assert metric(report, "baseline", "recall/discovery/later_review")["observations"] == [0, 0, 1]
+    assert report["variants"]["baseline"]["training_exposure"] == {
+        "none": 0,
+        "possible": 0,
+        "unknown": 2,
+    }
+    # Dated January 3, a day before round 2 read anything: round 2 cannot
+    # have reported it then, and a training cutoff of January 3 would read as
+    # having seen the answer. Refused, not scored.
+    d1["discovery"]["discovered"] = "2026-01-03"
+    refused_everywhere(
+        corpus, repo, subs, planned, "a review's discovery is no earlier than its round"
+    )
+    # A disclosure on January 3 stays representable as what it was: exposure
+    # evidence, beside round 2's discovery.
+    d1["discovery"]["discovered"] = "2026-01-04"
+    case["exposure"]["public_by"] = "2026-01-03"
+    report = score(corpus, recorded(corpus, subs, planned), repo.path)
+    assert metric(report, "baseline", "recall/discovery/later_review")["observations"] == [0, 0, 1]
+    assert report["variants"]["baseline"]["training_exposure"]["possible"] == 1
+    # A round the corpus does not hold dates nothing: round 3's discovery on
+    # round 1's cutoff day is the corpus's claim, as before.
+    del corpus["cases"]["round2"]
+    case["exposure"]["public_by"] = None
+    d1["discovery"].update(round=3, finding="R3-F1", discovered="2026-01-03")
+    lineaged(case, "d1")
+    assert describe(corpus)["runnable"] == ["round1"]
 
 
 def test_one_pr_merges_as_one_commit(history, subs):

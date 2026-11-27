@@ -190,8 +190,11 @@ from what was learned afterwards. These rules hold that line; each is enforced w
   such day is no later than the committer day of the head and of every defect's introducing commit,
   which `verify` checks; an earlier copy of the code (a rebase, another branch) is the curator's to
   trace. A discovery is relative to the reviewed head, at or after its cutoff; a disclosure before
-  it is exposure evidence, not a discovery. A discovery day bounds the first report from above only
-  (the seed's is the FIX commit's day). The counts are reported, not corrected for.
+  it is exposure evidence, not a discovery. A review's discovery is no earlier than the round it
+  credits either: when the corpus holds a case of that round of the PR, a discovery dated before
+  that case's cutoff day would date the answer, and so a variant's exposure to it, before any
+  round reported it, and the corpus is refused. A discovery day bounds the first report from above
+  only (the seed's is the FIX commit's day). The counts are reported, not corrected for.
 
 **The review-time boundary.** A review round's head is committed and pushed before its PR, and so
 its PR body, can exist, so the head's committer time can fall before context its review read. A
@@ -248,31 +251,41 @@ finding (#539's round 2 R2-F1 in the seed) are told apart by their ids and summa
 bound, so one defect registered at several heads of its PR, its lines each head's own, holds the
 same record at each. A record of either kind that names anything else is refused.
 
-No retained record is ever part of the reviewer's input, since each holds what the reviewer must
-not be given: the round's own result, the merge, the fix. Not under its own source, and not in any
-value the reviewer is given (each context item's id, kind, source, reference and text, the
-environment's paths and validation commands, and the base ref): none of them may be the record (its
-digest), carry its binding statement, or hold, between them, every other line of its text,
-wherever each line stands. Each is compared by its letters and digits alone, without case, after
-decoding HTML entities and compatibility forms, both as written and as a Markdown renderer shows
-it. The rendered form drops what adds letters no reader of it sees: a link's or image's
-destination and title, a defined reference's label and its definition, a defined footnote's
-marker, raw HTML tags and comments, and a code fence's info string, while code spans and fenced
-code read as written, as in CommonMark. A link reference definition is read as CommonMark defines
-one, on one line or several: its label (over lines, matched without case or spacing), then its
-destination and an optional title, each after at most one line break, the title over lines too,
-and nothing after either on its line; a title that does not end its line leaves the destination
-alone the definition when a line break comes between them. A definition starts a paragraph and
-never continues one: it may follow a blank line, a heading or its underline, a fence, or start a
-list item (a bullet, or the number 1) or a block quote that interrupts a paragraph, and it runs on
-over the paragraph's lines, lazily continued in a block quote, up to a blank line or a line that
-opens another block. So a copy that only presents the record otherwise (each line as a Markdown
-block quote, a list item or a table cell, emphasised, linked inline or by reference, or in a code
-span, reflowed or joined into one line, its spacing or punctuation changed) is refused as the
-record itself. The rendered form is a model of CommonMark, not a renderer: markup it does not model
-(an indented code block, an HTML block, a list item's indentation past three spaces) reads as
-prose, and a value whose link destinations would have it read more than four times the value's
-length (plus 4096 characters) is refused rather than read on.
+No retained record is ever part of the reviewer's input, since each holds what the reviewer must not
+be given: the round's own result, the merge, the fix. Not under its own source, and not in any value
+the reviewer is given (each context item's id, kind, source, reference and text, the environment's
+paths and validation commands, and the base ref): none of them may be the record (its digest), carry
+its binding statement, or hold, between them, every other line of its text, wherever each line
+stands. Each is compared by its letters and digits alone, without case, after decoding HTML entities
+and compatibility forms, both as written and as a Markdown renderer shows it. The rendered form
+drops what adds letters no reader of it sees: a link's or image's destination and title, a defined
+reference's label and its definition, a defined footnote's marker, raw HTML tags and comments, and a
+code fence's info string, while code spans and fenced code read as written, as in CommonMark. Its
+blocks are read line by line as cmark reads them: the block quotes and list items each line
+continues (a quote by its `>`, an item by its indentation), and in them fenced and indented code,
+HTML blocks, headings and paragraphs, a paragraph alone continuing lazily. A fence ends at its
+closing fence, read only past the fence's own quotes and items, or where they end: a fence a block
+quote or a list item opens ends with it, and what follows is prose. A line in an HTML block or
+indented as code opens no fence; an HTML block shows its text but its tags and comments; and inline
+markup (a link, a code span, a tag or a comment) never runs from one paragraph or heading into
+another. A tab stops at every fourth column, only a line feed or a carriage return ends a line, and
+a byte order mark the value starts with is skipped. A link reference definition is read as
+CommonMark defines one, on one line or several: its label (over lines, matched without case or
+spacing), then its destination and an optional title, each after at most one line break, the title
+over lines too, and nothing after either on its line; a title that does not end its line leaves the
+destination alone the definition when a line break comes between them. A definition starts a
+paragraph and never continues one: it may follow a blank line, a heading or its underline, a fence,
+or start a list item (a bullet, or the number 1) or a block quote that interrupts a paragraph, and
+it runs on over the paragraph's lines, their indentation stripped and lazily continued in a block
+quote, up to a blank line or a line that opens another block; an underline after definitions alone
+is the paragraph's text, not a heading. So a copy that only presents the record otherwise (each line
+as a Markdown block quote, a list item or a table cell, emphasised, linked inline or by reference,
+or in a code span, reflowed or joined into one line, its spacing or punctuation changed) is refused
+as the record itself, and so is one below a fence its block quote or list item has ended. The
+rendered form is a model of CommonMark, not a renderer: markup it does not model (a table's cells, a
+footnote's indented continuation, an HTML block's text as a browser would parse it) reads as prose,
+and a value whose link destinations would have it read more than four times the value's length (plus
+4096 characters) is refused rather than read on.
 
 The same holds across cases for every record that is demonstrably later than a case's cutoff,
 whichever case retains it. A record cannot exist before what it records: a review record before
@@ -301,17 +314,20 @@ history; and adjudicators who cannot see which variant produced a finding.
 
 Every label names who decided, their role, the verdict, the UTC day it was decided and an
 independently reproducible artifact (REV-R0's examples: an oracle assertion, a minimized input, a
-reviewed trace). A **curator** proposes and never settles anything. **Adjudicators** settle a
-label when they agree: one suffices, two for a critical defect, either way. A disagreement stays
-`unknown` unless **arbiters**, all of one verdict, settle it; an arbiter label without a
-disagreement is refused. An `unknown` verdict counts for nothing. One identity labels a record
-once, no actor of the case may label it, and no label is decided after the corpus's freeze. No
-reviewer variant may label any record of the corpus, in any role: the corpus is checked before
-its variants are known, so the scorer refuses submissions with a variant whose identity labeled a
-defect or a negative of any case, planned or not. An identity is a string, not an authentication,
-as in REV-R0. No label of a case's defect or negative, and no label matching a finding of a run
-of it, is decided before the day of the case's cutoff: a verdict on a candidate, or on a finding
-about it, cannot precede the candidate as it was reviewed.
+reviewed trace). A **curator** proposes and never settles anything. **Adjudicators** settle a label
+when they agree: one suffices, two for a critical defect, either way. A disagreement stays `unknown`
+unless **arbiters**, all of one verdict, settle it; an arbiter label without a disagreement is
+refused. An arbiter decides between adjudicators and never stands in for one: a label that needs two
+adjudicators (a critical defect's, either way, or a match to one) is settled by arbitration only
+when two adjudicators gave the arbiters' verdict, and stays `unknown` otherwise, while any other
+label's disagreement is the arbiters' to settle. An `unknown` verdict counts for nothing. One
+identity labels a record once, no actor of the case may label it, and no label is decided after the
+corpus's freeze. No reviewer variant may label any record of the corpus, in any role: the corpus is
+checked before its variants are known, so the scorer refuses submissions with a variant whose
+identity labeled a defect or a negative of any case, planned or not. An identity is a string, not an
+authentication, as in REV-R0. No label of a case's defect or negative, and no label matching a
+finding of a run of it, is decided before the day of the case's cutoff: a verdict on a candidate, or
+on a finding about it, cannot precede the candidate as it was reviewed.
 
 A finding is matched against the case's registered defects by adjudicators who are neither a
 reviewer variant nor an actor of the case: `match` to one defect, `false`, or `unknown`, two
@@ -519,7 +535,10 @@ and label outcome, with a complete inventory for every case: a disagreement, a c
 one adjudicator, a rejected defect, a censored and two settled negatives, a duplicate, a match to a
 rejected defect, unknown findings and a variant without a knowledge cutoff. The tests check its
 scorecards against values computed by hand, refuse each malformed or leaking record, settle labels
-and change windows to show each rule move a number, and run `verify` on a throwaway repository with
+and change windows to show each rule move a number (a critical defect, and a match to one, one
+adjudicator each way and an arbiter of either verdict, staying unknown and out of recall and
+precision until two adjudicators give the arbiters' verdict, while a disputed match to a
+non-critical defect is the arbiter's), and run `verify` on a throwaway repository with
 fixed commit dates, including against the operator's `GIT_*` variables and a replacement object, and
 refuse a cutoff later than the head together with the review comment it would admit. They refuse a
 case missing its issue or PR body, an inventory that leaves an item out or lists one too many, a
@@ -567,7 +586,14 @@ each of two references; each in a reference as a document's text alike. The refe
 definition is also refused over several lines: its destination on the line after its label, its
 destination in angle brackets and a title over two lines each on lines of their own, its label
 broken over lines and in another case, in a block quote continued lazily, opening a list item
-that interrupts a paragraph, and after a heading's underline. They check what the rendered form
+that interrupts a paragraph, and after a heading's underline; and the answer, linked by reference,
+below a fence a block quote or a list item opened (on the item's line or below it) and ended, below
+a deeper quote's fence line inside a fence, and below an HTML block holding a fence's line. They
+check that a fence ends at its closing fence, read past its own quotes and items only, or where
+they end, a legitimate quoted code block reading as code; that no fence opens in an HTML block,
+indented as code or past a list marker's four spaces; tab stops, line endings, a leading byte
+order mark, a comment or tag a blank line cuts, a closing tag with attributes, a link a heading
+opens, an HTML block's text and its comment over blank lines. They check what the rendered form
 drops and keeps on CommonMark's own cases (code spans and fences as written, no link inside a
 link, an undefined reference and a definition inside a paragraph as text, and the definitions of
 its examples 193 to 218, those it reads as text included: a blank line inside a title, text after
@@ -602,7 +628,10 @@ the squash nor its cutoff, and a review's FIX claimed as a revert under its own 
 count an escape found the day after its squash for post-merge recall, refuse it in `verify` and
 the score when found two days before the squash landed, though its fix descends from the squash,
 accept it found on the squash's own day, and count the earlier report as exposure evidence beside
-the later discovery. They score a squash case's merge record and a branch round's lineage record
+the later discovery. They score round 1's defect found by round 2's R2-F1 the day round 2 read
+its input, refuse it in every command dated the day before, when a knowledge cutoff of that day
+would read as `possible`, and keep that day's disclosure as exposure evidence beside round 2's
+discovery. They score a squash case's merge record and a branch round's lineage record
 naming the same merge of PR 2, and refuse, in every command, the lineage record naming instead a
 later commit whose subject also names PR 2, which keeps the defect's line and whose descendant
 changes it (consistent with git on its own, which `verify` shows without the squash case), as
