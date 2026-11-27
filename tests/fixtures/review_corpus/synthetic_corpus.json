@@ -120,7 +120,13 @@
             "finding": "R1-F1",
             "discovered": "2026-05-01",
             "fix": "cef08c729419cecdc8385d9c3f8f542c2a924d4e",
-            "merged": null
+            "merged": null,
+            "lineage": {
+              "status": "captured",
+              "source": "document/synthetic/lineage/alpha-defect-d1.md",
+              "text": "lineage-record: {\"pr\": null, \"introduced\": \"5a73afb9449777adb9bece8d94ec4639cffddaca\", \"paths\": [\"src/alpha.py\"], \"merged\": null, \"fix\": \"cef08c729419cecdc8385d9c3f8f542c2a924d4e\"}\nSynthetic lineage of alpha-defect/d1: its fix, retained apart from the corpus.",
+              "sha256": "7d3c1a8e5e231917d9ebf08004e0458f421bcd497d042ee9d982ec37f36b2e80"
+            }
           },
           "labels": [
             {
@@ -159,7 +165,13 @@
             "finding": "R2-F1",
             "discovered": "2026-05-03",
             "fix": "f6717d15bff3e9275193a5903e2302d08f0239c7",
-            "merged": null
+            "merged": null,
+            "lineage": {
+              "status": "captured",
+              "source": "document/synthetic/lineage/alpha-defect-d2.md",
+              "text": "lineage-record: {\"pr\": null, \"introduced\": \"5a73afb9449777adb9bece8d94ec4639cffddaca\", \"paths\": [\"src/alpha.py\"], \"merged\": null, \"fix\": \"f6717d15bff3e9275193a5903e2302d08f0239c7\"}\nSynthetic lineage of alpha-defect/d2: its fix, retained apart from the corpus.",
+              "sha256": "75b2f1cdc7113aab7e5d16a7bb28967ed5ab6b1bd202458e7c06853ad24d1dde"
+            }
           },
           "labels": [
             {
@@ -195,7 +207,13 @@
             "finding": "R3-F2",
             "discovered": "2026-05-05",
             "fix": null,
-            "merged": null
+            "merged": null,
+            "lineage": {
+              "status": "not_captured",
+              "source": null,
+              "text": null,
+              "sha256": null
+            }
           },
           "labels": [
             {
@@ -400,7 +418,13 @@
             "finding": null,
             "discovered": "2026-06-01",
             "fix": "5a68eb368c71f2d19379dff55a5c403824a54612",
-            "merged": null
+            "merged": null,
+            "lineage": {
+              "status": "captured",
+              "source": "document/synthetic/lineage/beta-escape-d1.md",
+              "text": "lineage-record: {\"pr\": null, \"introduced\": \"dfc15e8fbd6ff870fe37c7311acab43e4d31d7fb\", \"paths\": [\"src/beta.py\"], \"merged\": null, \"fix\": \"5a68eb368c71f2d19379dff55a5c403824a54612\"}\nSynthetic lineage of beta-escape/d1: its fix, retained apart from the corpus.",
+              "sha256": "52ac7f8d7848f387027ed50d7de71a0c83b133d50776ab185b0f354cef065fe8"
+            }
           },
           "labels": [
             {
@@ -439,7 +463,13 @@
             "finding": null,
             "discovered": "2026-06-02",
             "fix": null,
-            "merged": null
+            "merged": null,
+            "lineage": {
+              "status": "not_captured",
+              "source": null,
+              "text": null,
+              "sha256": null
+            }
           },
           "labels": [
             {
@@ -635,7 +665,13 @@
             "finding": null,
             "discovered": "2026-04-10",
             "fix": "7eb7352db2d1fbe9b37f4ee26611d8af50256d63",
-            "merged": null
+            "merged": null,
+            "lineage": {
+              "status": "captured",
+              "source": "document/synthetic/lineage/gamma-revert-d1.md",
+              "text": "lineage-record: {\"pr\": null, \"introduced\": \"8c3fb2c2584573e3f2cc47bb68fb5af847a482de\", \"paths\": [\"src/gamma.py\"], \"merged\": null, \"fix\": \"7eb7352db2d1fbe9b37f4ee26611d8af50256d63\"}\nSynthetic lineage of gamma-revert/d1: its fix, retained apart from the corpus.",
+              "sha256": "259501750f6f14e4510d4e4bd4d16e29e963c5c7c25fa6f9d9655eb529afa8c7"
+            }
           },
           "labels": [
             {
@@ -667,7 +703,13 @@
             "finding": "R2-F1",
             "discovered": "2026-04-02",
             "fix": null,
-            "merged": null
+            "merged": null,
+            "lineage": {
+              "status": "not_captured",
+              "source": null,
+              "text": null,
+              "sha256": null
+            }
           },
           "labels": [
             {
@@ -703,7 +745,13 @@
             "finding": null,
             "discovered": "2026-04-20",
             "fix": null,
-            "merged": null
+            "merged": null,
+            "lineage": {
+              "status": "not_captured",
+              "source": null,
+              "text": null,
+              "sha256": null
+            }
           },
           "labels": [
             {

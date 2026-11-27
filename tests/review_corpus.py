@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from fractions import Fraction
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from random import Random
@@ -91,16 +91,34 @@ MIN_CLUSTERS = 2
 # The work a score may expand to, refused before anything is expanded: the
 # file-size cap bounds what is read, not the planned pairs or the bootstrap's
 # tables (BOOTSTRAP_DRAWS draws of every cluster a metric observes), which grow
-# with their product. A metric's bootstrap over 64 clusters took about half a
-# second on one host, so a score at these bounds is estimated at minutes.
+# with their product. Each run's observations are computed once, from its
+# findings and its case's tally of confirmed defects (``Case.tally``, counted
+# once per case), so no step scans a case's defects once per run. See
+# ``docs/review-corpus.md`` section 5 for what a score at these bounds cost.
 MAX_VARIANTS = 8
 MAX_PLANNED_PAIRS = 10_000  # planned cases times seeds
 MAX_PLANNED_CLUSTERS = 64
 BOOTSTRAP_TABLES = 16  # resample tables kept at once, one per cluster count
-# A review record states what it reviewed and when it read its input in one
-# line of its own text: this prefix, then a JSON object of BINDING_FIELDS.
-RECORD_BINDING = "review-record: "
-BINDING_FIELDS = "pr round base_ref head merge_base input_read"
+
+
+@dataclass(frozen=True)
+class Form:
+    """A kind of retained record: what its one binding statement begins with
+    and the fields of the JSON object that follows (``record_binding``)."""
+
+    kind: str
+    prefix: str
+    fields: str
+
+
+# A review round's record: what it reviewed, against which base revision, and
+# when it read its input.
+REVIEW = Form("review", "review-record: ", "pr round base_ref base_tip head merge_base input_read")
+# A PR's merge record: the commit its PR merged into its base ref as.
+MERGE = Form("merge", "merge-record: ", "pr base_ref merged")
+# A defect's lineage record: the fix or revert that addresses it, and the
+# merge it escaped through.
+LINEAGE = Form("lineage", "lineage-record: ", "pr introduced paths merged fix")
 CLAIM = "scorecards only: no benchmark decision, gate or rollout follows from this report"
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 OBJECT_ID = re.compile(r"[0-9a-f]{40}")
@@ -311,8 +329,9 @@ CASE_FIELDS = (
 )
 REVIEW_FIELDS = "base_ref base_tip merge_base head tree cutoff"
 DEFECT_FIELDS = "severity class introduced summary location discovery labels"
-DISCOVERY_FIELDS = "source round finding discovered fix merged"
+DISCOVERY_FIELDS = "source round finding discovered fix merged lineage"
 RECORD_FIELDS = "status source started text sha256"
+LINEAGE_FIELDS = "status source text sha256"
 EXPOSURE_FIELDS = "possible_from public_by artifact"
 
 
@@ -345,11 +364,17 @@ class Case:
     # than the case itself shows (a disclosure at a previous revision, say).
     public_by: date | None = None
 
-    @property
+    # Each of these reads every defect of the case, so each is computed once per
+    # case, never once per run of it.
+    @cached_property
     def confirmed(self) -> dict:
         return {key: d for key, d in self.defects.items() if d.status == "confirmed"}
 
-    @property
+    @cached_property
+    def tally(self) -> Tally:
+        return Tally.of(self.confirmed)
+
+    @cached_property
     def public(self) -> date:
         """The first day by which part of the case's answer was certainly public.
 
@@ -362,6 +387,30 @@ class Case:
         if self.public_by is not None:
             days.append(self.public_by)
         return min(days)
+
+
+@dataclass(frozen=True)
+class Tally:
+    """A case's confirmed defects as every run of it is scored against them.
+
+    A run's recall needs only how many confirmed defects there are of each
+    severity and each discovery source, and the severity and source of each it
+    found, so counting them once lets a run be scored from its findings alone.
+    """
+
+    severity: dict  # defect key -> severity, for the confirmed defects
+    source: dict  # defect key -> discovery source
+    by_severity: Counter
+    by_source: Counter
+
+    @classmethod
+    def of(cls, confirmed: dict) -> Tally:
+        return cls(
+            severity={key: d.severity for key, d in confirmed.items()},
+            source={key: d.source for key, d in confirmed.items()},
+            by_severity=Counter(d.severity for d in confirmed.values()),
+            by_source=Counter(d.source for d in confirmed.values()),
+        )
 
 
 @dataclass(frozen=True)
@@ -462,25 +511,25 @@ def check_context(context, *, origin, cutoff: datetime, frozen: date) -> bool:
     return captured
 
 
-def record_binding(text: str) -> tuple[str, dict]:
-    """The one binding statement a review record's text carries, and its line.
+def record_binding(text: str, form: Form) -> tuple[str, dict]:
+    """The one binding statement a retained record's text carries, and its line.
 
-    It is the line that begins with ``RECORD_BINDING``, followed by a JSON
-    object of exactly ``BINDING_FIELDS``. Nothing else of the text is read for
-    the binding: an instant or a commit the text names elsewhere (when the
-    record was published, say) is never taken for one.
+    It is the line that begins with ``form.prefix``, followed by a JSON object
+    of exactly ``form.fields``. Nothing else of the text is read for the
+    binding: an instant or a commit the text names elsewhere (when the record
+    was published, say) is never taken for one.
     """
-    lines = [line for line in text.splitlines() if line.startswith(RECORD_BINDING)]
-    require(len(lines) == 1, "a review record states one binding")
+    lines = [line for line in text.splitlines() if line.startswith(form.prefix)]
+    require(len(lines) == 1, f"a {form.kind} record states one binding")
     try:
         binding = json.loads(
-            lines[0].removeprefix(RECORD_BINDING),
+            lines[0].removeprefix(form.prefix),
             object_pairs_hook=_unique_object,
             parse_constant=_no_constant,
         )
     except json.JSONDecodeError as exc:
-        raise CorpusError("review record binding") from exc
-    closed(binding, BINDING_FIELDS)
+        raise CorpusError(f"{form.kind} record binding") from exc
+    closed(binding, form.fields)
     return lines[0], binding
 
 
@@ -489,76 +538,121 @@ def squeezed(text: str) -> str:
     return "".join(text.casefold().split())
 
 
-def holds_record(item, *, record, line: str) -> bool:
-    """Whether a captured context item holds the round's own review record.
+def exposes(texts: Sequence[str], record, line: str) -> bool:
+    """Whether the reviewer's input holds a retained record.
 
-    Its digest is the record's, it carries the record's binding statement, or
-    it holds every line of the rest of the record, each compared without case
-    or whitespace. A paraphrase, or a part of the record, cannot be told.
+    ``texts`` is every free-text value of the input (``reviewer_text``): each
+    context item's id, kind, source, reference and text, the environment's
+    paths and commands and the base ref. One of them is the record (its digest
+    is the record's), or one carries the record's binding statement, or
+    together they hold every other line of the record, each compared without
+    case or whitespace, wherever each line stands. A paraphrase, or a part of
+    the record, cannot be told.
     """
-    if item["status"] != "captured":
-        return False
-    held = {squeezed(row) for row in item["text"].splitlines()} - {""}
     body = {squeezed(row) for row in record["text"].splitlines() if row != line} - {""}
-    return (
-        item["sha256"] == record["sha256"]
-        or squeezed(line) in squeezed(item["text"])
-        or bool(body and body <= held)
+    held: set[str] = set()
+    for text in texts:
+        if sha256(text.encode()).hexdigest() == record["sha256"] or squeezed(line) in squeezed(
+            text
+        ):
+            return True
+        held |= {squeezed(row) for row in text.splitlines()}
+    return bool(body) and body <= held
+
+
+def check_source(record, form: Form, *, origin, context) -> None:
+    """A retained record is named by a stable source anyone can read again: a
+    comment on the case's own PR, or a document. It is never the reviewer's
+    context under that source."""
+    if record["source"] is None:
+        return
+    kind, _, number = source_kind(record["source"])
+    require(
+        kind == "document" or (kind == "pr_comment" and number == origin["pr"]),
+        f"a {form.kind} record is a comment on the case's PR or a document",
+    )
+    require(
+        all(record["source"] != item["source"] for item in context),
+        f"the {form.kind} record is not the reviewer's context",
     )
 
 
-def check_record(record, *, case, cutoff: datetime, context: list) -> bool:
-    """The retained record of a review round, and whether it evidences the cutoff.
+def retained(record, form: Form) -> tuple[str, dict]:
+    """A captured record's text, its digest and its binding statement."""
+    require(record["source"] is not None, f"a {form.kind} record names its source")
+    text = record["text"]
+    require(nonempty(text), f"{form.kind} record text")
+    require(record["sha256"] == sha256(text.encode()).hexdigest(), f"{form.kind} record digest")
+    return record_binding(text, form)
+
+
+def pr_number(value) -> bool:
+    return value is None or integer(value, 1)
+
+
+def check_record(record, *, case, cutoff: datetime, context: list) -> str | None:
+    """The retained record of a case's review time; its binding line, if captured.
 
     A review round's head is committed before its PR, and so its PR body, can
     exist, so the head's committer time can fall before the context the review
-    read. A later boundary needs evidence kept apart from the corpus: a record
-    of the round, named by its stable source so anyone can read it again (a
-    comment on the case's own PR, or a document), whose digest matches its
-    text and whose text carries one binding statement (``record_binding``)
-    naming the case's PR, round, base ref, head and merge base and the instant
-    the review read its input. That instant is then the cutoff. The record
-    holds the review's own result, so it is never part of the reviewer's
-    input, under its own source or another (``holds_record``). Without one the
-    cutoff is the head's committer time, which ``verify`` checks, and the case
-    is never runnable.
+    read, and the base ref's tip at that time is a guess: commit times say
+    when a commit was made, not when the ref reached it. A later boundary and
+    the base revision the review read need evidence kept apart from the
+    corpus: a record of the round (``REVIEW``), named by its stable source so
+    anyone can read it again (``check_source``), whose digest matches its text
+    and whose text carries one binding statement (``record_binding``) naming
+    the case's PR, round, base ref, base revision, head and merge base and the
+    instant the review read its input. That instant is then the cutoff.
+    Without one the cutoff is the head's committer time and the base revision
+    the ref's tip by committer times, both of which ``verify`` checks, the
+    second only provisionally, and the case is never runnable.
+
+    A squash candidate's record is its PR's merge record (``MERGE``): the
+    commit the PR merged as, which its commit subject only suggests. Without
+    one a squash candidate is never runnable either.
+
+    Either record holds what the reviewer must not be given, so neither is
+    ever part of the reviewer's input (``exposes``, in ``check_case``).
     """
     closed(record, RECORD_FIELDS)
-    require(record["status"] in ("captured", "not_captured"), "review record status")
     origin = case["provenance"]
-    if record["source"] is not None:
-        kind, _, number = source_kind(record["source"])
-        require(
-            kind == "document" or (kind == "pr_comment" and number == origin["pr"]),
-            "a review record is a comment on the case's PR or a document",
-        )
-        require(
-            all(record["source"] != item["source"] for item in context),
-            "the review record is not the reviewer's context",
-        )
+    form = MERGE if origin["source"] == "squash" else REVIEW
+    require(record["status"] in ("captured", "not_captured"), f"{form.kind} record status")
+    check_source(record, form, origin=origin, context=context)
     if record["status"] == "not_captured":
         require(
             all(record[key] is None for key in ("started", "text", "sha256")),
-            "an uncaptured review record holds nothing",
+            f"an uncaptured {form.kind} record holds nothing",
         )
-        return False
-    require(origin["source"] == "pr_branch", "only a review round holds its record")
-    require(record["source"] is not None, "a review record names its source")
-    started = instant(record["started"])
-    text = record["text"]
-    require(nonempty(text), "review record text")
-    require(record["sha256"] == sha256(text.encode()).hexdigest(), "review record digest")
-    line, binding = record_binding(text)
-    review = case["review"]
+        return None
     require(
-        (binding["pr"] is None or integer(binding["pr"], 1))
+        origin["source"] in ("pr_branch", "squash"),
+        "only a review round or a squash holds its record",
+    )
+    review = case["review"]
+    if form is MERGE:
+        require(record["started"] is None, "a merge record states no review start")
+        line, binding = retained(record, form)
+        require(
+            integer(binding["pr"], 1) and binding["pr"] == origin["pr"],
+            "the merge record's binding names the case's PR",
+        )
+        require(
+            binding["base_ref"] == review["base_ref"] and binding["merged"] == review["head"],
+            "the merge record's binding names the case's merge",
+        )
+        return line
+    started = instant(record["started"])
+    line, binding = retained(record, form)
+    require(
+        pr_number(binding["pr"])
         and binding["pr"] == origin["pr"]
         and integer(binding["round"], 1)
         and binding["round"] == origin["round"],
         "the review record's binding names the case's PR and round",
     )
     require(
-        all(binding[key] == review[key] for key in ("base_ref", "head", "merge_base")),
+        all(binding[key] == review[key] for key in ("base_ref", "base_tip", "head", "merge_base")),
         "the review record's binding names the case's review",
     )
     require(
@@ -566,11 +660,48 @@ def check_record(record, *, case, cutoff: datetime, context: list) -> bool:
         "the review record's binding states its start",
     )
     require(cutoff == started, "the cutoff is the review record's start")
+    return line
+
+
+def check_lineage(defect, *, case) -> str | None:
+    """A defect's lineage record; its binding line, if captured.
+
+    That a later commit is a defect's fix or revert, and that a squash is the
+    merge it escaped through, is what the record evidences: its binding names
+    the case's PR, the defect's introducing commit and the files it is located
+    in, the merged revision (or ``null``) and the fix. ``verify``'s checks of
+    the same lineage against git (ancestry, the squash's subject, the lines it
+    carried, the files and lines the fix changed) are consistency checks: a
+    later commit can satisfy every one of them without fixing anything. A
+    case is runnable only when each fix it names has its record.
+    """
+    found = defect["discovery"]
+    lineage = found["lineage"]
+    closed(lineage, LINEAGE_FIELDS)
+    require(lineage["status"] in ("captured", "not_captured"), "lineage record status")
+    origin = case["provenance"]
+    check_source(lineage, LINEAGE, origin=origin, context=case["context"]["items"])
+    if lineage["status"] == "not_captured":
+        require(
+            lineage["text"] is None and lineage["sha256"] is None,
+            "an uncaptured lineage record holds nothing",
+        )
+        return None
+    require(found["fix"] is not None, "a lineage record evidences a fix")
+    line, binding = retained(lineage, LINEAGE)
+    paths = sorted({place["path"] for place in defect["location"]})
     require(
-        not any(holds_record(item, record=record, line=line) for item in context),
-        "the review record is not the reviewer's context",
+        pr_number(binding["pr"])
+        and binding["pr"] == origin["pr"]
+        and binding["introduced"] == defect["introduced"]
+        and binding["paths"] == paths,
+        "the lineage record's binding names the defect",
     )
-    return True
+    require(
+        binding["merged"] == found["merged"] and binding["fix"] == found["fix"],
+        "the lineage record's binding names the defect's lineage",
+    )
+    return line
 
 
 def check_defect(key, defect, *, case, cutoff: datetime, frozen: date, withheld, barred) -> Defect:
@@ -622,8 +753,10 @@ def check_defect(key, defect, *, case, cutoff: datetime, frozen: date, withheld,
         require(fix in withheld, "a fix is withheld from the reviewer")
     # A defect that escaped a PR branch through a squash reaches its fix or
     # revert through the merged revision, not through its introducing commit.
-    # ``verify`` binds that revision to the case's PR and finds the defect's
-    # own lines in it, so a squash lineage names the PR and every line.
+    # Its lineage record evidences that revision as the PR's merge
+    # (``check_lineage``); ``verify`` checks it is consistent with git, the
+    # PR's squash holding the defect's own lines, so a squash lineage names
+    # the PR and every line.
     if found["merged"] is not None:
         merged = object_id(found["merged"])
         origin = case["provenance"]
@@ -664,6 +797,7 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
         require(origin["issue"] is not None and integer(origin["round"], 1), "a branch round")
     elif origin["source"] == "squash":
         require(origin["round"] is None, "a squash candidate is no review round")
+        require(origin["pr"] is not None, "a squash candidate names its PR")
     else:
         require(origin["round"] is None or integer(origin["round"], 1), "provenance round")
     review = case["review"]
@@ -683,7 +817,9 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
     # Each file the repository declares its test environment (``check_corpus``
     # holds the names to that list), as its blob at the head or ``None`` when
     # the head has none, and at least one command a runner may validate with:
-    # leaving a pin out is never how a case says it has none.
+    # leaving a pin out is never how a case says it has none. A case none of
+    # whose declared files is at its head pins no environment at all, so it
+    # never runs (``pinned`` below): an absent placeholder pins nothing.
     require(isinstance(environment["files"], dict), "environment files")
     for path, blob in environment["files"].items():
         relative_path(path)
@@ -731,10 +867,9 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
     recorded = check_record(
         case["record"], case=case, cutoff=cutoff, context=case["context"]["items"]
     )
-    # A review round's case runs only on a cutoff its record evidences.
-    runnable = on_context and (recorded or origin["source"] != "pr_branch")
+    texts = list(reviewer_text(case))
     require(
-        not any(names_commit(text, forbidden) for text in reviewer_text(case)),
+        not any(names_commit(text, forbidden) for text in texts),
         "the reviewer's input names a withheld commit",
     )
     require(isinstance(case["defects"], dict), "defects")
@@ -748,6 +883,31 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
         )
         for key, defect in case["defects"].items()
     }
+    lineages = {key: check_lineage(defect, case=case) for key, defect in case["defects"].items()}
+    # Every record retained for the case holds what its reviewer must not be
+    # given: the round's own result, a merge, a fix. None reaches the input,
+    # through a context item's text or any other value the reviewer reads.
+    held = [(REVIEW if origin["source"] != "squash" else MERGE, case["record"], recorded)]
+    held += [
+        (LINEAGE, defect["discovery"]["lineage"], lineages[key])
+        for key, defect in sorted(case["defects"].items())
+    ]
+    for form, kept, line in held:
+        require(
+            line is None or not exposes(texts, kept, line),
+            f"the {form.kind} record is not the reviewer's context",
+        )
+    # A case runs only on what its records evidence: a review round on the
+    # cutoff and base revision its review record states, a squash on its PR's
+    # merge record, and every defect's fix on its lineage record; and only on
+    # a test environment it pins.
+    evidenced = recorded is not None or origin["source"] == "synthetic"
+    lineaged = all(
+        lineages[key] is not None or defect["discovery"]["fix"] is None
+        for key, defect in case["defects"].items()
+    )
+    pinned = any(blob is not None for blob in environment["files"].values())
+    runnable = on_context and evidenced and lineaged and pinned
     negative = None
     labels = [label for defect in case["defects"].values() for label in defect["labels"]]
     if STRATA[case["stratum"]]:
@@ -963,6 +1123,10 @@ class Git:
         stamp = self.out("show", "-s", "--format=%ct", commit)
         return int(stamp) if stamp and stamp.isdigit() else None
 
+    def parents(self, commit: str) -> list[str] | None:
+        found = self.out("show", "-s", "--format=%P", commit)
+        return None if found is None else found.split()
+
     def line(self, tip: str) -> list[tuple[str, int]] | None:
         """``tip``'s first-parent history, newest first, with committer times."""
         if tip not in self.lines:
@@ -1047,13 +1211,15 @@ def utc_day(stamp: int) -> date:
 
 
 def line_tip(line: list[tuple[str, int]], cutoff: int) -> str | None:
-    """The newest commit of ``line`` at ``cutoff``, or None when git cannot tell.
+    """The newest commit of ``line`` by ``cutoff``, or None when git cannot tell.
 
-    Committer times establish it only when they split the line at the cutoff:
+    Committer times name one only when they split the line at the cutoff:
     every commit after it on the line committed after the cutoff, it and every
-    commit before it by then, as on a base branch that moves only by merges,
-    each committed when it lands. Times out of order across the cutoff leave
-    more than one commit that could have been the tip, so none is taken.
+    commit before it by then. Times out of order across the cutoff leave more
+    than one commit that could have been the tip, so none is taken. Even a
+    clean split is provisional: a commit is made before its ref reaches it, so
+    one dated before the cutoff can have landed after it, and only a review
+    record states which revision the review read.
     """
     newer = 0
     while newer < len(line) and line[newer][1] > cutoff:
@@ -1114,6 +1280,19 @@ def addresses(git: Git, head: str, fix: str, location) -> bool:
     return False
 
 
+def squashes(subject: str | None, pr) -> bool:
+    """Whether a commit subject names ``pr`` as a squash merge's does, at its end."""
+    return subject is not None and subject.endswith(f" (#{pr})")
+
+
+def base_evidence(case) -> str:
+    """What establishes a case's base revision: its review record, a squash's
+    own parent, or, provisionally, its ref's line by committer times."""
+    if case["provenance"]["source"] == "squash":
+        return "squash_parent"
+    return "review_record" if case["record"]["status"] == "captured" else "provisional"
+
+
 def verify_case(git: Git, case, repository) -> list[str]:
     """The rules a historical case's pins fail against ``git``'s object store."""
     failed: list[str] = []
@@ -1146,12 +1325,37 @@ def verify_case(git: Git, case, repository) -> list[str]:
         # or a squash commit, committed when it merged. A later cutoff would
         # admit context from after the review, such as its own findings.
         check(stamp is not None and stamp == cutoff, "the cutoff is the head's committer time")
+    evidence = base_evidence(case)
     if source == "squash":
+        # A squash is one commit on its parent, and its subject names the PR
+        # it merged, as the merge record, which a runnable case holds, states.
+        parents = git.parents(head)
         check(head in on_line, "a squash candidate is on its base ref's line")
-        check(git.resolve(f"{head}^1") == base, "a squash candidate's parent is its merge base")
+        check(parents is not None and len(parents) == 1, "a squash candidate has one parent")
+        check(
+            parents is not None and parents[:1] == [base],
+            "a squash candidate's parent is its merge base",
+        )
+        check(
+            squashes(git.subject(head), case["provenance"]["pr"]),
+            "a squash candidate is its PR's squash",
+        )
+    elif evidence == "review_record":
+        # The base revision the record states, which the corpus check binds:
+        # git can only show it consistent, a commit of the ref's line made by
+        # the time the review read its input. A later commit dated before
+        # then can have reached the ref after it, so the line's order by
+        # committer time is no evidence either way.
+        when = git.committed(tip)
+        check(tip in on_line, "the base revision is on its ref's line")
+        check(
+            when is not None and when <= cutoff,
+            "the base revision was committed by the review's start",
+        )
     else:
-        # Only a line whose committer times split at the cutoff names one tip;
-        # otherwise two base revisions, and so two diffs, would both pass.
+        # Provisional: only a line whose committer times split at the cutoff
+        # names one tip, and otherwise two base revisions, and so two diffs,
+        # would both pass. Such a case is never runnable.
         at = line_tip(line, cutoff)
         if at is None:
             failed.append("the base ref's line splits at the cutoff")
@@ -1187,18 +1391,20 @@ def verify_case(git: Git, case, repository) -> list[str]:
         if fix is not None and merged is None:
             check(git.is_ancestor(introduced, fix), f"defect {key} fix follows its introduction")
         elif fix is not None:
-            # Squashed: the merged revision is a commit of the base line whose
-            # subject names the case's PR as a squash does, that changed every
-            # file the defect is located in and still holds each of its lines
-            # as the head had them, and the fix or revert descends from it. A
-            # later rewrite of the same file carries none of that.
+            # Squashed: the merged revision, which the lineage record states,
+            # is consistent with git when it is one commit of the base line
+            # whose subject names the case's PR as a squash does, that changed
+            # every file the defect is located in and still holds each of its
+            # lines as the head had them, and the fix or revert descends from
+            # it. Consistency is no proof: a later commit can pass each check.
             pr = case["provenance"]["pr"]
             paths = {place["path"] for place in defect["location"]}
             changed = git.changed(merged) if git.kind(merged) == "commit" else None
             subject = git.subject(merged) if changed is not None else None
+            parents = git.parents(merged) if changed is not None else None
             check(merged in on_line, f"defect {key} merged on its base ref's line")
             check(
-                subject is not None and subject.endswith(f" (#{pr})"),
+                squashes(subject, pr) and parents is not None and len(parents) == 1,
                 f"defect {key} merge is its PR's squash",
             )
             check(changed is not None and paths <= changed, f"defect {key} merge carries it")
@@ -1214,7 +1420,9 @@ def verify_case(git: Git, case, repository) -> list[str]:
             )
             check(git.is_ancestor(merged, fix), f"defect {key} fix follows its merge")
         if fix is not None:
-            # The fix or revert itself changed what the defect is located in.
+            # The fix or revert itself changed what the defect is located in:
+            # consistent with its lineage record, though a comment beside the
+            # defect passes as well as a fix of it.
             check(
                 git.kind(fix) == "commit" and addresses(git, head, fix, defect["location"]),
                 f"defect {key} fix changes what it is located in",
@@ -1247,11 +1455,18 @@ def verify(corpus, repo: Path) -> dict:
     cases = {
         case_id: verify_case(git, corpus["cases"][case_id], repository) for case_id in checked.cases
     }
+    # Each case says what its base revision rests on; ``provisional`` is a
+    # guess from committer times that no record confirms.
     return {
         "corpus": checked.digest,
         "ok": not any(cases.values()),
         "cases": {
-            case_id: {"ok": not failed, "failed": failed} for case_id, failed in cases.items()
+            case_id: {
+                "ok": not failed,
+                "failed": failed,
+                "base_tip": base_evidence(corpus["cases"][case_id]),
+            }
+            for case_id, failed in cases.items()
         },
     }
 
@@ -1425,14 +1640,16 @@ def run_counts(run: Run) -> dict[str, Counts]:
     Recall counts the weight of the case's confirmed defects; an unknown
     finding may at most have found the heaviest one still undetected (an outer
     bound, not an attribution). Strata count defects, each bounded on its own.
+    The run is read through its findings and its case's ``Tally`` only, so its
+    cost grows with its findings, never with the case's defects.
     """
     case = run.case
-    confirmed = case.confirmed
+    tally = case.tally
     detected = {key for _, verdict, key in run.findings if verdict == "confirmed"}
-    tally = Counter(verdict for _, verdict, _ in run.findings)
-    unknown = tally["unknown"]
+    verdicts = Counter(verdict for _, verdict, _ in run.findings)
+    unknown = verdicts["unknown"]
     out: dict[str, Counts] = {
-        "precision": (tally["confirmed"], unknown, len(run.findings)),
+        "precision": (verdicts["confirmed"], unknown, len(run.findings)),
     }
     for classification in CLASSIFICATIONS:
         mine = [verdict for c, verdict, _ in run.findings if c == classification]
@@ -1442,30 +1659,34 @@ def run_counts(run: Run) -> dict[str, Counts]:
                 mine.count("unknown"),
                 len(mine),
             )
-    if confirmed:
-        missed = sorted(
-            (WEIGHT[d.severity] for k, d in confirmed.items() if k not in detected), reverse=True
-        )
-        extra = sum(missed[:unknown])
-        found = sum(WEIGHT[confirmed[key].severity] for key in detected)
-        total = sum(WEIGHT[d.severity] for d in confirmed.values())
+    if tally.by_severity:
+        hit = {
+            "severity": Counter(tally.severity[key] for key in detected),
+            "discovery": Counter(tally.source[key] for key in detected),
+        }
+        # The heaviest missed defects first, one per unknown finding.
+        extra, left = 0, unknown
+        for severity in sorted(SEVERITIES, key=WEIGHT.__getitem__, reverse=True):
+            taken = min(left, tally.by_severity[severity] - hit["severity"][severity])
+            extra, left = extra + taken * WEIGHT[severity], left - taken
+        found = sum(WEIGHT[s] * n for s, n in hit["severity"].items())
+        total = sum(WEIGHT[s] * n for s, n in tally.by_severity.items())
         out["recall"] = (found, extra, total)
         out[f"recall/risk/{case.risk}"] = (found, extra, total)
-        for name, attribute, values in (
-            ("severity", "severity", SEVERITIES),
-            ("discovery", "source", DISCOVERY),
+        for name, counts, values in (
+            ("severity", tally.by_severity, SEVERITIES),
+            ("discovery", tally.by_source, DISCOVERY),
         ):
             for value in values:
-                mine_keys = [k for k, d in confirmed.items() if getattr(d, attribute) == value]
-                if mine_keys:
-                    hit = sum(key in detected for key in mine_keys)
+                if counts[value]:
+                    got = hit[name][value]
                     out[f"recall/{name}/{value}"] = (
-                        hit,
-                        min(unknown, len(mine_keys) - hit),
-                        len(mine_keys),
+                        got,
+                        min(unknown, counts[value] - got),
+                        counts[value],
                     )
     if case.negative == "settled":
-        alarm = tally["false"] > 0
+        alarm = verdicts["false"] > 0
         out["false_positive_rate"] = (int(alarm), int(not alarm and unknown > 0), 1)
     return out
 
@@ -1540,10 +1761,17 @@ def pooled(groups: Iterable[Counts]) -> Counts:
 
 
 Observed = list[tuple[str, dict[str, Counts]]]  # (cluster, run_counts) per completed run
+RunKey = tuple[str, str, int]  # variant, case, seed
 
 
-def observed(runs: Iterable[Run]) -> Observed:
-    return [(run.case.cluster, run_counts(run)) for run in runs]
+def run_key(run: Run) -> RunKey:
+    return run.variant, run.case.id, run.seed
+
+
+def observed(runs: Iterable[Run], counts: dict[RunKey, dict[str, Counts]]) -> Observed:
+    """The runs' observations, each computed once (``counts``) for every metric
+    and every contrast that reads it."""
+    return [(run.case.cluster, counts[run_key(run)]) for run in runs]
 
 
 def by_cluster(runs: Observed, key: str) -> dict[str, Counts]:
@@ -1653,6 +1881,9 @@ def score(corpus, submissions, repo: Path | None = None) -> dict:
         require(verify(corpus, repo)["ok"], "a recorded score verifies its corpus")
         verified = {"corpus": checked.digest, "ok": True}
     runs = check_submissions(checked, submissions)
+    # Each completed run's observations, once: every metric of its scorecard
+    # and of each contrast it is paired in reads the same counts.
+    counts = {run_key(run): run_counts(run) for run in runs if run.status == "completed"}
     plan = submissions["plan"]
     planned = [(case_id, seed) for case_id in plan["cases"] for seed in plan["seeds"]]
     by_variant = {
@@ -1672,6 +1903,7 @@ def score(corpus, submissions, repo: Path | None = None) -> dict:
             hits = [key for _, verdict, key in run.findings if verdict == "confirmed"]
             duplicates += len(hits) - len(set(hits))
         launched = [r for r in mine.values() if r.status != "excluded"]
+        observations = observed(completed, counts)
         exposed = Counter(exposure(r.case, variant["knowledge_cutoff"]) for r in completed)
         costs = [r.cost for r in launched]
         cards[name] = {
@@ -1692,7 +1924,7 @@ def score(corpus, submissions, repo: Path | None = None) -> dict:
                 level: exposed[level] for level in ("none", "possible", "unknown")
             },
             "cost_microusd": sum(costs) if None not in costs else None,
-            "metrics": {key: marginal(observed(completed), key) for key in metric_keys()},
+            "metrics": {key: marginal(observations, key) for key in metric_keys()},
         }
     baseline = submissions["baseline"]
     contrasts = {}
@@ -1717,8 +1949,8 @@ def score(corpus, submissions, repo: Path | None = None) -> dict:
             )
         ]
         incomplete = [key for key in planned if key not in excluded and key not in paired]
-        base_runs = observed(by_variant[baseline][key] for key in paired)
-        other_runs = observed(by_variant[name][key] for key in paired)
+        base_runs = observed((by_variant[baseline][key] for key in paired), counts)
+        other_runs = observed((by_variant[name][key] for key in paired), counts)
         metrics = {key: contrast(base_runs, other_runs, key) for key in metric_keys()}
         for item in metrics.values():
             item["usable"] = (
