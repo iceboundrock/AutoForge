@@ -63,6 +63,17 @@ CONTEXT_KINDS = ("issue", "issue_comment", "pr_body", "pr_comment", "document")
 # (see ``required_context``), since a reviewer of either was always given them.
 SINGULAR_KINDS = ("issue", "pr_body")
 INVENTORY_STATUSES = ("complete", "not_captured")
+# A context item's stable source identity, from which its kind follows: the
+# issue or PR body, a comment on either, or a document. The issue and PR are the
+# ones the case's provenance names (see ``source_kind``).
+THREAD_SOURCE = re.compile(r"(issue|pr)/([1-9][0-9]{0,9})(?:/comment/([a-z0-9][a-z0-9._-]{0,63}))?")
+DOCUMENT_SOURCE = "document/"
+THREAD_KINDS = {
+    ("issue", False): "issue",
+    ("issue", True): "issue_comment",
+    ("pr", False): "pr_body",
+    ("pr", True): "pr_comment",
+}
 ROLES = {"curator", "adjudicator", "arbiter"}
 DEFECT_VERDICTS = {"confirmed", "rejected", "unknown"}
 NEGATIVE_VERDICTS = {"clean", "defective", "unknown"}
@@ -158,12 +169,29 @@ def input_digest(case) -> str:
                 "review": case["review"],
                 "environment": case["environment"],
                 "context": [
-                    {key: item[key] for key in ("id", "kind", "ref", "sha256")}
+                    {key: item[key] for key in ("id", "kind", "source", "ref", "sha256")}
                     for item in case["context"]["items"]
                 ],
             }
         )
     ).hexdigest()
+
+
+def source_kind(source) -> tuple[str, str | None, int | None]:
+    """The context kind a source identity names, and the issue or PR it is on.
+
+    ``issue/<n>`` and ``pr/<n>`` are an issue and a PR body,
+    ``issue/<n>/comment/<id>`` and ``pr/<n>/comment/<id>`` a comment on one, and
+    ``document/<path>`` a document (another issue, a file, a page).
+    """
+    require(isinstance(source, str), "context source")
+    if source.startswith(DOCUMENT_SOURCE):
+        relative_path(source.removeprefix(DOCUMENT_SOURCE))
+        return "document", None, None
+    match = THREAD_SOURCE.fullmatch(source)
+    require(match, "context source")
+    thread, number, comment = match.groups()
+    return THREAD_KINDS[(thread, comment is not None)], thread, int(number)
 
 
 def names_commit(text: str, commits: Iterable[str]) -> bool:
@@ -190,6 +218,8 @@ def reviewer_text(case) -> Iterable[str]:
     for item in case["context"]["items"]:
         yield item["id"]
         yield item["kind"]
+        if item["source"] is not None:
+            yield item["source"]
         yield item["ref"]
         if item["text"] is not None:
             yield item["text"]
@@ -260,9 +290,14 @@ def critical_needs_two(severity: str) -> Callable[[object], int]:
 
 CORPUS_FIELDS = "format version mode name release frozen repository cases"
 CASE_FIELDS = (
-    "stratum cluster provenance review environment context actors risk defects negative withheld"
+    "stratum cluster provenance review environment context record actors risk exposure"
+    " defects negative withheld"
 )
+REVIEW_FIELDS = "base_ref base_tip merge_base head tree cutoff"
 DEFECT_FIELDS = "severity class introduced summary location discovery labels"
+DISCOVERY_FIELDS = "source round finding discovered fix merged"
+RECORD_FIELDS = "status source started text sha256"
+EXPOSURE_FIELDS = "possible_from public_by artifact"
 
 
 @dataclass(frozen=True)
@@ -287,19 +322,30 @@ class Case:
     negative: str | None  # settled, censored, unlabeled, refuted; None for a defect case
     runnable: bool
     input: str
+    # Before this day nothing of the case's answer can have been public; None
+    # when no evidence rules any day out.
+    possible_from: date | None = None
+    # By this day part of the answer was certainly public, when that is earlier
+    # than the case itself shows (a disclosure at a previous revision, say).
+    public_by: date | None = None
 
     @property
     def confirmed(self) -> dict:
         return {key: d for key, d in self.defects.items() if d.status == "confirmed"}
 
     @property
-    def earliest_discovery(self) -> date | None:
-        """The first day by which a registered defect had certainly been reported.
+    def public(self) -> date:
+        """The first day by which part of the case's answer was certainly public.
 
-        A discovery day bounds the first report from above only: the report may
-        be earlier, never later.
+        A registered defect's discovery day, or a negative's own cutoff (its
+        answer is its later history), unless the exposure evidence names an
+        earlier disclosure. Each bounds the first report from above only: the
+        report may be earlier, never later.
         """
-        return min((d.discovered for d in self.defects.values()), default=None)
+        days = [d.discovered for d in self.defects.values()] or [self.cutoff.date()]
+        if self.public_by is not None:
+            days.append(self.public_by)
+        return min(days)
 
 
 @dataclass(frozen=True)
@@ -322,29 +368,46 @@ def required_context(origin) -> set[str]:
     return required
 
 
-def check_context(context, *, origin, cutoff: datetime, frozen: date) -> bool:
+def check_context(context, *, origin, cutoff: datetime, frozen: date) -> tuple[bool, set[str]]:
     """Admit only what existed by the cutoff; whether all of it was captured.
 
-    The inventory states what the reviewer was given at the cutoff, counted by
-    kind, and when and from what that listing was taken. A case is runnable only
-    when its inventory is complete, counts exactly the items the case holds, and
-    every one of them is captured. The issue and the PR body its provenance
-    names must be held either way, captured or not: leaving an item out can
-    make a case refused or unrunnable, never runnable.
+    Each item names its stable source identity (``source_kind``): the issue and
+    PR its provenance names, a comment on one of them, or a document. The
+    inventory lists, by those identities, what the reviewer was given at the
+    cutoff, and says when and from what that listing was taken. A case is
+    runnable only when its inventory is complete, lists exactly the sources of
+    the items the case holds, each once, and every item is captured. The issue
+    and the PR body its provenance names must be held either way, captured or
+    not: leaving an item out, or holding a copy of one in another's place, can
+    make a case refused or unrunnable, never runnable. Returns whether it is
+    runnable on its context and the sources it holds.
     """
     closed(context, "inventory items")
     items = context["items"]
     require(isinstance(items, list), "context items")
     ids = set()
+    sources: set[str] = set()
     kinds: Counter = Counter()
     captured = True
     for item in items:
-        closed(item, "id kind ref observed_at status text sha256")
+        closed(item, "id kind source ref observed_at status text sha256")
         require(isinstance(item["id"], str) and IDENTIFIER.fullmatch(item["id"]), "context id")
         require(item["id"] not in ids, "context id repeated")
         ids.add(item["id"])
         require(item["kind"] in CONTEXT_KINDS and nonempty(item["ref"]), "context kind")
         kinds[item["kind"]] += 1
+        source = item["source"]
+        if source is None:
+            # An identity nobody established (a PR whose number no record
+            # states, say) can be held only as uncaptured.
+            require(item["status"] == "not_captured", "a captured context names its source")
+        else:
+            kind, thread, number = source_kind(source)
+            require(kind == item["kind"], "a context item's kind is its source's")
+            if thread is not None:
+                require(number == origin[thread], f"a context source is on the case's {thread}")
+            require(source not in sources, "context source repeated")
+            sources.add(source)
         if item["status"] == "not_captured":
             require(
                 item["observed_at"] is None and item["text"] is None and item["sha256"] is None,
@@ -360,25 +423,67 @@ def check_context(context, *, origin, cutoff: datetime, frozen: date) -> bool:
     for kind in sorted(required_context(origin)):
         require(kinds[kind] == 1, f"the context holds the case's {kind}")
     inventory = context["inventory"]
-    closed(inventory, "status taken artifact counts")
+    closed(inventory, "status taken artifact sources")
     require(inventory["status"] in INVENTORY_STATUSES, "context inventory status")
     if inventory["status"] == "not_captured":
         require(
-            all(inventory[key] is None for key in ("taken", "artifact", "counts")),
+            all(inventory[key] is None for key in ("taken", "artifact", "sources")),
             "an uncaptured inventory holds nothing",
         )
-        return False
+        return False, sources
     taken = instant(inventory["taken"])
     require(cutoff <= taken and taken.date() <= frozen, "inventory taken between cutoff and freeze")
     require(nonempty(inventory["artifact"]), "inventory artifact")
-    counts = inventory["counts"]
-    closed(counts, " ".join(CONTEXT_KINDS))
-    require(all(integer(counts[kind]) for kind in CONTEXT_KINDS), "inventory counts")
+    listed = inventory["sources"]
+    require(isinstance(listed, list), "inventory sources")
+    for source in listed:
+        source_kind(source)
+    require(len(set(listed)) == len(listed), "inventory source repeated")
     require(
-        all(counts[kind] == kinds[kind] for kind in CONTEXT_KINDS),
-        "the inventory counts every context item",
+        all(item["source"] is not None for item in items) and set(listed) == sources,
+        "the inventory lists exactly the context's sources",
     )
-    return captured
+    return captured, sources
+
+
+def check_record(record, *, case, cutoff: datetime, context: set[str]) -> bool:
+    """The retained record of a review round, and whether it evidences the cutoff.
+
+    A review round's head is committed before its PR, and so its PR body, can
+    exist, so the head's committer time can fall before the context the review
+    read. A later boundary needs evidence kept apart from the corpus: a record
+    of the round, named by its stable source so anyone can read it again, whose
+    digest matches its text and whose text states the head and merge base it
+    reviewed and, verbatim, the instant it read its input. That instant is then
+    the cutoff. The record holds the review's own result, so it is never part
+    of the reviewer's input. Without one the cutoff is the head's committer
+    time, which ``verify`` checks, and the case is never runnable.
+    """
+    closed(record, RECORD_FIELDS)
+    require(record["status"] in ("captured", "not_captured"), "review record status")
+    if record["source"] is not None:
+        source_kind(record["source"])
+        require(record["source"] not in context, "the review record is not the reviewer's context")
+    if record["status"] == "not_captured":
+        require(
+            all(record[key] is None for key in ("started", "text", "sha256")),
+            "an uncaptured review record holds nothing",
+        )
+        return False
+    require(case["provenance"]["source"] == "pr_branch", "only a review round holds its record")
+    require(record["source"] is not None, "a review record names its source")
+    started = instant(record["started"])
+    text = record["text"]
+    require(nonempty(text), "review record text")
+    require(record["sha256"] == sha256(text.encode()).hexdigest(), "review record digest")
+    review = case["review"]
+    lowered = text.lower()
+    require(
+        review["head"] in lowered and review["merge_base"] in lowered and record["started"] in text,
+        "the review record states its head, merge base and start",
+    )
+    require(cutoff == started, "the cutoff is the review record's start")
+    return True
 
 
 def check_defect(key, defect, *, case, cutoff: datetime, frozen: date, withheld, barred) -> Defect:
@@ -406,8 +511,11 @@ def check_defect(key, defect, *, case, cutoff: datetime, frozen: date, withheld,
             "defect lines",
         )
     found = defect["discovery"]
-    closed(found, "source round finding discovered fix")
+    closed(found, DISCOVERY_FIELDS)
     require(found["source"] in DISCOVERY, "discovery source")
+    # Discovery is relative to the reviewed head: a report of this head or a
+    # later one. A disclosure before it (at a previous revision, say) is
+    # exposure evidence, the case's ``exposure``, never a discovery.
     discovered = day(found["discovered"])
     require(cutoff.date() <= discovered <= frozen, "discovered between cutoff and freeze")
     require(found["finding"] is None or nonempty(found["finding"]), "discovery finding")
@@ -423,6 +531,13 @@ def check_defect(key, defect, *, case, cutoff: datetime, frozen: date, withheld,
     if found["fix"] is not None:
         fix = object_id(found["fix"])
         require(fix in withheld, "a fix is withheld from the reviewer")
+    # A defect that escaped a PR branch through a squash reaches its fix or
+    # revert through the merged revision, not through its introducing commit.
+    if found["merged"] is not None:
+        merged = object_id(found["merged"])
+        require(found["fix"] is not None, "a merged revision leads to a fix")
+        require(merged in withheld, "a merged revision is withheld from the reviewer")
+        require(merged not in (introduced, found["fix"]), "a merged revision is its own commit")
     check_labels(defect["labels"], DEFECT_VERDICTS, frozen=frozen, barred=barred)
     status = settle(defect["labels"], critical_needs_two(defect["severity"]))
     return Defect(
@@ -452,11 +567,15 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
     else:
         require(origin["round"] is None or integer(origin["round"], 1), "provenance round")
     review = case["review"]
-    closed(review, "base_ref merge_base head tree cutoff")
+    closed(review, REVIEW_FIELDS)
     require(nonempty(review["base_ref"]), "base ref")
     head, base = object_id(review["head"]), object_id(review["merge_base"])
+    tip = object_id(review["base_tip"])
     object_id(review["tree"])
     require(head != base, "the candidate is above its merge base")
+    require(tip != head, "the base revision is not the candidate")
+    if origin["source"] == "squash":
+        require(tip == base, "a squash candidate's base revision is its merge base")
     cutoff = instant(review["cutoff"])
     require(cutoff.date() <= frozen, "a candidate reviewed by the freeze")
     environment = case["environment"]
@@ -475,7 +594,7 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
     for commit in withheld:
         object_id(commit)
     require(len(set(withheld)) == len(withheld), "withheld commit repeated")
-    require(head not in withheld and base not in withheld, "the candidate is not withheld")
+    require(not {head, base, tip} & set(withheld), "the candidate is not withheld")
     actors = case["actors"]
     require(
         isinstance(actors, list) and actors and all(nonempty(actor) for actor in actors),
@@ -486,8 +605,28 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
     risk = case["risk"]
     closed(risk, "stratum rationale")
     require(risk["stratum"] in RISKS and nonempty(risk["rationale"]), "risk stratum")
+    exposure = case["exposure"]
+    closed(exposure, EXPOSURE_FIELDS)
+    require(nonempty(exposure["artifact"]), "exposure artifact")
+    possible_from = None if exposure["possible_from"] is None else day(exposure["possible_from"])
+    public_by = None if exposure["public_by"] is None else day(exposure["public_by"])
+    # The candidate existed by its cutoff, so nothing can rule exposure out
+    # after it; ``verify`` also holds the day to the commits the case pins.
+    require(
+        possible_from is None or possible_from <= cutoff.date(), "exposure possible by the cutoff"
+    )
+    require(public_by is None or public_by <= frozen, "exposure public by the freeze")
+    require(
+        None in (possible_from, public_by) or possible_from <= public_by,
+        "exposure possible before it was public",
+    )
     forbidden = set(withheld)
-    runnable = check_context(case["context"], origin=origin, cutoff=cutoff, frozen=frozen)
+    on_context, sources = check_context(
+        case["context"], origin=origin, cutoff=cutoff, frozen=frozen
+    )
+    recorded = check_record(case["record"], case=case, cutoff=cutoff, context=sources)
+    # A review round's case runs only on a cutoff its record evidences.
+    runnable = on_context and (recorded or origin["source"] != "pr_branch")
     require(
         not any(names_commit(text, forbidden) for text in reviewer_text(case)),
         "the reviewer's input names a withheld commit",
@@ -535,7 +674,30 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
         negative=negative,
         runnable=runnable,
         input=input_digest(case),
+        possible_from=possible_from,
+        public_by=public_by,
     )
+
+
+def check_clusters(corpus, cases: dict) -> None:
+    """Cases of one issue, of one PR or of one defect's commit share a cluster.
+
+    Rounds of one PR share code and their reviewers' history, so counting them
+    as separate clusters would overstate the evidence. A cluster may still hold
+    several issues the curator judges related.
+    """
+    owner: dict[tuple[str, str | int], str] = {}
+    for case_id, case in sorted(corpus["cases"].items()):
+        origin = case["provenance"]
+        keys = [("issue", origin["issue"]), ("pr", origin["pr"])]
+        keys += [("commit", defect["introduced"]) for defect in case["defects"].values()]
+        cluster = cases[case_id].cluster
+        for key in keys:
+            if key[1] is not None:
+                require(
+                    owner.setdefault(key, cluster) == cluster,
+                    "cases of one issue, PR or defect share a cluster",
+                )
 
 
 def check_corpus(corpus) -> Corpus:
@@ -546,14 +708,24 @@ def check_corpus(corpus) -> Corpus:
     require(isinstance(corpus["name"], str) and IDENTIFIER.fullmatch(corpus["name"]), "name")
     require(integer(corpus["release"], 1), "corpus release")
     frozen = day(corpus["frozen"])
-    closed(corpus["repository"], "slug root")
-    require(nonempty(corpus["repository"]["slug"]), "repository slug")
-    object_id(corpus["repository"]["root"])
+    repository = corpus["repository"]
+    closed(repository, "slug root refs")
+    require(nonempty(repository["slug"]), "repository slug")
+    object_id(repository["root"])
+    # Each base ref's tip at the freeze: the line a case's base revision is on.
+    refs = repository["refs"]
+    require(isinstance(refs, dict) and refs, "repository refs")
+    for ref, tip in refs.items():
+        require(nonempty(ref), "repository refs")
+        object_id(tip)
     require(isinstance(corpus["cases"], dict) and corpus["cases"], "registered cases")
     cases = {
         case_id: check_case(case_id, case, mode=corpus["mode"], frozen=frozen)
         for case_id, case in sorted(corpus["cases"].items())
     }
+    for case in corpus["cases"].values():
+        require(case["review"]["base_ref"] in refs, "a case's base ref is frozen")
+    check_clusters(corpus, cases)
     inputs = [case.input for case in cases.values()]
     require(len(set(inputs)) == len(inputs), "two cases with one review input")
     return Corpus(
@@ -645,6 +817,7 @@ class Git:
             for key, value in os.environ.items()
             if key in GIT_ENV_KEEP or key.startswith("LC_")
         } | GIT_ENV
+        self.lines: dict[str, list[tuple[str, int]] | None] = {}
 
     def run(self, *args: str) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
@@ -674,6 +847,37 @@ class Git:
         stamp = self.out("show", "-s", "--format=%ct", commit)
         return int(stamp) if stamp and stamp.isdigit() else None
 
+    def line(self, tip: str) -> list[tuple[str, int]] | None:
+        """``tip``'s first-parent history, newest first, with committer times."""
+        if tip not in self.lines:
+            self.lines[tip] = self._line(tip)
+        return self.lines[tip]
+
+    def _line(self, tip: str) -> list[tuple[str, int]] | None:
+        listed = self.out("rev-list", "--first-parent", "--timestamp", tip)
+        if not listed:
+            return None
+        line = []
+        for row in listed.splitlines():
+            stamp, _, commit = row.partition(" ")
+            if not stamp.isdigit() or not OBJECT_ID.fullmatch(commit):
+                return None
+            line.append((commit, int(stamp)))
+        return line
+
+    def merge_bases(self, one: str, other: str) -> list[str] | None:
+        found = self.out("merge-base", "--all", one, other)
+        return sorted(found.split()) if found else None
+
+    def changed(self, commit: str) -> set[str] | None:
+        """The paths ``commit`` changed against its first parent."""
+        done = self.run(
+            "diff-tree", "-r", "-z", "--name-only", "--no-renames", f"{commit}^1", commit
+        )
+        if done.returncode:
+            return None
+        return {path.decode() for path in done.stdout.split(b"\0") if path}
+
     def line_count(self, commit: str, path: str) -> int | None:
         done = self.run("cat-file", "blob", f"{commit}:{path}")
         if done.returncode:
@@ -682,7 +886,24 @@ class Git:
         return body.count(b"\n") + (1 if body and not body.endswith(b"\n") else 0)
 
 
-def verify_case(git: Git, case, root: str) -> list[str]:
+def utc_day(stamp: int) -> date:
+    return datetime.fromtimestamp(stamp, UTC).date()
+
+
+def tip_at(line: list[tuple[str, int]], tip: str, cutoff: int) -> bool:
+    """Whether ``tip`` was its line's newest commit at ``cutoff``, by committer time.
+
+    It was committed by the cutoff and the commit after it on the line was not,
+    as on a base branch that moves only by merges, each committed when it lands.
+    """
+    commits = [commit for commit, _ in line]
+    if tip not in commits:
+        return False
+    at = commits.index(tip)
+    return line[at][1] <= cutoff and (at == 0 or line[at - 1][1] > cutoff)
+
+
+def verify_case(git: Git, case, repository) -> list[str]:
     """The rules a historical case's pins fail against ``git``'s object store."""
     failed: list[str] = []
 
@@ -691,23 +912,37 @@ def verify_case(git: Git, case, root: str) -> list[str]:
             failed.append(rule)
 
     review = case["review"]
-    head, base = review["head"], review["merge_base"]
+    source = case["provenance"]["source"]
+    head, tip, base = review["head"], review["base_tip"], review["merge_base"]
     cutoff = int(instant(review["cutoff"]).timestamp())
     check(git.kind(head) == "commit", "head is a commit")
     check(git.kind(base) == "commit", "merge base is a commit")
-    if failed:
+    check(git.kind(tip) == "commit", "base revision is a commit")
+    line = git.line(repository["refs"][review["base_ref"]])
+    check(line is not None, "the base ref's frozen tip is a commit")
+    if failed or line is None:
         return failed
+    on_line = {commit for commit, _ in line}
     check(git.resolve(f"{head}^{{tree}}") == review["tree"], "head tree")
-    check(git.is_ancestor(base, head), "merge base is an ancestor of head")
-    check(git.is_ancestor(root, head), "repository root is an ancestor of head")
-    # Version 1 has one review-time boundary for both historical sources: the
-    # head's committer time (a review round's head, or the squash commit, which
-    # is committed when it merges). A later cutoff would admit context from
-    # after the review, such as the review's own findings.
+    check(git.is_ancestor(repository["root"], head), "repository root is an ancestor of head")
     stamp = git.committed(head)
-    check(stamp is not None and stamp == cutoff, "the cutoff is the head's committer time")
-    if case["provenance"]["source"] == "squash":
+    if source == "pr_branch" and case["record"]["status"] == "captured":
+        # The record's start, which the corpus check holds the cutoff to; the
+        # withheld commits below bound it from above, the head from below.
+        check(stamp is not None and stamp <= cutoff, "the head was committed by the review's start")
+    else:
+        # Without a record, the head's committer time: a review round's head,
+        # or a squash commit, committed when it merged. A later cutoff would
+        # admit context from after the review, such as its own findings.
+        check(stamp is not None and stamp == cutoff, "the cutoff is the head's committer time")
+    if source == "squash":
+        check(head in on_line, "a squash candidate is on its base ref's line")
         check(git.resolve(f"{head}^1") == base, "a squash candidate's parent is its merge base")
+    else:
+        check(tip_at(line, tip, cutoff), "the base revision is its ref's tip at the cutoff")
+    # The merge base the diff starts from is the base revision's with the head,
+    # not merely some ancestor of the head: an older one is another diff.
+    check(git.merge_bases(tip, head) == [base], "the merge base is the base revision's and head's")
     for index, (path, blob) in enumerate(sorted(case["environment"]["files"].items())):
         found = git.resolve(f"{head}:{path}")
         check(found == blob and git.kind(blob) == "blob", f"environment file {index}")
@@ -716,18 +951,30 @@ def verify_case(git: Git, case, root: str) -> list[str]:
             failed.append(f"withheld {commit[:12]} is a commit")
             continue
         check(git.is_ancestor(commit, head) is False, f"withheld {commit[:12]} is not in head")
+        check(git.is_ancestor(commit, tip) is False, f"withheld {commit[:12]} is not in the base")
         stamp = git.committed(commit)
         check(stamp is not None and stamp > cutoff, f"withheld {commit[:12]} follows the cutoff")
+    introduced_days = []
     for key, defect in sorted(case["defects"].items()):
         introduced = defect["introduced"]
         if git.kind(introduced) != "commit":
             failed.append(f"defect {key} introduced by a commit")
             continue
+        introduced_days.append(git.committed(introduced))
         check(git.is_ancestor(introduced, head), f"defect {key} introduced in head")
         check(git.is_ancestor(introduced, base) is False, f"defect {key} above the merge base")
-        fix = defect["discovery"]["fix"]
-        if fix is not None:
+        fix, merged = defect["discovery"]["fix"], defect["discovery"]["merged"]
+        if fix is not None and merged is None:
             check(git.is_ancestor(introduced, fix), f"defect {key} fix follows its introduction")
+        elif fix is not None:
+            # Squashed: the merged revision is a commit of the base line that
+            # changed every file the defect is located in, and the fix or
+            # revert descends from it.
+            paths = {place["path"] for place in defect["location"]}
+            changed = git.changed(merged) if git.kind(merged) == "commit" else None
+            check(merged in on_line, f"defect {key} merged on its base ref's line")
+            check(changed is not None and paths <= changed, f"defect {key} merge carries it")
+            check(git.is_ancestor(merged, fix), f"defect {key} fix follows its merge")
         for index, place in enumerate(defect["location"]):
             count = git.line_count(head, place["path"])
             lines = place["lines"]
@@ -735,6 +982,15 @@ def verify_case(git: Git, case, root: str) -> list[str]:
                 count is not None and (lines is None or lines[1] <= count),
                 f"defect {key} location {index}",
             )
+    possible = case["exposure"]["possible_from"]
+    if possible is not None:
+        # Nothing of the answer can be public before the code it is about, but
+        # the code is public no later than its commits: a later day is refused.
+        stamps = [git.committed(head), *introduced_days]
+        check(
+            all(s is not None and day(possible) <= utc_day(s) for s in stamps),
+            "exposure possible no later than the commits it is about",
+        )
     return failed
 
 
@@ -743,8 +999,10 @@ def verify(corpus, repo: Path) -> dict:
     checked = check_corpus(corpus)
     require(checked.mode == "historical", "only a historical corpus names real objects")
     git = Git(repo)
-    root = corpus["repository"]["root"]
-    cases = {case_id: verify_case(git, corpus["cases"][case_id], root) for case_id in checked.cases}
+    repository = corpus["repository"]
+    cases = {
+        case_id: verify_case(git, corpus["cases"][case_id], repository) for case_id in checked.cases
+    }
     return {
         "corpus": checked.digest,
         "ok": not any(cases.values()),
@@ -862,7 +1120,7 @@ def check_submissions(corpus: Corpus, submissions) -> list[Run]:
     require(len(set(plan["cases"])) == len(plan["cases"]), "planned case repeated")
     for case_id in plan["cases"]:
         require(case_id in corpus.cases, "planned case registered")
-        require(corpus.cases[case_id].runnable, "a planned case has its context captured")
+        require(corpus.cases[case_id].runnable, "a planned case is runnable")
     seeds = plan["seeds"]
     require(isinstance(seeds, list) and seeds and all(integer(s, 1) for s in seeds), "seeds")
     require(len(set(seeds)) == len(seeds), "planned seed repeated")
@@ -1093,26 +1351,38 @@ def contrast(base_runs: Observed, other_runs: Observed, key: str) -> dict:
 def exposure(case: Case, knowledge_cutoff: str | None) -> str:
     """Whether a variant's training data may hold the case's answer.
 
-    ``none`` only with evidence: the variant's stated knowledge cutoff precedes
-    the candidate itself, so nothing about its review could have been public.
-    ``possible`` when the cutoff falls on or after a day by which the answer
-    was public: a registered defect's discovery, or a negative's own cutoff, as
-    a negative's answer is its later history. ``unknown`` otherwise: no cutoff
-    is stated, or it falls between the candidate and its first discovery day,
-    which bounds the first report from above only.
+    ``possible`` when the variant's stated knowledge cutoff falls on or after a
+    day by which part of the answer was public (``Case.public``). ``none`` only
+    when the case's exposure evidence rules every earlier day out: the cutoff
+    falls before the first day the answer could have been public. The candidate
+    being newer proves nothing on its own, since its head can carry code, and a
+    finding about it, from a revision public before it. ``unknown`` otherwise:
+    no knowledge cutoff, no evidence, or a cutoff between the two days.
     """
     if knowledge_cutoff is None:
         return "unknown"
     known = day(knowledge_cutoff)
-    if known < case.cutoff.date():
+    if known >= case.public:
+        return "possible"
+    if case.possible_from is not None and known < case.possible_from:
         return "none"
-    public = case.earliest_discovery if case.defects else case.cutoff.date()
-    return "possible" if public is not None and known >= public else "unknown"
+    return "unknown"
 
 
-def score(corpus, submissions) -> dict:
-    """Scorecards of every variant and its contrast with the baseline."""
+def score(corpus, submissions, repo: Path | None = None) -> dict:
+    """Scorecards of every variant and its contrast with the baseline.
+
+    A historical corpus is scored only once ``verify`` accepts that exact
+    corpus against the object store at ``repo``: a cutoff or merge base the
+    object store contradicts never reaches a recorded scorecard.
+    """
     checked = check_corpus(corpus)
+    verified = None
+    if checked.mode == "historical":
+        if repo is None:
+            raise CorpusError("a recorded score verifies its corpus")
+        require(verify(corpus, repo)["ok"], "a recorded score verifies its corpus")
+        verified = {"corpus": checked.digest, "ok": True}
     runs = check_submissions(checked, submissions)
     plan = submissions["plan"]
     planned = [(case_id, seed) for case_id in plan["cases"] for seed in plan["seeds"]]
@@ -1201,6 +1471,7 @@ def score(corpus, submissions) -> dict:
         "evidence": submissions["mode"],
         "claim": CLAIM,
         "corpus": {"name": checked.name, "release": checked.release, "sha256": checked.digest},
+        "verified": verified,
         "plan": {
             "cases": len(plan["cases"]),
             "seeds": sorted(plan["seeds"]),
@@ -1254,6 +1525,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     scored = commands.add_parser("score", help="score submissions against a corpus")
     scored.add_argument("corpus", type=Path, nargs="?", default=SYNTHETIC_CORPUS)
     scored.add_argument("submissions", type=Path, nargs="?", default=SYNTHETIC_SUBMISSIONS)
+    scored.add_argument(
+        "--repo", type=Path, help="the object store a historical corpus verifies in"
+    )
     args = parser.parse_args(argv)
     try:
         corpus = read_json(args.corpus)
@@ -1262,7 +1536,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "verify":
             report = verify(corpus, args.repo)
         else:
-            report = score(corpus, read_json(args.submissions))
+            report = score(corpus, read_json(args.submissions), args.repo)
     except (
         OSError,
         subprocess.SubprocessError,

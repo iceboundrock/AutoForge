@@ -18,23 +18,37 @@ run to [#318's harness rules](evaluation-protocol.md).
 A case is one candidate a reviewer is asked to review, pinned so that anyone holding the
 repository's objects can rebuild exactly what the reviewer was given:
 
-- **Review binding:** base ref, merge base, head, the head's tree, and the review-time cutoff (a
-  UTC instant). The reviewer reads the diff from the merge base to the head.
+- **Review binding:** base ref, base revision (the base ref's commit at the cutoff), merge base,
+  head, the head's tree, and the review-time cutoff (a UTC instant). The reviewer reads the diff
+  from the merge base to the head. The corpus pins each base ref's tip at the freeze
+  (`repository.refs`), whose first-parent line the base revision is on.
 - **Environment:** the blob ids, at the head, of the files that define the test environment
   (`pyproject.toml`, `uv.lock`), and the validation commands a runner may run.
 - **Context:** what the reviewer reads besides the diff (the issue, the PR body, issue and PR
-  comments, documents), and an **inventory** of it. Each item is either captured, as text with its
-  SHA-256 and the instant it reached that state, or explicitly `not_captured`. The inventory is
-  either `complete`, counting by kind every item the reviewer was given at the cutoff and saying
-  when and from what that listing was taken, or `not_captured`.
+  comments, documents), and an **inventory** of it. Each item names its stable **source**:
+  `issue/<n>` and `pr/<n>` for the issue and PR body, `issue/<n>/comment/<id>` and
+  `pr/<n>/comment/<id>` for a comment on them, `document/<path>` for anything else (another issue,
+  a file). The source fixes the item's kind, and `<n>` must be the issue or PR the provenance
+  names. Each item is either captured, as text with its SHA-256 and the instant it reached that
+  state, or explicitly `not_captured`; an item whose source nobody established (a PR no record
+  numbers) has none and can only be `not_captured`. The inventory is either `complete`, listing by
+  source every item the reviewer was given at the cutoff and saying when and from what that listing
+  was taken, or `not_captured`.
+- **Review record** of a `pr_branch` case: the retained record of the historical review round, kept
+  apart from the corpus and out of the reviewer's input (section 2), or `not_captured`.
 - **Defects** of a defect case, or the **negative** record of a negative case (sections 3 and 4).
 - **Withheld commits:** commits that would reveal an answer (the fixes, later rounds, the later
   merge). They are never part of the reviewer's input.
 - **Actors:** who produced, reviewed, fixed or merged the candidate. None may adjudicate it.
 - **Risk stratum:** REV-R0's routine, elevated or critical surface, decided from the diff before
   any outcome is known, with its rationale.
+- **Exposure evidence:** the first day anything of the case's answer could have been public, and a
+  day by which part of it already was when that precedes what the case shows, each a day or
+  `null`, with the artifact that evidences them (section 2).
 - **Cluster:** the unit resampled together. Cases of one issue share code and history, so treating
-  them as independent would overstate the evidence.
+  them as independent would overstate the evidence: cases of one issue, of one PR, or registering a
+  defect of one commit must share a cluster, and the corpus check refuses any that do not. A
+  cluster may hold several issues the curator judges related.
 - **Provenance:** `pr_branch` (a review round's exact head on a PR branch), `squash` (a squash
   commit on main) or `synthetic`; the issue and PR as git states them; the round; the selection
   rule; a note on what is not known.
@@ -58,43 +72,65 @@ from what was learned afterwards. These rules hold that line; each is enforced w
 - A captured context item was observed at or before the cutoff (inclusive) and its digest matches
   its text. Nothing the reviewer is given names a withheld commit: no free-text value of its input
   (the base ref, the environment's paths and validation commands, and every context item's id,
-  kind, reference and text, captured or not) holds a hexadecimal run of seven or more digits that
-  contains a withheld commit's first seven, whether as an abbreviation, the whole id or inside a
-  longer run. The corpus check refuses any other.
+  kind, source, reference and text, captured or not) holds a hexadecimal run of seven or more
+  digits that contains a withheld commit's first seven, whether as an abbreviation, the whole id or
+  inside a longer run. The corpus check refuses any other.
 - A case holds its issue when its provenance names one, and its PR body when its candidate came
-  from a PR (every `pr_branch` and `squash` case), captured or not, and at most one of each. A
-  complete inventory was taken at or after the cutoff and by the freeze, and its counts equal the
-  items the case holds, kind by kind. The corpus check refuses any other, so leaving an item out
-  makes a case refused, never runnable.
-- A case is **runnable** only when its inventory is complete and every item it holds is captured.
-  Reviewing a case without its issue or with part of its discussion would be a different task, so
-  the scorer refuses a plan naming any other case.
-- The cutoff is exactly the head's committer time; every withheld commit exists, is not reachable
-  from the head and was committed after the cutoff; a defect's introducing commit is reachable from
-  the head and not from the merge base, and its fix descends from it. `verify` checks each against
-  the object store. The corpus check refuses a fix that is not withheld, a withheld head or merge
-  base, and a withheld commit named as a present defect's introduction.
+  from a PR (every `pr_branch` and `squash` case), captured or not, and at most one of each. No two
+  items share a source. A complete inventory was taken at or after the cutoff and by the freeze,
+  lists each source once, and lists exactly the sources of the items the case holds, so every item
+  must have one. The corpus check refuses any other, so leaving an item out, or holding another
+  copy of a comment in place of one the listing names, makes a case refused, never runnable. The
+  check cannot tell a copy given the right source; reading each source again at capture is #592's.
+- A case is **runnable** only when its inventory is complete, every item it holds is captured, and,
+  for a `pr_branch` case, its review record is captured. Reviewing a case without its issue or with
+  part of its discussion would be a different task, so the scorer refuses a plan naming any other
+  case.
+- The cutoff is the review-time boundary below. The base revision was its base ref's tip at the
+  cutoff, by committer time on the ref's first-parent line (for a `squash` case, the squash's
+  parent), and the merge base is exactly the merge base of the base revision and the head: an
+  older ancestor of the head would be another diff. Every withheld commit exists, is reachable
+  from neither the head nor the base revision, and was committed after the cutoff. A defect's
+  introducing commit is reachable from the head and not from the merge base, and its fix descends
+  from it, or, when it escaped through a squash, from the **merged** revision: a commit of the base
+  ref's line that changed every file the defect is located in. `verify` checks each against the
+  object store. The corpus check refuses a fix or merged revision that is not withheld, a withheld
+  head, base revision or merge base, and a withheld commit named as a present defect's
+  introduction.
 - A reviewer's input is identified by its digest: the review binding, the environment and each
-  context item's id, kind, reference and text digest. Nothing about the answer (defects, labels,
-  withheld commits, actors, risk, case ids) enters it, and every run states the digest of the input
-  it was given. A run naming another digest is refused.
+  context item's id, kind, source, reference and text digest. Nothing about the answer (defects,
+  labels, the review record, withheld commits, actors, risk, exposure, case ids) enters it, and
+  every run states the digest of the input it was given. A run naming another digest is refused.
 - A model may have been trained on the answer. Each completed run counts its variant's exposure to
-  the case: `none` only when the variant's stated knowledge cutoff falls before the case's cutoff
-  day, since nothing about a review can be public before its candidate exists; `possible` when it
-  falls on or after a day by which the answer was public (a registered defect's discovery day, or a
-  negative's own cutoff, as a negative's answer is its later history); `unknown` when the variant
-  states no cutoff, or when it falls between the candidate and its first discovery day. A discovery
-  day bounds the first report from above only (the seed's is the FIX commit's day), so an earlier
-  disclosure can never be ruled out there. The counts are reported, not corrected for.
+  the case: `possible` when the variant's stated knowledge cutoff falls on or after a day by which
+  part of the answer was public (a registered defect's discovery day, a negative's own cutoff, as a
+  negative's answer is its later history, or an earlier disclosure the exposure evidence names);
+  `none` only when the evidence rules exposure out, the knowledge cutoff falling before the first
+  day anything of the answer could have been public; `unknown` otherwise: no knowledge cutoff, no
+  such evidence, or a cutoff between the two days. A newer candidate proves nothing on its own,
+  since its head can carry code, and a finding about it, from a revision public before it. The first
+  such day is no later than the committer day of the head and of every defect's introducing commit,
+  which `verify` checks; an earlier copy of the code (a rebase, another branch) is the curator's to
+  trace. A discovery is relative to the reviewed head, at or after its cutoff; a disclosure before
+  it is exposure evidence, not a discovery. A discovery day bounds the first report from above only
+  (the seed's is the FIX commit's day). The counts are reported, not corrected for.
 
-For a `pr_branch` case the cutoff is the head's committer time: when the review started is not in
-git, and the head's time is the earliest the candidate existed, so context admitted by it is
-conservative. A `squash` case takes the merge time, which is the squash commit's committer time,
-and its diff is the merged change, which can differ from what the last review read. `verify`
-refuses any other cutoff, later as much as earlier: a later one would admit context from after the
-review started, such as the round's own findings. Version 1 has no other review-time boundary; one
-taken from a record outside git (when the review was launched, say) needs a format change with a
-rule that checks it.
+**The review-time boundary.** A review round's head is committed and pushed before its PR, and so
+its PR body, can exist, so the head's committer time can fall before context its review read. A
+`pr_branch` case may therefore take its cutoff from its **review record**: a record of the round
+retained apart from the corpus (a record the controller kept of the REVIEW launch, say; which record
+serves for this repository's history is #592's to establish), named by its stable source so anyone
+can read it again, with its text and SHA-256. Its text must name the head and the merge base in full
+and state, verbatim, the instant the review read its input, and the cutoff is that instant. The
+record holds the round's own result, so it is never context. `verify` bounds it by git: the head was
+committed by it, and every withheld commit, the round's own FIX among them, after it. Without a
+captured record the cutoff is exactly the head's committer time, the earliest the candidate existed,
+so what it admits is conservative, and the case is never runnable: a round whose boundary is not
+evidenced stays unplanned. A `squash` case takes the merge time, the squash commit's committer time,
+and holds no record; its diff is the merged change, which can differ from what the last review read.
+`verify` refuses any other cutoff, later as much as earlier: a later one would admit context from
+after the review started, such as the round's own findings. What the format cannot check offline is
+that a record is what its source holds; capturing records is #592's.
 
 What a future runner must still provide, and nothing here implements: a disposable repository whose
 history ends at the head (as #318's runs start from a base's tree), so the reviewer cannot read
@@ -151,7 +187,10 @@ seeds; a seed is an independent repetition in a fresh session. Each planned run 
 (with its findings, each classified `blocked`, `non-blocked` or `nit` as a REVIEW result is),
 `failed` (no findings: missing evidence, never zero findings), or `excluded` for one of REV-R0's
 reasons. One run per variant, case and seed. Synthetic submissions are scored only against the
-synthetic corpus and recorded ones only against a historical corpus.
+synthetic corpus and recorded ones only against a historical corpus, and a historical corpus is
+scored only after `verify` accepts that exact corpus against the object store `score --repo`
+names: a cutoff, merge base or lineage git contradicts never reaches a recorded scorecard, whose
+report names the verified corpus's digest.
 
 ## 6. Scorecards
 
@@ -173,12 +212,12 @@ A scorecard also counts runs by status, confirmed, false and unknown findings, d
 
 Uncertainty is reported two ways and never combined. Label bounds come from the unknowns above.
 Sampling uncertainty comes from a cluster bootstrap: 10,000 resamples of the clusters that observe
-the metric, seed 356, every case and seed of a drawn cluster together; the draws depend only on how
-many clusters a metric observes, so both arms of a contrast share them. The report gives the
-nearest-rank 2.5th and 97.5th percentiles of the point estimate (a contrast's of the point
-difference), a separate outer envelope (variant low minus baseline high, variant high minus
-baseline low), and the number of undefined draws, which are never replaced. Values are exact
-fractions.
+the metric (which section 1 holds to the corpus's issues, PRs and defect commits), seed 356, every
+case and seed of a drawn cluster together; the draws depend only on how many clusters a metric
+observes, so both arms of a contrast share them. The report gives the nearest-rank 2.5th and 97.5th
+percentiles of the point estimate (a contrast's of the point difference), a separate outer envelope
+(variant low minus baseline high, variant high minus baseline low), and the number of undefined
+draws, which are never replaced. Values are exact fractions.
 
 A contrast is `usable` only when every planned pair either completed on both arms or was
 excluded, it observes at least two clusters (one cluster resamples to itself), both arms' label
@@ -224,8 +263,10 @@ it (`r2-f1-workdir`), and round 2's FIX added the caller inventory that left out
 (`r4-f2-k13-inventory`). R2-F1 is registered as two defects because its two failures have
 different causes and different introducing commits. That makes 20 registrations of 12 distinct
 defects. The discovery day is the FIX commit's committer day, an upper bound on the review that
-reported it, so a variant whose knowledge cutoff falls before it but on or after the case's cutoff
-day is counted `unknown` exposure, never `none`.
+reported it. The seed states no exposure evidence: git shows each defect's introducing commit, but
+not whether its code, or a report of it, was public earlier (another branch, an earlier attempt,
+the branch before a squash), and the curator has not traced that. So no seed case is ever counted
+`none`: a variant whose knowledge cutoff falls before the first discovery day is `unknown`.
 
 **What the seed does not cover.** It has no `escape`, `revert` or `clean` case. No commit on main
 through `e3443d30` reverts a merged change: the one revert in its history, inside #73's squash,
@@ -240,23 +281,31 @@ R2-F1 and the tracing to earlier heads are the curator's proposals, recorded as 
 none is settled. The two negatives have no independent pass, so they are unlabeled, and by the
 freeze their windows (3 and 21 days) would leave them censored anyway. Offline, git does not hold:
 the issue and PR text at each cutoff, nor the listing of the comments that stood at it, so every
-case holds its issue and PR body as `not_captured` items and an inventory that is `not_captured`,
-and no case is runnable yet; it does not hold the full finding list of each
-round (a finding resolved without a commit, deferred or carried forward does not appear), which
-rounds were clean, and which agents and models acted. PR numbers are as the commits state them
-(main merged those issues as #540 and #460), not checked against GitHub. The actors are
-role names for the same reason.
+case holds its issue (`issue/<n>`) and PR body (`pr/<n>`) as `not_captured` items and an inventory
+that is `not_captured`; #262's branch names no PR, so its PR body has no source, and no listing can
+name it until one is established. Nor does git hold any round's review record, so every round's
+cutoff is its head's committer time. No case is runnable yet, on either count. Git does not hold
+the full finding list of each round either (a finding resolved without a commit, deferred or
+carried forward does not appear), which rounds were clean, and which agents and models acted. PR
+numbers are as the commits state them (main merged those issues as #540 and #460), not checked
+against GitHub. The actors are role names for the same reason. The base ref is `main`, pinned at
+`e3443d30`; at every round's cutoff main had not moved past the round's merge base, so each
+round's base revision is its merge base. The clusters follow the issues: #329's four rounds and
+#540's squash, #414's round and #460's squash, and #262's round.
 
 **Verification.** `uv run python -m tests.review_corpus verify --repo .` was run on 2026-11-27
-against this repository's object store, with git 2.47.3: all eight cases passed every check of
-section 2, each cutoff equal to its head's committer time. The PR branches are not on main, so
-rebuilding these cases needs their objects (the branches, or the PRs' head refs on GitHub, which
-were not checked); CI's shallow checkout does not hold them, so no test reads this repository's
-history.
+against this repository's object store, with git 2.47.3, after the round-2 checks were added: all
+eight cases passed every check of section 2, each cutoff equal to its head's committer time, each
+base revision main's tip at its cutoff and each merge base exactly that of its base revision and
+head; with `pr539-round1`'s merge base replaced by the repository root it fails. The PR branches
+are not on main, so rebuilding these cases needs their objects (the branches, or the PRs' head refs
+on GitHub, which were not checked); CI's shallow checkout does not hold them, so no test reads this
+repository's history.
 
 **What would make it golden:** capturing each case's context as it stood at its cutoff (a GitHub
 read of the issue, PR body and comments with their edit history, and a complete inventory taken
-from that read), independent adjudication of every defect (two for the critical one) and both
+from that read) and each round's review record, exposure evidence traced where it can be,
+independent adjudication of every defect (two for the critical one) and both
 negatives by people who are neither its actors nor any variant to be scored, escape, revert and
 clean cases traced as carefully as the defect cases, and only then planned runs, matched blind.
 
@@ -266,6 +315,7 @@ clean cases traced as carefully as the defect cases, and only then planned runs,
 uv run python -m tests.review_corpus describe           # the seed: cases, strata, label states
 uv run python -m tests.review_corpus verify --repo .    # its pins against this object store
 uv run python -m tests.review_corpus score              # the synthetic fixture's scorecards
+uv run python -m tests.review_corpus score CORPUS SUBMISSIONS --repo .  # a historical corpus
 uv run pytest tests/test_review_corpus.py
 ```
 
@@ -277,11 +327,20 @@ scorecards against values computed by hand, refuse each malformed or leaking rec
 and change windows to show each rule move a number, and run `verify` on a throwaway repository with
 fixed commit dates, including against the operator's `GIT_*` variables and a replacement object, and
 refuse a cutoff later than the head together with the review comment it would admit. They refuse a
-case missing its issue or PR body, an inventory that leaves an item out or counts one too many, a
-withheld commit named in a reference, an id, a validation command or the base ref, and a variant
-that labeled the corpus in any role; they show exposure `unknown` between a candidate and its first
-discovery day and without a stated cutoff. They pin the seed's state: eight historical cases, 20
-unsettled registrations, no runnable case.
+case missing its issue or PR body, an inventory that leaves an item out or lists one too many, a
+copy of a comment held in place of another or a source repeated, a source of another kind or
+issue, a withheld commit named in a reference, a source, an id, a validation command or the base
+ref, and a variant that labeled the corpus in any role. On the throwaway repository they admit a
+PR body opened after the head and before the review its record evidences, refuse context after
+that boundary and a cutoff moved past it, bound the record by the head and the round's fix, refuse
+a recorded score without a verified corpus or with a cutoff git contradicts, refuse an ancestor
+that is not the merge base and a base revision that was not the ref's tip, follow a squashed
+defect through its merge to its post-merge fix and refuse an unrelated fix, and hold exposure
+evidence to the commits. They show exposure `possible` for a defect disclosed at an earlier
+revision, `unknown` between a candidate and its first discovery day and without evidence or a
+stated cutoff, refuse one issue, PR or defect commit split over two clusters, and let related
+issues share one. They pin the seed's state: eight historical cases, 20 unsettled registrations,
+no review record, no exposure evidence, no runnable case.
 
 ## 9. Coordination and amendments
 
@@ -295,10 +354,11 @@ unsettled registrations, no runnable case.
 
 A rule change bumps the format `version`; a content change bumps the corpus `release`. Either
 updates the digests below and the tests in one reviewed change, and says whether any run preceded
-it.
+it. Version 1 and the seed's release 1 were amended in place during their own review, before
+either was merged; no run preceded any amendment.
 
 Fixture SHA-256:
 
-- `autoforge_seed.json`: `0365d7edfd08c1c495f9837f259325bb0aa48cc3b6de070f54d39cbe099bb4b9`
-- `synthetic_corpus.json`: `47b7ba52d24907142054e5e74aa6e239ae98722fe5fcc0ea656a34c109af1026`
-- `synthetic_submissions.json`: `e51a7905a8de4a07de2e4d3d4f217256a21a473a3505ad7fa9ccf5883f8067ef`
+- `autoforge_seed.json`: `565f3ed1829a086be2fde16eba6128b22edd9dcbb22aafa3d431c10099f1d54c`
+- `synthetic_corpus.json`: `68d5f1399b5910910dbbb07b3ec9ba634af9bd0d009ac29b5d99bb43e0704a7b`
+- `synthetic_submissions.json`: `ad9bf7b51ec452c77cdfcda0a58a442c0aa3a765aaccf17bea5ffdfee46db6c7`

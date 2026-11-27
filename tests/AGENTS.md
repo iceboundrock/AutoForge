@@ -299,7 +299,8 @@ read it before adding tests for a listed area.
 - `tests/review_corpus.py` is no test either: REV-R1's corpus tool
   (`docs/review-corpus.md`, #356), which checks a review corpus, verifies a
   historical corpus's pins against a git object store read only, and scores
-  reviewer submissions offline, launching no reviewer and calling no model.
+  reviewer submissions offline, a historical corpus only once that exact
+  corpus verifies, launching no reviewer and calling no model.
   `tests/test_review_corpus.py` runs it on the synthetic fixture and on
   throwaway repositories with fixed commit dates, never on this repository's
   own history, which CI's shallow checkout does not hold: verifying the seed
@@ -635,8 +636,11 @@ the evaluation protocol (#318)        test_evaluation.py (the pins, what arms ho
                                       its reproducibility, the negative fixtures, the oracle)
 the review corpus (REV-R1, #356)      test_review_corpus.py (the synthetic scorecards by hand,
                                       label settlement, censoring, cutoff and leakage
-                                      refusals, the seed's unadjudicated state, verify on a
-                                      throwaway repository)
+                                      refusals, context bound to its listed sources, exposure
+                                      evidence, cluster integrity, the seed's unadjudicated
+                                      state, verify on a throwaway repository: the review
+                                      record's boundary, the merge base, squash lineage, and
+                                      recorded scoring bound to it)
 troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
                                       a test that exists; the guide's links and the links
                                       into it resolve)

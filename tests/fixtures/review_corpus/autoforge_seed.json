@@ -7,7 +7,10 @@
   "frozen": "2026-11-27",
   "repository": {
     "slug": "iceboundrock/AutoForge",
-    "root": "e5d562e85f2d6eb5c10a1bfe02707f1e554ecb2d"
+    "root": "e5d562e85f2d6eb5c10a1bfe02707f1e554ecb2d",
+    "refs": {
+      "main": "e3443d308c72b5afd873cfdcfc50d947ab5c55ff"
+    }
   },
   "cases": {
     "issue262-round1": {
@@ -23,6 +26,7 @@
       },
       "review": {
         "base_ref": "main",
+        "base_tip": "70e8bb0199b80b58199730f4546456b5377cd555",
         "merge_base": "70e8bb0199b80b58199730f4546456b5377cd555",
         "head": "fd257b2829fc69941ad7fbe0b5be1e25b4b2db7b",
         "tree": "8926e1684367a793c7f2015e1c88cc4853c9e284",
@@ -42,12 +46,13 @@
           "status": "not_captured",
           "taken": null,
           "artifact": null,
-          "counts": null
+          "sources": null
         },
         "items": [
           {
             "id": "issue",
             "kind": "issue",
+            "source": "issue/262",
             "ref": "#262 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -57,6 +62,7 @@
           {
             "id": "pr-body",
             "kind": "pr_body",
+            "source": null,
             "ref": "the PR of branch autoforge/262, whose number no commit states",
             "observed_at": null,
             "status": "not_captured",
@@ -64,6 +70,13 @@
             "sha256": null
           }
         ]
+      },
+      "record": {
+        "status": "not_captured",
+        "source": null,
+        "started": null,
+        "text": null,
+        "sha256": null
       },
       "actors": [
         "autoforge-producer",
@@ -73,6 +86,11 @@
       "risk": {
         "stratum": "routine",
         "rationale": "the README's feature matrix (documentation)"
+      },
+      "exposure": {
+        "possible_from": null,
+        "public_by": null,
+        "artifact": "not traced: git shows each defect's introducing commit, not whether its code, or a report of it, was public earlier (another branch, an earlier attempt), so no day is ruled out"
       },
       "defects": {
         "r1-f1-relaunch-claim": {
@@ -91,7 +109,8 @@
             "round": 1,
             "finding": "R1-F1",
             "discovered": "2026-11-22",
-            "fix": "f4c836a3999276e4001f3e5d6bc2b49278c25181"
+            "fix": "f4c836a3999276e4001f3e5d6bc2b49278c25181",
+            "merged": null
           },
           "labels": [
             {
@@ -122,6 +141,7 @@
       },
       "review": {
         "base_ref": "main",
+        "base_tip": "280702b7623e7ec29e5f2529485e4702df4ce84b",
         "merge_base": "280702b7623e7ec29e5f2529485e4702df4ce84b",
         "head": "0b8eeb75703e673a926ea6a85e02285faa4b29fd",
         "tree": "cbe41c9530559d1b7df2c93e36b2f5408a569e98",
@@ -141,12 +161,13 @@
           "status": "not_captured",
           "taken": null,
           "artifact": null,
-          "counts": null
+          "sources": null
         },
         "items": [
           {
             "id": "issue",
             "kind": "issue",
+            "source": "issue/414",
             "ref": "#414 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -156,6 +177,7 @@
           {
             "id": "pr-body",
             "kind": "pr_body",
+            "source": "pr/459",
             "ref": "#459 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -163,6 +185,13 @@
             "sha256": null
           }
         ]
+      },
+      "record": {
+        "status": "not_captured",
+        "source": null,
+        "started": null,
+        "text": null,
+        "sha256": null
       },
       "actors": [
         "autoforge-producer",
@@ -172,6 +201,11 @@
       "risk": {
         "stratum": "critical",
         "rationale": "who may drive a PR: the ownership fence between runs (authorization)"
+      },
+      "exposure": {
+        "possible_from": null,
+        "public_by": null,
+        "artifact": "not traced: git shows each defect's introducing commit, not whether its code, or a report of it, was public earlier (another branch, an earlier attempt), so no day is ruled out"
       },
       "defects": {
         "r1-f1-owner-removed": {
@@ -194,7 +228,8 @@
             "round": 1,
             "finding": "R1-F1",
             "discovered": "2026-11-03",
-            "fix": "8df0b1e27e0b60999d11c49bb0a275fac16192f6"
+            "fix": "8df0b1e27e0b60999d11c49bb0a275fac16192f6",
+            "merged": null
           },
           "labels": [
             {
@@ -222,7 +257,8 @@
             "round": 1,
             "finding": "R1-F2",
             "discovered": "2026-11-03",
-            "fix": "8df0b1e27e0b60999d11c49bb0a275fac16192f6"
+            "fix": "8df0b1e27e0b60999d11c49bb0a275fac16192f6",
+            "merged": null
           },
           "labels": [
             {
@@ -250,7 +286,8 @@
             "round": 1,
             "finding": "R1-F3",
             "discovered": "2026-11-03",
-            "fix": "8df0b1e27e0b60999d11c49bb0a275fac16192f6"
+            "fix": "8df0b1e27e0b60999d11c49bb0a275fac16192f6",
+            "merged": null
           },
           "labels": [
             {
@@ -278,7 +315,8 @@
             "round": 1,
             "finding": "R1-F4",
             "discovered": "2026-11-03",
-            "fix": "8df0b1e27e0b60999d11c49bb0a275fac16192f6"
+            "fix": "8df0b1e27e0b60999d11c49bb0a275fac16192f6",
+            "merged": null
           },
           "labels": [
             {
@@ -319,6 +357,7 @@
       },
       "review": {
         "base_ref": "main",
+        "base_tip": "01c6836b833e3782a99e031440864f629420b601",
         "merge_base": "01c6836b833e3782a99e031440864f629420b601",
         "head": "08a2e075b3c5383dfbae567ed943d40b662c75a9",
         "tree": "126610b360caafd40263a17007c926e4874a5a20",
@@ -338,12 +377,13 @@
           "status": "not_captured",
           "taken": null,
           "artifact": null,
-          "counts": null
+          "sources": null
         },
         "items": [
           {
             "id": "issue",
             "kind": "issue",
+            "source": "issue/414",
             "ref": "#414 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -353,6 +393,7 @@
           {
             "id": "pr-body",
             "kind": "pr_body",
+            "source": "pr/460",
             "ref": "#460 as merged",
             "observed_at": null,
             "status": "not_captured",
@@ -360,6 +401,13 @@
             "sha256": null
           }
         ]
+      },
+      "record": {
+        "status": "not_captured",
+        "source": null,
+        "started": null,
+        "text": null,
+        "sha256": null
       },
       "actors": [
         "autoforge-producer",
@@ -370,6 +418,11 @@
       "risk": {
         "stratum": "critical",
         "rationale": "who may drive a PR: the ownership fence between runs (authorization)"
+      },
+      "exposure": {
+        "possible_from": null,
+        "public_by": null,
+        "artifact": "not traced: the squash merged code its PR branch held, and was public there, before it; the curator has not dated that branch, so no day is ruled out"
       },
       "defects": {},
       "negative": {
@@ -399,6 +452,7 @@
       },
       "review": {
         "base_ref": "main",
+        "base_tip": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
         "merge_base": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
         "head": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
         "tree": "a6a0436effc29d77b3ee5c8281ac3bed454188f0",
@@ -418,12 +472,13 @@
           "status": "not_captured",
           "taken": null,
           "artifact": null,
-          "counts": null
+          "sources": null
         },
         "items": [
           {
             "id": "issue",
             "kind": "issue",
+            "source": "issue/329",
             "ref": "#329 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -433,6 +488,7 @@
           {
             "id": "pr-body",
             "kind": "pr_body",
+            "source": "pr/539",
             "ref": "#539 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -440,6 +496,13 @@
             "sha256": null
           }
         ]
+      },
+      "record": {
+        "status": "not_captured",
+        "source": null,
+        "started": null,
+        "text": null,
+        "sha256": null
       },
       "actors": [
         "autoforge-producer",
@@ -449,6 +512,11 @@
       "risk": {
         "stratum": "critical",
         "rationale": "GitHub read-back verification and the credential it sends (data integrity, credentials)"
+      },
+      "exposure": {
+        "possible_from": null,
+        "public_by": null,
+        "artifact": "not traced: git shows each defect's introducing commit, not whether its code, or a report of it, was public earlier (another branch, an earlier attempt), so no day is ruled out"
       },
       "defects": {
         "r1-f1-reply-text": {
@@ -471,7 +539,8 @@
             "round": 1,
             "finding": "R1-F1",
             "discovered": "2026-11-23",
-            "fix": "c8d96429ac1aac2023cc06c11b669e4d0fc809ce"
+            "fix": "c8d96429ac1aac2023cc06c11b669e4d0fc809ce",
+            "merged": null
           },
           "labels": [
             {
@@ -503,7 +572,8 @@
             "round": 2,
             "finding": "R2-F1",
             "discovered": "2026-11-23",
-            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7"
+            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7",
+            "merged": null
           },
           "labels": [
             {
@@ -535,7 +605,8 @@
             "round": 2,
             "finding": "R2-F2",
             "discovered": "2026-11-23",
-            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7"
+            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7",
+            "merged": null
           },
           "labels": [
             {
@@ -567,7 +638,8 @@
             "round": 3,
             "finding": "R3-F1",
             "discovered": "2026-11-23",
-            "fix": "f47a59a37b0558cd038c4e80e3262f299198a4cd"
+            "fix": "f47a59a37b0558cd038c4e80e3262f299198a4cd",
+            "merged": null
           },
           "labels": [
             {
@@ -599,7 +671,8 @@
             "round": 4,
             "finding": "R4-F1",
             "discovered": "2026-11-23",
-            "fix": "b6e62d546013e76bfb72c648d69721d981f2a357"
+            "fix": "b6e62d546013e76bfb72c648d69721d981f2a357",
+            "merged": null
           },
           "labels": [
             {
@@ -635,6 +708,7 @@
       },
       "review": {
         "base_ref": "main",
+        "base_tip": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
         "merge_base": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
         "head": "c8d96429ac1aac2023cc06c11b669e4d0fc809ce",
         "tree": "c1f02ee7485b5395dabacefddbce9f1694fbfd06",
@@ -654,12 +728,13 @@
           "status": "not_captured",
           "taken": null,
           "artifact": null,
-          "counts": null
+          "sources": null
         },
         "items": [
           {
             "id": "issue",
             "kind": "issue",
+            "source": "issue/329",
             "ref": "#329 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -669,6 +744,7 @@
           {
             "id": "pr-body",
             "kind": "pr_body",
+            "source": "pr/539",
             "ref": "#539 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -676,6 +752,13 @@
             "sha256": null
           }
         ]
+      },
+      "record": {
+        "status": "not_captured",
+        "source": null,
+        "started": null,
+        "text": null,
+        "sha256": null
       },
       "actors": [
         "autoforge-producer",
@@ -685,6 +768,11 @@
       "risk": {
         "stratum": "critical",
         "rationale": "GitHub read-back verification and the credential it sends (data integrity, credentials)"
+      },
+      "exposure": {
+        "possible_from": null,
+        "public_by": null,
+        "artifact": "not traced: git shows each defect's introducing commit, not whether its code, or a report of it, was public earlier (another branch, an earlier attempt), so no day is ruled out"
       },
       "defects": {
         "r2-f1-nesting": {
@@ -707,7 +795,8 @@
             "round": 2,
             "finding": "R2-F1",
             "discovered": "2026-11-23",
-            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7"
+            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7",
+            "merged": null
           },
           "labels": [
             {
@@ -739,7 +828,8 @@
             "round": 2,
             "finding": "R2-F1",
             "discovered": "2026-11-23",
-            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7"
+            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7",
+            "merged": null
           },
           "labels": [
             {
@@ -771,7 +861,8 @@
             "round": 2,
             "finding": "R2-F2",
             "discovered": "2026-11-23",
-            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7"
+            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7",
+            "merged": null
           },
           "labels": [
             {
@@ -803,7 +894,8 @@
             "round": 3,
             "finding": "R3-F1",
             "discovered": "2026-11-23",
-            "fix": "f47a59a37b0558cd038c4e80e3262f299198a4cd"
+            "fix": "f47a59a37b0558cd038c4e80e3262f299198a4cd",
+            "merged": null
           },
           "labels": [
             {
@@ -835,7 +927,8 @@
             "round": 4,
             "finding": "R4-F1",
             "discovered": "2026-11-23",
-            "fix": "b6e62d546013e76bfb72c648d69721d981f2a357"
+            "fix": "b6e62d546013e76bfb72c648d69721d981f2a357",
+            "merged": null
           },
           "labels": [
             {
@@ -870,6 +963,7 @@
       },
       "review": {
         "base_ref": "main",
+        "base_tip": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
         "merge_base": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
         "head": "046bbb1212cf1d517ab0d6c09661d3714561c1a7",
         "tree": "b0f77971cb8d394747518fd83c14509ec8b0bfec",
@@ -889,12 +983,13 @@
           "status": "not_captured",
           "taken": null,
           "artifact": null,
-          "counts": null
+          "sources": null
         },
         "items": [
           {
             "id": "issue",
             "kind": "issue",
+            "source": "issue/329",
             "ref": "#329 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -904,6 +999,7 @@
           {
             "id": "pr-body",
             "kind": "pr_body",
+            "source": "pr/539",
             "ref": "#539 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -911,6 +1007,13 @@
             "sha256": null
           }
         ]
+      },
+      "record": {
+        "status": "not_captured",
+        "source": null,
+        "started": null,
+        "text": null,
+        "sha256": null
       },
       "actors": [
         "autoforge-producer",
@@ -920,6 +1023,11 @@
       "risk": {
         "stratum": "critical",
         "rationale": "GitHub read-back verification and the credential it sends (data integrity, credentials)"
+      },
+      "exposure": {
+        "possible_from": null,
+        "public_by": null,
+        "artifact": "not traced: git shows each defect's introducing commit, not whether its code, or a report of it, was public earlier (another branch, an earlier attempt), so no day is ruled out"
       },
       "defects": {
         "r3-f1-certificate-remedy": {
@@ -942,7 +1050,8 @@
             "round": 3,
             "finding": "R3-F1",
             "discovered": "2026-11-23",
-            "fix": "f47a59a37b0558cd038c4e80e3262f299198a4cd"
+            "fix": "f47a59a37b0558cd038c4e80e3262f299198a4cd",
+            "merged": null
           },
           "labels": [
             {
@@ -974,7 +1083,8 @@
             "round": 4,
             "finding": "R4-F1",
             "discovered": "2026-11-23",
-            "fix": "b6e62d546013e76bfb72c648d69721d981f2a357"
+            "fix": "b6e62d546013e76bfb72c648d69721d981f2a357",
+            "merged": null
           },
           "labels": [
             {
@@ -1002,7 +1112,8 @@
             "round": 4,
             "finding": "R4-F2",
             "discovered": "2026-11-23",
-            "fix": "d8c8fcce8262148c5830976f6c4799a9c8b8c930"
+            "fix": "d8c8fcce8262148c5830976f6c4799a9c8b8c930",
+            "merged": null
           },
           "labels": [
             {
@@ -1036,6 +1147,7 @@
       },
       "review": {
         "base_ref": "main",
+        "base_tip": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
         "merge_base": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
         "head": "f47a59a37b0558cd038c4e80e3262f299198a4cd",
         "tree": "2d9d7875bf3aab0d0cb9d26f124d30c8d81159d3",
@@ -1055,12 +1167,13 @@
           "status": "not_captured",
           "taken": null,
           "artifact": null,
-          "counts": null
+          "sources": null
         },
         "items": [
           {
             "id": "issue",
             "kind": "issue",
+            "source": "issue/329",
             "ref": "#329 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -1070,6 +1183,7 @@
           {
             "id": "pr-body",
             "kind": "pr_body",
+            "source": "pr/539",
             "ref": "#539 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -1077,6 +1191,13 @@
             "sha256": null
           }
         ]
+      },
+      "record": {
+        "status": "not_captured",
+        "source": null,
+        "started": null,
+        "text": null,
+        "sha256": null
       },
       "actors": [
         "autoforge-producer",
@@ -1086,6 +1207,11 @@
       "risk": {
         "stratum": "critical",
         "rationale": "GitHub read-back verification and the credential it sends (data integrity, credentials)"
+      },
+      "exposure": {
+        "possible_from": null,
+        "public_by": null,
+        "artifact": "not traced: git shows each defect's introducing commit, not whether its code, or a report of it, was public earlier (another branch, an earlier attempt), so no day is ruled out"
       },
       "defects": {
         "r4-f1-probe-shape": {
@@ -1108,7 +1234,8 @@
             "round": 4,
             "finding": "R4-F1",
             "discovered": "2026-11-23",
-            "fix": "b6e62d546013e76bfb72c648d69721d981f2a357"
+            "fix": "b6e62d546013e76bfb72c648d69721d981f2a357",
+            "merged": null
           },
           "labels": [
             {
@@ -1136,7 +1263,8 @@
             "round": 4,
             "finding": "R4-F2",
             "discovered": "2026-11-23",
-            "fix": "d8c8fcce8262148c5830976f6c4799a9c8b8c930"
+            "fix": "d8c8fcce8262148c5830976f6c4799a9c8b8c930",
+            "merged": null
           },
           "labels": [
             {
@@ -1169,6 +1297,7 @@
       },
       "review": {
         "base_ref": "main",
+        "base_tip": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
         "merge_base": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
         "head": "e86e606b0a21782d0d99308306c7d81206f27421",
         "tree": "ff320ab92fe73550984937d30532ec2c4c1b956f",
@@ -1188,12 +1317,13 @@
           "status": "not_captured",
           "taken": null,
           "artifact": null,
-          "counts": null
+          "sources": null
         },
         "items": [
           {
             "id": "issue",
             "kind": "issue",
+            "source": "issue/329",
             "ref": "#329 as of the cutoff",
             "observed_at": null,
             "status": "not_captured",
@@ -1203,6 +1333,7 @@
           {
             "id": "pr-body",
             "kind": "pr_body",
+            "source": "pr/540",
             "ref": "#540 as merged",
             "observed_at": null,
             "status": "not_captured",
@@ -1210,6 +1341,13 @@
             "sha256": null
           }
         ]
+      },
+      "record": {
+        "status": "not_captured",
+        "source": null,
+        "started": null,
+        "text": null,
+        "sha256": null
       },
       "actors": [
         "autoforge-producer",
@@ -1220,6 +1358,11 @@
       "risk": {
         "stratum": "critical",
         "rationale": "GitHub read-back verification and the credential it sends (data integrity, credentials)"
+      },
+      "exposure": {
+        "possible_from": null,
+        "public_by": null,
+        "artifact": "not traced: the squash merged code its PR branch held, and was public there, before it; the curator has not dated that branch, so no day is ruled out"
       },
       "defects": {},
       "negative": {
