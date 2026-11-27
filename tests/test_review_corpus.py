@@ -67,6 +67,29 @@ def label(by, verdict, role="adjudicator", decided="2026-06-25", defect=None, ma
     return item
 
 
+def items(case):
+    return case["context"]["items"]
+
+
+def uncaptured(item_id, kind, ref):
+    return {
+        "id": item_id,
+        "kind": kind,
+        "ref": ref,
+        "observed_at": None,
+        "status": "not_captured",
+        "text": None,
+        "sha256": None,
+    }
+
+
+def captured(item_id, kind, ref, observed_at, text):
+    item = uncaptured(item_id, kind, ref)
+    item.update(status="captured", observed_at=observed_at)
+    set_text(item, text)
+    return item
+
+
 def metric(report, variant, key):
     return report["variants"][variant]["metrics"][key]
 
@@ -338,6 +361,45 @@ def test_match_labels_are_refused(corpus, subs, labels, rule):
         score(corpus, subs)
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        # The baseline as the sole adjudicator of a defect.
+        lambda c: c["cases"]["beta-escape"]["defects"]["d2"].update(
+            labels=[label("reviewer-baseline", "confirmed")]
+        ),
+        lambda c: c["cases"]["alpha-defect"]["defects"]["d1"]["labels"].append(
+            label("reviewer-variant-a", "confirmed")
+        ),
+        # An arbiter of a real disagreement.
+        lambda c: c["cases"]["alpha-defect"]["defects"]["d3"]["labels"].append(
+            label("reviewer-variant-a", "confirmed", role="arbiter")
+        ),
+        lambda c: c["cases"]["alpha-negative"]["negative"]["labels"].append(
+            label("reviewer-baseline", "clean")
+        ),
+        # A curator only proposes, but has still seen the answers.
+        lambda c: c["cases"]["beta-clean"]["negative"]["labels"].append(
+            label("reviewer-variant-a", "clean", role="curator")
+        ),
+    ],
+)
+def test_a_reviewer_variant_cannot_label_the_corpus(corpus, subs, change):
+    change(corpus)
+    # The corpus alone cannot know who will be scored against it.
+    check_corpus(corpus)
+    with pytest.raises(CorpusError, match="a reviewer variant cannot label the corpus"):
+        scored(corpus, subs)
+
+
+def test_a_variant_cannot_label_even_a_case_it_is_not_planned_on(corpus, subs):
+    corpus["cases"]["gamma-clean"]["negative"]["labels"].append(label("reviewer-baseline", "clean"))
+    subs["plan"]["cases"].remove("gamma-clean")
+    subs["runs"] = [run for run in subs["runs"] if run["case"] != "gamma-clean"]
+    with pytest.raises(CorpusError, match="a reviewer variant cannot label the corpus"):
+        scored(corpus, subs)
+
+
 def test_a_match_to_a_critical_defect_needs_two_adjudicators(corpus, subs):
     finding = run_of(subs, "variant-a", "alpha-defect")["findings"][0]
     finding["labels"] = finding["labels"][:1]
@@ -352,7 +414,7 @@ def test_a_match_to_a_critical_defect_needs_two_adjudicators(corpus, subs):
 def test_a_negative_settles_only_after_thirty_days(corpus, subs):
     case = corpus["cases"]["beta-clean"]
     case["review"]["cutoff"] = "2026-05-31T08:00:00Z"
-    case["context"][0]["observed_at"] = "2026-05-30T10:00:00Z"
+    case["context"]["items"][0]["observed_at"] = "2026-05-30T10:00:00Z"
     report = scored(corpus, deepcopy(subs))
     assert report["labels"]["negatives"]["settled"] == 3
     # beta-clean's baseline false alarm now counts against the FPR.
@@ -400,11 +462,12 @@ def set_text(item, text):
         (lambda w: f"Fixed upstream in {w[:7]}.", True),
         (lambda w: f"See {w.upper()[:12]}.", True),
         (lambda w: f"digest {'0' * 3}{w}{'f' * 21}", True),
+        (lambda w: f"An abbreviation inside a run: f{w[:9]}.", True),
         (lambda w: f"Six digits {w[:6]} name nothing.", False),
     ],
 )
 def test_context_naming_a_withheld_commit_is_refused(corpus, text, leaks):
-    item = corpus["cases"]["alpha-defect"]["context"][0]
+    item = corpus["cases"]["alpha-defect"]["context"]["items"][0]
     set_text(item, text(withheld(corpus)))
     if leaks:
         with pytest.raises(CorpusError, match="names a withheld commit"):
@@ -413,13 +476,149 @@ def test_context_naming_a_withheld_commit_is_refused(corpus, text, leaks):
         check_corpus(corpus)
 
 
+@pytest.mark.parametrize("digits", [7, 12, 40])
+@pytest.mark.parametrize(
+    "place",
+    [
+        lambda c, w: items(c)[0].update(ref=f"synthetic issue alpha, as edited by {w}"),
+        lambda c, w: items(c)[1].update(id=f"fix-{w}"),
+        lambda c, w: items(c).append(uncaptured("later", "pr_comment", f"the review of {w}")),
+        lambda c, w: c["environment"]["validation"].append(f"git show {w}"),
+        lambda c, w: c["environment"]["files"].update({f"pins/{w}.txt": "1" * 40}),
+        lambda c, w: c["review"].update(base_ref=f"refs/heads/{w}"),
+    ],
+)
+def test_every_reviewer_visible_field_is_held_to_the_leakage_rule(corpus, place, digits):
+    case = corpus["cases"]["alpha-defect"]
+    place(case, withheld(corpus)[:digits])
+    if case["context"]["inventory"]["counts"] is not None:
+        kinds = [item["kind"] for item in items(case)]
+        case["context"]["inventory"]["counts"] |= {kind: kinds.count(kind) for kind in kinds}
+    with pytest.raises(CorpusError, match="the reviewer's input names a withheld commit"):
+        check_corpus(corpus)
+
+
+def test_an_uncaptured_reference_is_held_to_the_leakage_rule():
+    seed = read_json(SEED)
+    case = seed["cases"]["pr539-round1"]
+    fix = case["defects"]["r1-f1-reply-text"]["discovery"]["fix"]
+    items(case)[1]["ref"] = f"#539 as of {fix[:7]}"
+    with pytest.raises(CorpusError, match="names a withheld commit"):
+        check_corpus(seed)
+
+
+# -- the context inventory ----------------------------------------------------
+
+
+def complete(case, taken="2026-06-28T00:00:00Z"):
+    kinds = [item["kind"] for item in items(case)]
+    case["context"]["inventory"] = {
+        "status": "complete",
+        "taken": taken,
+        "artifact": "test: the listing as of the cutoff",
+        "counts": {
+            kind: kinds.count(kind)
+            for kind in ("issue", "issue_comment", "pr_body", "pr_comment", "document")
+        },
+    }
+
+
+def never_taken(case):
+    case["context"]["inventory"] = {
+        "status": "not_captured",
+        "taken": None,
+        "artifact": None,
+        "counts": None,
+    }
+
+
 @pytest.mark.parametrize(
     ("change", "rule"),
     [
-        (lambda c: c["context"][1].update(observed_at="2026-05-01T12:00:01Z"), "after the cutoff"),
-        (lambda c: c["context"][0].update(sha256="0" * 64), "context digest"),
-        (lambda c: c["context"][0].update(status="not_captured"), "uncaptured context holds"),
-        (lambda c: c["context"].append(dict(c["context"][0])), "context id repeated"),
+        # The seed's records deleted, the inventory left uncaptured.
+        (lambda c: c["context"].update(items=[]), "the context holds the case's issue"),
+        (lambda c: items(c).pop(1), "the context holds the case's pr_body"),
+        (lambda c: items(c).pop(0), "the context holds the case's issue"),
+        # ...or the inventory declared complete over nothing.
+        (
+            lambda c: (c["context"].update(items=[]), complete(c, "2026-11-27T00:00:00Z")),
+            "the context holds the case's issue",
+        ),
+        (lambda c: items(c).append(dict(items(c)[0], id="again")), "one issue and one PR body"),
+        (
+            lambda c: c["context"]["inventory"].update(artifact="a listing"),
+            "an uncaptured inventory holds nothing",
+        ),
+    ],
+)
+def test_omitting_required_context_never_makes_a_seed_case_runnable(change, rule):
+    seed = read_json(SEED)
+    change(seed["cases"]["pr539-round1"])
+    with pytest.raises(CorpusError, match=rule):
+        check_corpus(seed)
+
+
+@pytest.mark.parametrize(
+    ("change", "rule"),
+    [
+        (lambda c: c["context"].update(items=[]), "the context holds the case's issue"),
+        # A comment the inventory counts is left out.
+        (lambda c: items(c).pop(1), "the inventory counts every context item"),
+        # A comment the inventory does not count is added.
+        (
+            lambda c: items(c).append(uncaptured("comment-2", "issue_comment", "comment 2")),
+            "the inventory counts every context item",
+        ),
+        (lambda c: complete(c, "2026-05-01T11:59:59Z"), "inventory taken between"),
+        (lambda c: complete(c, "2026-07-01T00:00:00Z"), "inventory taken between"),
+        (lambda c: c["context"]["inventory"].update(artifact=" "), "inventory artifact"),
+        (lambda c: c["context"]["inventory"]["counts"].update(issue=-1), "inventory counts"),
+        (lambda c: c["context"]["inventory"]["counts"].pop("document"), "fields: issue"),
+        (lambda c: c["context"]["inventory"].update(status="partial"), "inventory status"),
+        (lambda c: c.update(context=items(c)), "fields: inventory items"),
+    ],
+)
+def test_the_context_inventory_is_refused(corpus, change, rule):
+    change(corpus["cases"]["alpha-defect"])
+    with pytest.raises(CorpusError, match=rule):
+        check_corpus(corpus)
+
+
+def test_a_case_runs_only_on_a_complete_and_captured_inventory(corpus, subs):
+    assert describe(corpus)["runnable"] == sorted(corpus["cases"])
+    # An explicitly uncaptured item leaves a complete inventory unrunnable.
+    comment = items(corpus["cases"]["alpha-defect"])[1]
+    comment.update(status="not_captured", observed_at=None, text=None, sha256=None)
+    # An inventory never taken leaves captured items unrunnable.
+    never_taken(corpus["cases"]["beta-clean"])
+    assert describe(corpus)["runnable"] == [
+        "alpha-negative",
+        "beta-escape",
+        "gamma-clean",
+        "gamma-revert",
+    ]
+    for case_id in ("alpha-defect", "beta-clean"):
+        planned = deepcopy(subs)
+        planned["plan"]["cases"] = [case_id]
+        planned["runs"] = [run for run in planned["runs"] if run["case"] == case_id]
+        with pytest.raises(CorpusError, match="context captured"):
+            scored(corpus, planned)
+
+
+def test_a_seed_inventory_declared_complete_runs_nothing_uncaptured():
+    seed = read_json(SEED)
+    for case in seed["cases"].values():
+        complete(case, "2026-11-27T00:00:00Z")
+    assert describe(seed)["runnable"] == []
+
+
+@pytest.mark.parametrize(
+    ("change", "rule"),
+    [
+        (lambda c: items(c)[1].update(observed_at="2026-05-01T12:00:01Z"), "after the cutoff"),
+        (lambda c: items(c)[0].update(sha256="0" * 64), "context digest"),
+        (lambda c: items(c)[0].update(status="not_captured"), "uncaptured context holds"),
+        (lambda c: items(c).append(dict(items(c)[0])), "context id repeated"),
         (lambda c: c["defects"]["d1"]["discovery"].update(fix="9" * 40), "withheld from"),
         (lambda c: c["withheld"].append(c["review"]["head"]), "candidate is not withheld"),
         (
@@ -474,14 +673,36 @@ def test_the_input_holds_no_answer(corpus):
     assert input_digest(case) == before
 
 
-def test_training_exposure_follows_the_knowledge_cutoff(corpus, subs):
-    report = score(corpus, subs)
-    assert report["variants"]["baseline"]["training_exposure"] == {"none": 6}
-    assert report["variants"]["variant-a"]["training_exposure"] == {"none": 3, "possible": 3}
-    # gamma-revert's earliest discovery is 2026-04-02: a cutoff that day may hold it.
-    subs["variants"]["baseline"]["knowledge_cutoff"] = "2026-04-02"
+def exposed(corpus, subs, knowledge_cutoff):
+    subs["variants"]["baseline"]["knowledge_cutoff"] = knowledge_cutoff
     exposure = score(corpus, subs)["variants"]["baseline"]["training_exposure"]
-    assert exposure == {"none": 5, "possible": 1}
+    return exposure["none"], exposure["possible"], exposure["unknown"]
+
+
+def test_training_exposure_is_none_only_with_evidence(corpus, subs):
+    report = score(corpus, subs)
+    # The baseline's knowledge ends before any candidate existed.
+    assert report["variants"]["baseline"]["training_exposure"] == {
+        "none": 6,
+        "possible": 0,
+        "unknown": 0,
+    }
+    # No stated cutoff is no evidence of absence, for a negative as for a defect.
+    assert report["variants"]["variant-a"]["training_exposure"] == {
+        "none": 0,
+        "possible": 0,
+        "unknown": 6,
+    }
+    # gamma-revert's earliest discovery is 2026-04-02, so a cutoff that day may
+    # hold it; gamma-clean existed by then, and a negative's answer is its later
+    # history.
+    assert exposed(corpus, subs, "2026-04-02") == (4, 2, 0)
+    # beta-escape's candidate is from 2026-05-10 and its first discovery day is
+    # 2026-06-01. That day bounds the first report from above only: an earlier
+    # disclosure cannot be ruled out in between, so exposure is unknown, not none.
+    assert exposed(corpus, subs, "2026-05-20") == (1, 4, 1)
+    # The day before beta-escape's candidate existed, nothing of it could be.
+    assert exposed(corpus, subs, "2026-05-09") == (2, 4, 0)
 
 
 # -- files, formats and modes -------------------------------------------------
@@ -569,7 +790,8 @@ def test_the_seed_is_historical_pinned_and_wholly_unadjudicated():
     # No context is captured yet, so no reviewer can be run on any case.
     assert report["runnable"] == []
     for case in seed["cases"].values():
-        assert all(item["status"] == "not_captured" for item in case["context"])
+        assert case["context"]["inventory"]["status"] == "not_captured"
+        assert all(item["status"] == "not_captured" for item in case["context"]["items"])
         for defect in case["defects"].values():
             assert {item["role"] for item in defect["labels"]} == {"curator"}
 
@@ -689,7 +911,18 @@ def historical(repo: Repo, ids) -> dict:
             },
             "review": review,
             "environment": environment,
-            "context": [],
+            "context": {
+                "inventory": {
+                    "status": "not_captured",
+                    "taken": None,
+                    "artifact": None,
+                    "counts": None,
+                },
+                "items": [
+                    uncaptured("issue", "issue", "#1"),
+                    uncaptured("pr-body", "pr_body", "#2"),
+                ],
+            },
             "actors": ["producer"],
             "risk": {"stratum": "routine", "rationale": "test"},
             "defects": defects,
@@ -727,7 +960,7 @@ def historical(repo: Repo, ids) -> dict:
                 "pr_branch",
                 1,
                 [ids["fix"], ids["squash"]],
-                "2026-01-03T12:00:00Z",
+                "2026-01-03T00:00:00Z",
                 {"d1": defect},
                 None,
             ),
@@ -771,7 +1004,7 @@ def test_verify_reads_no_replacement_object(history):
     ("change", "rule"),
     [
         (lambda c, i: c["review"].update(tree=i["root"]), "head tree"),
-        (lambda c, i: c["review"].update(cutoff="2026-01-02T23:59:59Z"), "head committed by"),
+        (lambda c, i: c["review"].update(cutoff="2026-01-02T23:59:59Z"), "committer time"),
         (lambda c, i: c["environment"]["files"].update({"uv.lock": i["root"]}), "environment"),
         (lambda c, i: c["withheld"].append(i["root"]), "is not in head"),
         (lambda c, i: c["withheld"].append(i["root"]), "follows the cutoff"),
@@ -792,6 +1025,39 @@ def test_verify_names_each_pin_git_contradicts(history, change, rule):
     report = verify(corpus, repo.path)
     assert not report["ok"]
     assert any(rule in failed for failed in report["cases"][target]["failed"]), report
+
+
+def test_verify_refuses_a_cutoff_after_the_head_and_the_context_it_admits(history):
+    repo, ids = history
+    corpus = historical(repo, ids)
+    case = corpus["cases"]["round1"]
+    # A cutoff a day after the head admits the round's own review comment.
+    case["review"]["cutoff"] = "2026-01-04T12:00:00Z"
+    items(case).append(
+        captured(
+            "review-1",
+            "pr_comment",
+            "the round 1 review",
+            "2026-01-04T06:00:00Z",
+            "R1-F1: src/a.py lines 2 to 5 are never fixed.",
+        )
+    )
+    # The corpus alone cannot tell; git can.
+    check_corpus(corpus)
+    failed = verify(corpus, repo.path)["cases"]["round1"]["failed"]
+    assert failed == ["the cutoff is the head's committer time"]
+    # At the head's own time the same comment is refused outright.
+    case["review"]["cutoff"] = "2026-01-03T00:00:00Z"
+    with pytest.raises(CorpusError, match="context observed after the cutoff"):
+        check_corpus(corpus)
+
+
+def test_verify_holds_a_squash_case_to_its_merge_time(history):
+    repo, ids = history
+    corpus = historical(repo, ids)
+    corpus["cases"]["merged"]["review"]["cutoff"] = "2026-01-06T00:00:01Z"
+    failed = verify(corpus, repo.path)["cases"]["merged"]["failed"]
+    assert failed == ["the cutoff is the head's committer time"]
 
 
 def test_verify_stops_at_an_unknown_candidate(history):

@@ -57,7 +57,12 @@ STRATUM_SOURCES = {
     "revert": {"revert"},
 }
 RISKS = ("routine", "elevated", "critical")
-CONTEXT_KINDS = {"issue", "issue_comment", "pr_body", "document"}
+CONTEXT_KINDS = ("issue", "issue_comment", "pr_body", "pr_comment", "document")
+# A case holds at most one of each; it must hold the issue when its provenance
+# names one and the PR body when its candidate came from a PR, captured or not
+# (see ``required_context``), since a reviewer of either was always given them.
+SINGULAR_KINDS = ("issue", "pr_body")
+INVENTORY_STATUSES = ("complete", "not_captured")
 ROLES = {"curator", "adjudicator", "arbiter"}
 DEFECT_VERDICTS = {"confirmed", "rejected", "unknown"}
 NEGATIVE_VERDICTS = {"clean", "defective", "unknown"}
@@ -154,7 +159,7 @@ def input_digest(case) -> str:
                 "environment": case["environment"],
                 "context": [
                     {key: item[key] for key in ("id", "kind", "ref", "sha256")}
-                    for item in case["context"]
+                    for item in case["context"]["items"]
                 ],
             }
         )
@@ -162,9 +167,32 @@ def input_digest(case) -> str:
 
 
 def names_commit(text: str, commits: Iterable[str]) -> bool:
-    """Whether ``text`` names a commit, abbreviated to seven digits or more."""
+    """Whether ``text`` names a commit, abbreviated to seven digits or more.
+
+    A hexadecimal run of seven or more digits names a commit when it holds the
+    commit's first seven digits anywhere in it: an abbreviation, the whole id,
+    or either inside a longer run.
+    """
     runs = [run.lower() for run in HEX_RUN.findall(text)]
-    return any(commit.startswith(run) or commit in run for commit in commits for run in runs)
+    return any(commit[:7] in run for commit in commits for run in runs)
+
+
+def reviewer_text(case) -> Iterable[str]:
+    """Every free-text value of a case that its reviewer is given.
+
+    The pinned object ids and digests are identifiers other rules hold; every
+    other string of the review input is read here, context references and ids
+    as much as captured text.
+    """
+    yield case["review"]["base_ref"]
+    yield from case["environment"]["files"]
+    yield from case["environment"]["validation"]
+    for item in case["context"]["items"]:
+        yield item["id"]
+        yield item["kind"]
+        yield item["ref"]
+        if item["text"] is not None:
+            yield item["text"]
 
 
 # -- labels -------------------------------------------------------------------
@@ -254,6 +282,7 @@ class Case:
     risk: str
     cutoff: datetime
     actors: frozenset
+    labelers: frozenset  # every identity that labeled a defect or the negative, any role
     defects: dict
     negative: str | None  # settled, censored, unlabeled, refuted; None for a defect case
     runnable: bool
@@ -265,6 +294,11 @@ class Case:
 
     @property
     def earliest_discovery(self) -> date | None:
+        """The first day by which a registered defect had certainly been reported.
+
+        A discovery day bounds the first report from above only: the report may
+        be earlier, never later.
+        """
         return min((d.discovered for d in self.defects.values()), default=None)
 
 
@@ -278,10 +312,31 @@ class Corpus:
     cases: dict = field(default_factory=dict)
 
 
-def check_context(items, *, cutoff: datetime, forbidden: set) -> bool:
-    """Admit only what existed by the cutoff and names no withheld commit."""
-    require(isinstance(items, list), "context")
+def required_context(origin) -> set[str]:
+    """The context kinds a case must hold, from its provenance alone."""
+    required = set()
+    if origin["issue"] is not None:
+        required.add("issue")
+    if origin["pr"] is not None or origin["source"] in ("pr_branch", "squash"):
+        required.add("pr_body")
+    return required
+
+
+def check_context(context, *, origin, cutoff: datetime, frozen: date) -> bool:
+    """Admit only what existed by the cutoff; whether all of it was captured.
+
+    The inventory states what the reviewer was given at the cutoff, counted by
+    kind, and when and from what that listing was taken. A case is runnable only
+    when its inventory is complete, counts exactly the items the case holds, and
+    every one of them is captured. The issue and the PR body its provenance
+    names must be held either way, captured or not: leaving an item out can
+    make a case refused or unrunnable, never runnable.
+    """
+    closed(context, "inventory items")
+    items = context["items"]
+    require(isinstance(items, list), "context items")
     ids = set()
+    kinds: Counter = Counter()
     captured = True
     for item in items:
         closed(item, "id kind ref observed_at status text sha256")
@@ -289,6 +344,7 @@ def check_context(items, *, cutoff: datetime, forbidden: set) -> bool:
         require(item["id"] not in ids, "context id repeated")
         ids.add(item["id"])
         require(item["kind"] in CONTEXT_KINDS and nonempty(item["ref"]), "context kind")
+        kinds[item["kind"]] += 1
         if item["status"] == "not_captured":
             require(
                 item["observed_at"] is None and item["text"] is None and item["sha256"] is None,
@@ -300,7 +356,28 @@ def check_context(items, *, cutoff: datetime, forbidden: set) -> bool:
         require(instant(item["observed_at"]) <= cutoff, "context observed after the cutoff")
         require(nonempty(item["text"]), "captured context text")
         require(item["sha256"] == sha256(item["text"].encode()).hexdigest(), "context digest")
-        require(not names_commit(item["text"], forbidden), "context names a withheld commit")
+    require(all(kinds[kind] <= 1 for kind in SINGULAR_KINDS), "one issue and one PR body")
+    for kind in sorted(required_context(origin)):
+        require(kinds[kind] == 1, f"the context holds the case's {kind}")
+    inventory = context["inventory"]
+    closed(inventory, "status taken artifact counts")
+    require(inventory["status"] in INVENTORY_STATUSES, "context inventory status")
+    if inventory["status"] == "not_captured":
+        require(
+            all(inventory[key] is None for key in ("taken", "artifact", "counts")),
+            "an uncaptured inventory holds nothing",
+        )
+        return False
+    taken = instant(inventory["taken"])
+    require(cutoff <= taken and taken.date() <= frozen, "inventory taken between cutoff and freeze")
+    require(nonempty(inventory["artifact"]), "inventory artifact")
+    counts = inventory["counts"]
+    closed(counts, " ".join(CONTEXT_KINDS))
+    require(all(integer(counts[kind]) for kind in CONTEXT_KINDS), "inventory counts")
+    require(
+        all(counts[kind] == kinds[kind] for kind in CONTEXT_KINDS),
+        "the inventory counts every context item",
+    )
     return captured
 
 
@@ -410,7 +487,11 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
     closed(risk, "stratum rationale")
     require(risk["stratum"] in RISKS and nonempty(risk["rationale"]), "risk stratum")
     forbidden = set(withheld)
-    runnable = check_context(case["context"], cutoff=cutoff, forbidden=forbidden)
+    runnable = check_context(case["context"], origin=origin, cutoff=cutoff, frozen=frozen)
+    require(
+        not any(names_commit(text, forbidden) for text in reviewer_text(case)),
+        "the reviewer's input names a withheld commit",
+    )
     require(isinstance(case["defects"], dict), "defects")
     if STRATA[case["stratum"]]:
         require(case["defects"] and case["negative"] is None, "a defect case registers its defects")
@@ -423,6 +504,7 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
         for key, defect in case["defects"].items()
     }
     negative = None
+    labels = [label for defect in case["defects"].values() for label in defect["labels"]]
     if STRATA[case["stratum"]]:
         sources = {defect.source for defect in defects.values()}
         require(sources & STRATUM_SOURCES[case["stratum"]], "a defect of the case's stratum")
@@ -448,6 +530,7 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
         risk=risk["stratum"],
         cutoff=cutoff,
         actors=barred,
+        labelers=frozenset(label["by"].strip() for label in labels),
         defects=defects,
         negative=negative,
         runnable=runnable,
@@ -617,8 +700,12 @@ def verify_case(git: Git, case, root: str) -> list[str]:
     check(git.resolve(f"{head}^{{tree}}") == review["tree"], "head tree")
     check(git.is_ancestor(base, head), "merge base is an ancestor of head")
     check(git.is_ancestor(root, head), "repository root is an ancestor of head")
+    # Version 1 has one review-time boundary for both historical sources: the
+    # head's committer time (a review round's head, or the squash commit, which
+    # is committed when it merges). A later cutoff would admit context from
+    # after the review, such as the review's own findings.
     stamp = git.committed(head)
-    check(stamp is not None and stamp <= cutoff, "head committed by the cutoff")
+    check(stamp is not None and stamp == cutoff, "the cutoff is the head's committer time")
     if case["provenance"]["source"] == "squash":
         check(git.resolve(f"{head}^1") == base, "a squash candidate's parent is its merge base")
     for index, (path, blob) in enumerate(sorted(case["environment"]["files"].items())):
@@ -786,6 +873,11 @@ def check_submissions(corpus: Corpus, submissions) -> list[Run]:
     require(submissions["baseline"] in variants, "the baseline is a registered variant")
     require(isinstance(submissions["runs"], list), "runs")
     barred = frozenset(identities)
+    # The corpus is checked before any variant is known: a variant that labeled
+    # any of its records, in any role, has seen its answers and cannot be scored
+    # against them.
+    for case in corpus.cases.values():
+        require(not barred & case.labelers, "a reviewer variant cannot label the corpus")
     runs = [
         check_run(run, corpus=corpus, variants=variants, plan=plan, frozen=frozen, barred=barred)
         for run in submissions["runs"]
@@ -998,13 +1090,24 @@ def contrast(base_runs: Observed, other_runs: Observed, key: str) -> dict:
     }
 
 
-def exposure(run: Run, variant) -> str:
-    """Whether the variant's training data may postdate the case's answer."""
-    earliest = run.case.earliest_discovery
-    if earliest is None:
+def exposure(case: Case, knowledge_cutoff: str | None) -> str:
+    """Whether a variant's training data may hold the case's answer.
+
+    ``none`` only with evidence: the variant's stated knowledge cutoff precedes
+    the candidate itself, so nothing about its review could have been public.
+    ``possible`` when the cutoff falls on or after a day by which the answer
+    was public: a registered defect's discovery, or a negative's own cutoff, as
+    a negative's answer is its later history. ``unknown`` otherwise: no cutoff
+    is stated, or it falls between the candidate and its first discovery day,
+    which bounds the first report from above only.
+    """
+    if knowledge_cutoff is None:
+        return "unknown"
+    known = day(knowledge_cutoff)
+    if known < case.cutoff.date():
         return "none"
-    cutoff = variant["knowledge_cutoff"]
-    return "none" if cutoff is not None and day(cutoff) < earliest else "possible"
+    public = case.earliest_discovery if case.defects else case.cutoff.date()
+    return "possible" if public is not None and known >= public else "unknown"
 
 
 def score(corpus, submissions) -> dict:
@@ -1030,6 +1133,7 @@ def score(corpus, submissions) -> dict:
             hits = [key for _, verdict, key in run.findings if verdict == "confirmed"]
             duplicates += len(hits) - len(set(hits))
         launched = [r for r in mine.values() if r.status != "excluded"]
+        exposed = Counter(exposure(r.case, variant["knowledge_cutoff"]) for r in completed)
         costs = [r.cost for r in launched]
         cards[name] = {
             "pins": variant,
@@ -1044,9 +1148,9 @@ def score(corpus, submissions) -> dict:
                 "unknown": verdicts["unknown"],
                 "duplicates": duplicates,
             },
-            "training_exposure": dict(
-                sorted(Counter(exposure(r, variant) for r in completed).items())
-            ),
+            "training_exposure": {
+                level: exposed[level] for level in ("none", "possible", "unknown")
+            },
             "cost_microusd": sum(costs) if None not in costs else None,
             "metrics": {key: marginal(observed(completed), key) for key in metric_keys()},
         }

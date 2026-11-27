@@ -15,7 +15,7 @@
       "cluster": "alpha",
       "provenance": {
         "source": "synthetic",
-        "issue": null,
+        "issue": 1,
         "pr": null,
         "round": 1,
         "selection": "synthetic fixture: hand-built to cover each stratum and label outcome",
@@ -37,26 +37,40 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "synthetic issue alpha",
-          "observed_at": "2026-04-30T09:00:00Z",
-          "status": "captured",
-          "text": "Synthetic issue alpha: read a lock file and refuse a stale writer.",
-          "sha256": "4355276ce961ca2f4c31aefb6a65997d6a742b168a804c14bb52fffd2eb60799"
+      "context": {
+        "inventory": {
+          "status": "complete",
+          "taken": "2026-06-28T00:00:00Z",
+          "artifact": "synthetic: the listing of synthetic issue 1 as of the cutoff",
+          "counts": {
+            "issue": 1,
+            "issue_comment": 1,
+            "pr_body": 0,
+            "pr_comment": 0,
+            "document": 0
+          }
         },
-        {
-          "id": "comment-1",
-          "kind": "issue_comment",
-          "ref": "synthetic issue alpha, comment 1",
-          "observed_at": "2026-05-01T12:00:00Z",
-          "status": "captured",
-          "text": "Synthetic comment posted exactly at the cutoff, which is inclusive.",
-          "sha256": "23d785b3ed353235836e1f966523f75909fd0bff753615e8bac73a07876d45ad"
-        }
-      ],
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "synthetic issue alpha",
+            "observed_at": "2026-04-30T09:00:00Z",
+            "status": "captured",
+            "text": "Synthetic issue alpha: read a lock file and refuse a stale writer.",
+            "sha256": "4355276ce961ca2f4c31aefb6a65997d6a742b168a804c14bb52fffd2eb60799"
+          },
+          {
+            "id": "comment-1",
+            "kind": "issue_comment",
+            "ref": "synthetic issue alpha, comment 1",
+            "observed_at": "2026-05-01T12:00:00Z",
+            "status": "captured",
+            "text": "Synthetic comment posted exactly at the cutoff, which is inclusive.",
+            "sha256": "23d785b3ed353235836e1f966523f75909fd0bff753615e8bac73a07876d45ad"
+          }
+        ]
+      },
       "actors": [
         "producer-alpha",
         "reviewer-alpha",
@@ -191,7 +205,7 @@
       "cluster": "alpha",
       "provenance": {
         "source": "synthetic",
-        "issue": null,
+        "issue": 1,
         "pr": null,
         "round": 4,
         "selection": "synthetic fixture: hand-built to cover each stratum and label outcome",
@@ -213,17 +227,31 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "synthetic issue alpha",
-          "observed_at": "2026-04-30T09:00:00Z",
-          "status": "captured",
-          "text": "Synthetic issue alpha, as the last round read it.",
-          "sha256": "5a372c4cdebffd5c954eb020d345bc21c6988968d3af99bb9568b07063cd4131"
-        }
-      ],
+      "context": {
+        "inventory": {
+          "status": "complete",
+          "taken": "2026-06-28T00:00:00Z",
+          "artifact": "synthetic: the listing of synthetic issue 1 as of the cutoff",
+          "counts": {
+            "issue": 1,
+            "issue_comment": 0,
+            "pr_body": 0,
+            "pr_comment": 0,
+            "document": 0
+          }
+        },
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "synthetic issue alpha",
+            "observed_at": "2026-04-30T09:00:00Z",
+            "status": "captured",
+            "text": "Synthetic issue alpha, as the last round read it.",
+            "sha256": "5a372c4cdebffd5c954eb020d345bc21c6988968d3af99bb9568b07063cd4131"
+          }
+        ]
+      },
       "actors": [
         "producer-alpha",
         "reviewer-alpha",
@@ -253,7 +281,7 @@
       "cluster": "beta",
       "provenance": {
         "source": "synthetic",
-        "issue": null,
+        "issue": 2,
         "pr": null,
         "round": null,
         "selection": "synthetic fixture: hand-built to cover each stratum and label outcome",
@@ -275,17 +303,31 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "synthetic issue beta",
-          "observed_at": "2026-05-09T10:00:00Z",
-          "status": "captured",
-          "text": "Synthetic issue beta: authorize a merge from a certificate.",
-          "sha256": "bcf67d4cc446a95f78dfe32d1998bee8daaa6cf0cb1e4708528acce5c1b2591f"
-        }
-      ],
+      "context": {
+        "inventory": {
+          "status": "complete",
+          "taken": "2026-06-28T00:00:00Z",
+          "artifact": "synthetic: the listing of synthetic issue 2 as of the cutoff",
+          "counts": {
+            "issue": 1,
+            "issue_comment": 0,
+            "pr_body": 0,
+            "pr_comment": 0,
+            "document": 0
+          }
+        },
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "synthetic issue beta",
+            "observed_at": "2026-05-09T10:00:00Z",
+            "status": "captured",
+            "text": "Synthetic issue beta: authorize a merge from a certificate.",
+            "sha256": "bcf67d4cc446a95f78dfe32d1998bee8daaa6cf0cb1e4708528acce5c1b2591f"
+          }
+        ]
+      },
       "actors": [
         "producer-beta",
         "reviewer-beta",
@@ -376,7 +418,7 @@
       "cluster": "beta",
       "provenance": {
         "source": "synthetic",
-        "issue": null,
+        "issue": 3,
         "pr": null,
         "round": null,
         "selection": "synthetic fixture: hand-built to cover each stratum and label outcome",
@@ -398,17 +440,31 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "synthetic issue beta 2",
-          "observed_at": "2026-06-14T10:00:00Z",
-          "status": "captured",
-          "text": "Synthetic issue beta 2: rename a configuration key.",
-          "sha256": "01eae681bc4489b2da6b49dc12907b54cc39eb38a87ba92312e94a37d6ca1a27"
-        }
-      ],
+      "context": {
+        "inventory": {
+          "status": "complete",
+          "taken": "2026-06-28T00:00:00Z",
+          "artifact": "synthetic: the listing of synthetic issue 3 as of the cutoff",
+          "counts": {
+            "issue": 1,
+            "issue_comment": 0,
+            "pr_body": 0,
+            "pr_comment": 0,
+            "document": 0
+          }
+        },
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "synthetic issue beta 2",
+            "observed_at": "2026-06-14T10:00:00Z",
+            "status": "captured",
+            "text": "Synthetic issue beta 2: rename a configuration key.",
+            "sha256": "01eae681bc4489b2da6b49dc12907b54cc39eb38a87ba92312e94a37d6ca1a27"
+          }
+        ]
+      },
       "actors": [
         "producer-beta",
         "reviewer-beta",
@@ -438,7 +494,7 @@
       "cluster": "gamma",
       "provenance": {
         "source": "synthetic",
-        "issue": null,
+        "issue": 4,
         "pr": null,
         "round": 1,
         "selection": "synthetic fixture: hand-built to cover each stratum and label outcome",
@@ -460,17 +516,31 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "synthetic issue gamma",
-          "observed_at": "2026-03-30T10:00:00Z",
-          "status": "captured",
-          "text": "Synthetic issue gamma: paginate a listing.",
-          "sha256": "9ba6550b67c24fb4fa1aff3b01a562db633a91ad119bb31c54bbb3b9cbb0638c"
-        }
-      ],
+      "context": {
+        "inventory": {
+          "status": "complete",
+          "taken": "2026-06-28T00:00:00Z",
+          "artifact": "synthetic: the listing of synthetic issue 4 as of the cutoff",
+          "counts": {
+            "issue": 1,
+            "issue_comment": 0,
+            "pr_body": 0,
+            "pr_comment": 0,
+            "document": 0
+          }
+        },
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "synthetic issue gamma",
+            "observed_at": "2026-03-30T10:00:00Z",
+            "status": "captured",
+            "text": "Synthetic issue gamma: paginate a listing.",
+            "sha256": "9ba6550b67c24fb4fa1aff3b01a562db633a91ad119bb31c54bbb3b9cbb0638c"
+          }
+        ]
+      },
       "actors": [
         "producer-gamma",
         "reviewer-gamma",
@@ -589,7 +659,7 @@
       "cluster": "gamma",
       "provenance": {
         "source": "synthetic",
-        "issue": null,
+        "issue": 5,
         "pr": null,
         "round": null,
         "selection": "synthetic fixture: hand-built to cover each stratum and label outcome",
@@ -611,17 +681,31 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "synthetic issue gamma 2",
-          "observed_at": "2026-03-31T10:00:00Z",
-          "status": "captured",
-          "text": "Synthetic issue gamma 2: document the listing's limits.",
-          "sha256": "79f93d64d4c4a4810c8489dd5ecaab9a5c3a24d0ef71cabd84a3ac1b39aab4e4"
-        }
-      ],
+      "context": {
+        "inventory": {
+          "status": "complete",
+          "taken": "2026-06-28T00:00:00Z",
+          "artifact": "synthetic: the listing of synthetic issue 5 as of the cutoff",
+          "counts": {
+            "issue": 1,
+            "issue_comment": 0,
+            "pr_body": 0,
+            "pr_comment": 0,
+            "document": 0
+          }
+        },
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "synthetic issue gamma 2",
+            "observed_at": "2026-03-31T10:00:00Z",
+            "status": "captured",
+            "text": "Synthetic issue gamma 2: document the listing's limits.",
+            "sha256": "79f93d64d4c4a4810c8489dd5ecaab9a5c3a24d0ef71cabd84a3ac1b39aab4e4"
+          }
+        ]
+      },
       "actors": [
         "producer-gamma",
         "reviewer-gamma",

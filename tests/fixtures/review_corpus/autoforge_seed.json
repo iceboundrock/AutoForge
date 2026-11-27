@@ -37,26 +37,34 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "#262 as of the cutoff",
-          "observed_at": null,
+      "context": {
+        "inventory": {
           "status": "not_captured",
-          "text": null,
-          "sha256": null
+          "taken": null,
+          "artifact": null,
+          "counts": null
         },
-        {
-          "id": "pr-body",
-          "kind": "pr_body",
-          "ref": "the PR of branch autoforge/262, whose number no commit states",
-          "observed_at": null,
-          "status": "not_captured",
-          "text": null,
-          "sha256": null
-        }
-      ],
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "#262 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          },
+          {
+            "id": "pr-body",
+            "kind": "pr_body",
+            "ref": "the PR of branch autoforge/262, whose number no commit states",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          }
+        ]
+      },
       "actors": [
         "autoforge-producer",
         "autoforge-reviewer",
@@ -128,26 +136,34 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "#414 as of the cutoff",
-          "observed_at": null,
+      "context": {
+        "inventory": {
           "status": "not_captured",
-          "text": null,
-          "sha256": null
+          "taken": null,
+          "artifact": null,
+          "counts": null
         },
-        {
-          "id": "pr-body",
-          "kind": "pr_body",
-          "ref": "#459 as of the cutoff",
-          "observed_at": null,
-          "status": "not_captured",
-          "text": null,
-          "sha256": null
-        }
-      ],
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "#414 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          },
+          {
+            "id": "pr-body",
+            "kind": "pr_body",
+            "ref": "#459 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          }
+        ]
+      },
       "actors": [
         "autoforge-producer",
         "autoforge-reviewer",
@@ -317,26 +333,34 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "#414 as of the cutoff",
-          "observed_at": null,
+      "context": {
+        "inventory": {
           "status": "not_captured",
-          "text": null,
-          "sha256": null
+          "taken": null,
+          "artifact": null,
+          "counts": null
         },
-        {
-          "id": "pr-body",
-          "kind": "pr_body",
-          "ref": "#460 as merged",
-          "observed_at": null,
-          "status": "not_captured",
-          "text": null,
-          "sha256": null
-        }
-      ],
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "#414 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          },
+          {
+            "id": "pr-body",
+            "kind": "pr_body",
+            "ref": "#460 as merged",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          }
+        ]
+      },
       "actors": [
         "autoforge-producer",
         "autoforge-reviewer",
@@ -389,26 +413,34 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "#329 as of the cutoff",
-          "observed_at": null,
+      "context": {
+        "inventory": {
           "status": "not_captured",
-          "text": null,
-          "sha256": null
+          "taken": null,
+          "artifact": null,
+          "counts": null
         },
-        {
-          "id": "pr-body",
-          "kind": "pr_body",
-          "ref": "#539 as of the cutoff",
-          "observed_at": null,
-          "status": "not_captured",
-          "text": null,
-          "sha256": null
-        }
-      ],
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "#329 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          },
+          {
+            "id": "pr-body",
+            "kind": "pr_body",
+            "ref": "#539 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          }
+        ]
+      },
       "actors": [
         "autoforge-producer",
         "autoforge-reviewer",
@@ -617,26 +649,34 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "#329 as of the cutoff",
-          "observed_at": null,
+      "context": {
+        "inventory": {
           "status": "not_captured",
-          "text": null,
-          "sha256": null
+          "taken": null,
+          "artifact": null,
+          "counts": null
         },
-        {
-          "id": "pr-body",
-          "kind": "pr_body",
-          "ref": "#539 as of the cutoff",
-          "observed_at": null,
-          "status": "not_captured",
-          "text": null,
-          "sha256": null
-        }
-      ],
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "#329 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          },
+          {
+            "id": "pr-body",
+            "kind": "pr_body",
+            "ref": "#539 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          }
+        ]
+      },
       "actors": [
         "autoforge-producer",
         "autoforge-reviewer",
@@ -844,26 +884,34 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "#329 as of the cutoff",
-          "observed_at": null,
+      "context": {
+        "inventory": {
           "status": "not_captured",
-          "text": null,
-          "sha256": null
+          "taken": null,
+          "artifact": null,
+          "counts": null
         },
-        {
-          "id": "pr-body",
-          "kind": "pr_body",
-          "ref": "#539 as of the cutoff",
-          "observed_at": null,
-          "status": "not_captured",
-          "text": null,
-          "sha256": null
-        }
-      ],
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "#329 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          },
+          {
+            "id": "pr-body",
+            "kind": "pr_body",
+            "ref": "#539 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          }
+        ]
+      },
       "actors": [
         "autoforge-producer",
         "autoforge-reviewer",
@@ -1002,26 +1050,34 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "#329 as of the cutoff",
-          "observed_at": null,
+      "context": {
+        "inventory": {
           "status": "not_captured",
-          "text": null,
-          "sha256": null
+          "taken": null,
+          "artifact": null,
+          "counts": null
         },
-        {
-          "id": "pr-body",
-          "kind": "pr_body",
-          "ref": "#539 as of the cutoff",
-          "observed_at": null,
-          "status": "not_captured",
-          "text": null,
-          "sha256": null
-        }
-      ],
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "#329 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          },
+          {
+            "id": "pr-body",
+            "kind": "pr_body",
+            "ref": "#539 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          }
+        ]
+      },
       "actors": [
         "autoforge-producer",
         "autoforge-reviewer",
@@ -1127,26 +1183,34 @@
           "make check"
         ]
       },
-      "context": [
-        {
-          "id": "issue",
-          "kind": "issue",
-          "ref": "#329 as of the cutoff",
-          "observed_at": null,
+      "context": {
+        "inventory": {
           "status": "not_captured",
-          "text": null,
-          "sha256": null
+          "taken": null,
+          "artifact": null,
+          "counts": null
         },
-        {
-          "id": "pr-body",
-          "kind": "pr_body",
-          "ref": "#540 as merged",
-          "observed_at": null,
-          "status": "not_captured",
-          "text": null,
-          "sha256": null
-        }
-      ],
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "ref": "#329 as of the cutoff",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          },
+          {
+            "id": "pr-body",
+            "kind": "pr_body",
+            "ref": "#540 as merged",
+            "observed_at": null,
+            "status": "not_captured",
+            "text": null,
+            "sha256": null
+          }
+        ]
+      },
       "actors": [
         "autoforge-producer",
         "autoforge-reviewer",
