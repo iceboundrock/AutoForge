@@ -2320,6 +2320,11 @@ PRESENTED = [
     lambda text: "Steps:\n\n1. Run\n\n   ```\n   make check\n" + referenced(text),
     lambda text: "```\n> ```\n```\n" + referenced(text),
     lambda text: "<div>\n```\n</div>\n\n" + referenced(text),
+    # ...its file linked between two HTML comments that each hold a backtick,
+    # which open no code span inside a comment; or linked with a title that
+    # holds one, which opens none inside a link a later backtick could close.
+    lambda text: linked(text, "<!-- ` --> [src/a.py](https://example.invalid/a.py) <!-- ` -->"),
+    lambda text: linked(text, 'src/a[](https://example.invalid/a.py "`").py `'),
 ]
 
 
@@ -2540,6 +2545,35 @@ def test_no_value_the_reviewer_reads_holds_a_merge_or_lineage_record(history):
         ("[a][r\\]]\n\n[r\\]]: /url", "[a]\n\n"),
         # A reference link holds no other link either.
         ("[a [b][r] c][r]\n\n[r]: /u", "[a [b] c][r]\n\n"),
+        # Inline markup is read from left to right: what starts first of a
+        # code span, an autolink and raw HTML is the one there. A backtick in
+        # a comment, a tag or an autolink opens no code span; a comment, a tag
+        # or a link in a code span is shown as written.
+        ("R1 <!-- ` --> [R2](x) <!-- ` --> R3", "R1  [R2]  R3"),
+        ("`<!-- R1 -->` R2 <!-- R3 -->", "`<!-- R1 -->` R2 "),
+        ("`R1 <b>` R2 <b title='`'>R3 `", "`R1 <b>` R2 R3 `"),
+        ("<https://example.invalid/`> <!-- ` R1 --> R2", "<https://example.invalid/`>  R2"),
+        ("<a`b@example.invalid> <!-- ` R1 --> R2", "<a`b@example.invalid>  R2"),
+        # ...a backslash escapes the character after it first: an escaped
+        # backslash leaves the backtick after it opening a span, and an escaped
+        # backtick leaves the rest of its run to open one.
+        ("\\\\`<!-- R1 -->` R2", "\\\\`<!-- R1 -->` R2"),
+        ("\\`<!-- R1 -->` R2", "\\`` R2"),
+        ("\\``R1 <b>` R2", "\\``R1 <b>` R2"),
+        # ...a link's destination and title are read, as written, where its
+        # text closes, before a backtick in them could open a span.
+        ('R1[](x "`").R2 `', "R1[].R2 `"),
+        ("[R1](`x) R2`", "[R1] R2`"),
+        # ...a shortcut reference is a link, so the brackets around it open
+        # none; an inline link comes before a footnote's marker.
+        ("[R1 [r] R2](x)\n\n[r]: /u", "[R1 [r] R2](x)\n\n"),
+        ("[^n](x) R1\n\n[^n]: note", "[^n] R1\n\n note"),
+        # ...and so are an HTML block's comments and tags.
+        ('<div title="<!--">\nR1 -->\n</div>', "\nR1 -->\n"),
+        # A comment may be empty, and a processing instruction ends at a
+        # "?>" after its "<?".
+        ("<!--> R1 --> <!---> R2 -->", " R1 -->  R2 -->"),
+        ("R1<??>R2 <?> R3", "R1R2 <?> R3"),
     ],
 )
 def test_the_record_check_reads_markup_as_a_renderer_shows_it(text, shown):
@@ -2554,6 +2588,52 @@ def test_markup_beyond_the_record_checks_bound_is_refused(history):
     items(corpus["cases"]["round1"])[0]["ref"] = "[a](x" * 40_000
     with pytest.raises(CorpusError, match="a value the reviewer reads is within the markup bound"):
         check_corpus(corpus)
+
+
+@pytest.mark.parametrize(
+    "opener",
+    [
+        # One paragraph of processing instructions that never close, as the
+        # review measured; then comments, CDATA sections, declarations,
+        # quoted attribute values of either quote, and attributes, unclosed.
+        "x <? ",
+        "x <!-- ",
+        "x <![CDATA[ ",
+        "x <!X ",
+        '<a b="',
+        "<a b='",
+        "<a b c ",
+        # ...and every one of them in turn.
+        "<? <!-- <![CDATA[ <!X <a b=\" <a c=' ",
+    ],
+)
+def test_raw_html_that_never_closes_is_read_for_once(monkeypatch, opener):
+    """Every opener asks where it ends; what ends it is searched for once from
+    where it was last found, so the characters the scans read (``Work.read``,
+    counted, not timed) grow with the value's length, never with its openers.
+    Unclosed, each is shown as written, and a closed one is still raw HTML."""
+    works = []
+    start = review_corpus.Work.__init__
+
+    def counted(self, size):
+        start(self, size)
+        works.append(self)
+
+    monkeypatch.setattr(review_corpus.Work, "__init__", counted)
+
+    def read(text):
+        works.clear()
+        assert review_corpus.rendered(text) == text
+        return works[-1].read
+
+    small, large = (opener * (size * 1024 // len(opener)) for size in (12, 48))
+    # Six kinds of end are each searched for once; one kind once.
+    kinds = 6 if opener.count("<") > 2 else 1
+    assert read(large) <= (kinds + 1) * len(large)
+    assert read(large) <= 4.1 * read(small)  # four times the text, four times the reads
+    # A processing instruction that closes before them is raw HTML still.
+    assert review_corpus.rendered("R1<?x?>R2 " + large) == "R1R2 " + large
+    assert works[-1].read <= (kinds + 2) * len(large)
 
 
 def test_linked_context_that_holds_no_record_still_runs(history, subs):
@@ -2673,6 +2753,37 @@ def test_an_earlier_case_never_shows_a_later_cases_record(history, subs):
     # round 1's earlier review still in its input.
     items(later["cases"]["round2"])[1]["ref"] = "#2"
     assert score(later, recorded(later, subs, ["round1", "round2"]), repo.path)["verified"]["ok"]
+
+
+def test_one_review_round_of_a_pr_is_one_case(history, subs):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    second_round(repo, ids, corpus)
+    # Two rounds of PR 2, each its own case: both verify and score.
+    assert verify(corpus, repo.path)["ok"]
+    assert score(corpus, recorded(corpus, subs, ["round1", "round2"]), repo.path)["verified"]["ok"]
+    # Round 2's candidate named round 1 under a record of its own, which binds
+    # round 1, the candidate's own head and its January 4 start: each case is
+    # consistent with its record and with git, while round 1 still binds its
+    # January 3 start and its head. One round read one head from one instant.
+    twice = deepcopy(corpus)
+    again = twice["cases"]["round2"]
+    again["provenance"]["round"] = 1
+    started = again["record"]["started"]
+    record(
+        again,
+        started,
+        text=f"{binding(again, started)}\n# Review, round 1\n"
+        "R1-F1: src/a.py lines 2 to 5 are left unchecked at this head.",
+        source="pr/2/comment/review-3",
+    )
+    rule = "one review round of a PR is one case"
+    refused_everywhere(twice, repo, subs, ["round1", "round2"], rule)
+    # ...and so it is with neither record captured.
+    for case in twice["cases"].values():
+        case["record"] = unrecorded()
+    with pytest.raises(CorpusError, match=rule):
+        describe(twice)
 
 
 # -- a defect that escaped through a squash ------------------------------------

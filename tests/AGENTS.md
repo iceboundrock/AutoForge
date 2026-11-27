@@ -636,12 +636,14 @@ the evaluation protocol (#318)        test_evaluation.py (the pins, what arms ho
                                       its reproducibility, the negative fixtures, the oracle)
 the review corpus (REV-R1, #356)      test_review_corpus.py (the synthetic scorecards by hand,
                                       label settlement, censoring, cutoff and leakage
-                                      refusals, context bound to its listed sources, exposure
-                                      evidence, cluster integrity, run pins and work limits,
-                                      the seed's unadjudicated state, verify on a throwaway
-                                      repository: the review, merge and lineage records'
-                                      bindings and their absence from every value the
-                                      reviewer reads, the recorded or provisional base
+                                      refusals, Markdown read in cmark's order and the
+                                      characters its scans read, context bound to its listed
+                                      sources, exposure evidence, cluster integrity, run pins
+                                      and work limits, the seed's unadjudicated state, verify
+                                      on a throwaway repository: the review, merge and lineage
+                                      records' bindings and their absence from every value the
+                                      reviewer reads, one case for each PR's review round,
+                                      the recorded or provisional base
                                       revision and merge base, a squash's PR and one parent,
                                       environment pins and the registered declaration they
                                       follow, fix, revert and squash lineage, and recorded

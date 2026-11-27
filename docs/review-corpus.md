@@ -78,8 +78,8 @@ repository's objects can rebuild exactly what the reviewer was given:
   defect of one commit must share a cluster, and the corpus check refuses any that do not. A
   cluster may hold several issues the curator judges related.
 - **Provenance:** `pr_branch` (a review round's exact head on a PR branch), `squash` (a squash
-  commit on main) or `synthetic`; the issue and PR as git states them; the round; the selection
-  rule; a note on what is not known.
+  commit on main) or `synthetic`; the issue and PR as git states them; the round, each round of
+  a PR one case's (section 2); the selection rule; a note on what is not known.
 
 | Stratum | A case of it | Needs a defect discovered |
 |---|---|---|
@@ -211,22 +211,27 @@ review-record: {"pr": 539, "issue": 329, "round": 1, "base_ref": "main", "base_t
 ```
 
 `pr`, `issue` and `round` must be the case's (`pr` is `null` when its provenance names none),
-`base_ref`, `base_tip`, `head` and `merge_base` its review binding's, and `input_read` the
-record's `started`, which is the cutoff. The issue binds the case's context to the round: a case
-holding another issue's text, issue item and inventory entry, all agreeing with one another, is
-refused under the round's record, since nothing else offline or in git names the issue a round was
-for. Nothing else of the text is read: an instant it names elsewhere, such as when
-it was published, is never taken for its start, and prose that names one is no binding. A record
-carrying no such line, or two, is refused; whether any record of this repository's history carries
-one is #592's to establish, and a round none does stays unplanned. `verify` bounds the cutoff by
-git: the head was committed by it, and every withheld commit, the round's own FIX among them,
-after it. Without a captured record the cutoff is exactly the head's committer time, the earliest
-the candidate existed, so what it admits is conservative, its base revision is provisional, and
-the case is never runnable: a round whose boundary is not evidenced stays unplanned. A `squash`
-case takes the merge time, the squash commit's committer time; its diff is the merged change,
-which can differ from what the last review read. `verify` refuses any other cutoff, later as much
-as earlier: a later one would admit context from after the review started, such as the round's
-own findings.
+`base_ref`, `base_tip`, `head` and `merge_base` its review binding's, and `input_read` the record's
+`started`, which is the cutoff. The issue binds the case's context to the round: a case holding
+another issue's text, issue item and inventory entry, all agreeing with one another, is refused
+under the round's record, since nothing else offline or in git names the issue a round was for. One
+round of a PR is one case: the round read one head against one base revision from one instant, so
+two cases naming one PR's round are refused, each however consistent with its own record and with
+git, rather than either trusted or the round scored twice. A round reviewed twice (a retried review,
+say) is one case in version 1, the attempt whose record it retains, since nothing in the format
+tells two attempts apart; a round of a PR no record numbers cannot be told from another PR's round
+of its issue, and is not held to this. Nothing else of the text is read: an instant it names
+elsewhere, such as when it was published, is never taken for its start, and prose that names one is
+no binding. A record carrying no such line, or two, is refused; whether any record of this
+repository's history carries one is #592's to establish, and a round none does stays unplanned.
+`verify` bounds the cutoff by git: the head was committed by it, and every withheld commit, the
+round's own FIX among them, after it. Without a captured record the cutoff is exactly the head's
+committer time, the earliest the candidate existed, so what it admits is conservative, its base
+revision is provisional, and the case is never runnable: a round whose boundary is not evidenced
+stays unplanned. A `squash` case takes the merge time, the squash commit's committer time; its diff
+is the merged change, which can differ from what the last review read. `verify` refuses any other
+cutoff, later as much as earlier: a later one would admit context from after the review started,
+such as the round's own findings.
 
 The other two records follow the same rules, each with its own binding statement:
 
@@ -260,32 +265,43 @@ stands. Each is compared by its letters and digits alone, without case, after de
 and compatibility forms, both as written and as a Markdown renderer shows it. The rendered form
 drops what adds letters no reader of it sees: a link's or image's destination and title, a defined
 reference's label and its definition, a defined footnote's marker, raw HTML tags and comments, and a
-code fence's info string, while code spans and fenced code read as written, as in CommonMark. Its
-blocks are read line by line as cmark reads them: the block quotes and list items each line
+code fence's info string, while code spans and fenced code read as written, as in CommonMark 0.31.2.
+Its blocks are read line by line as cmark reads them: the block quotes and list items each line
 continues (a quote by its `>`, an item by its indentation), and in them fenced and indented code,
 HTML blocks, headings and paragraphs, a paragraph alone continuing lazily. A fence ends at its
 closing fence, read only past the fence's own quotes and items, or where they end: a fence a block
 quote or a list item opens ends with it, and what follows is prose. A line in an HTML block or
 indented as code opens no fence; an HTML block shows its text but its tags and comments; and inline
 markup (a link, a code span, a tag or a comment) never runs from one paragraph or heading into
-another. A tab stops at every fourth column, only a line feed or a carriage return ends a line, and
-a byte order mark the value starts with is skipped. A link reference definition is read as
-CommonMark defines one, on one line or several: its label (over lines, matched without case or
-spacing), then its destination and an optional title, each after at most one line break, the title
-over lines too, and nothing after either on its line; a title that does not end its line leaves the
-destination alone the definition when a line break comes between them. A definition starts a
-paragraph and never continues one: it may follow a blank line, a heading or its underline, a fence,
-or start a list item (a bullet, or the number 1) or a block quote that interrupts a paragraph, and
-it runs on over the paragraph's lines, their indentation stripped and lazily continued in a block
-quote, up to a blank line or a line that opens another block; an underline after definitions alone
-is the paragraph's text, not a heading. So a copy that only presents the record otherwise (each line
-as a Markdown block quote, a list item or a table cell, emphasised, linked inline or by reference,
-or in a code span, reflowed or joined into one line, its spacing or punctuation changed) is refused
-as the record itself, and so is one below a fence its block quote or list item has ended. The
-rendered form is a model of CommonMark, not a renderer: markup it does not model (a table's cells, a
-footnote's indented continuation, an HTML block's text as a browser would parse it) reads as prose,
-and a value whose link destinations would have it read more than four times the value's length (plus
-4096 characters) is refused rather than read on.
+another. Inline markup is read from left to right as cmark reads it: a backslash escapes the
+punctuation after it; whichever of a code span, an autolink and raw HTML starts first is the one
+there, so a backtick inside a comment, a tag or an autolink opens no code span, and a comment, a tag
+or a link inside a code span reads as written; and a `]` closes the last bracket still open, its
+link's destination and title read from there as written, then a reference's label (a full, collapsed
+or shortcut reference, each a link, so the brackets around it open none), then a footnote's marker.
+An HTML block's comments and tags are read from left to right too. A tab stops at every fourth
+column, only a line feed or a carriage return ends a line, and a byte order mark the value starts
+with is skipped. A link reference definition is read as CommonMark defines one, on one line or
+several: its label (over lines, matched without case or spacing), then its destination and an
+optional title, each after at most one line break, the title over lines too, and nothing after
+either on its line; a title that does not end its line leaves the destination alone the definition
+when a line break comes between them. A definition starts a paragraph and never continues one: it
+may follow a blank line, a heading or its underline, a fence, or start a list item (a bullet, or the
+number 1) or a block quote that interrupts a paragraph, and it runs on over the paragraph's lines,
+their indentation stripped and lazily continued in a block quote, up to a blank line or a line that
+opens another block; an underline after definitions alone is the paragraph's text, not a heading. So
+a copy that only presents the record otherwise (each line as a Markdown block quote, a list item or
+a table cell, emphasised, linked inline or by reference, or in a code span, reflowed or joined into
+one line, its spacing or punctuation changed) is refused as the record itself, and so is one below a
+fence its block quote or list item has ended. The rendered form is a model of CommonMark, not a
+renderer: markup it does not model (a table's cells, a footnote's indented continuation, an HTML
+block's text as a browser would parse it) reads as prose. Its work is linear in the value's length.
+The search for what ends a comment, a processing instruction, a declaration, a CDATA section or a
+quoted attribute value reads the value at most once for each, however many openers never close,
+since each search starts where the last one stopped, as cmark's do. What a bracket or an angle
+bracket starts reading (a link's destination and title, a tag, an autolink), which many of them can
+each start over the same characters, stops at four times the value's length plus 4096 characters: a
+value that would need more is refused rather than read on.
 
 The same holds across cases for every record that is demonstrably later than a case's cutoff,
 whichever case retains it. A record cannot exist before what it records: a review record before
@@ -601,13 +617,29 @@ a title, a missing destination, a title not set apart from it, a definition past
 block quote that interrupts it, or where a list item cannot interrupt), and that a backslash
 escapes only punctuation and a destination ends only at an ASCII space or control character. They
 admit a PR body that links its file inline and by a reference defined over two lines and holds no
-record, and refuse a value whose link destinations would be read past the bound. They admit round
+record, and refuse a value whose link destinations would be read past the bound. They refuse the
+answer with its file linked between two HTML comments that each hold a backtick, or linked with a
+title that holds one, in a reference and as a document's text, and check that inline markup is read
+from left to right: a backtick in a comment, a tag or an autolink opens no code span, a comment or a
+tag in a code span reads as written, an escaped backslash leaves a backtick opening a span and an
+escaped backtick leaves the rest of its run to open one, a backtick in a link's destination or title
+opens none, a shortcut reference in a link's text leaves the link unopened, an inline link comes
+before a footnote's marker, an HTML block's tag holding a comment's opening keeps the text after
+it, and empty comments and a processing instruction's end read as CommonMark has them. They count
+what the scans read (not how long they take) over a paragraph of processing instructions that
+never close, as the review measured, and of comments, CDATA sections, declarations, quoted
+attribute values of either quote and attributes that never close, each kind and all of them in
+turn, at 12 and 48 KiB: the reads grow with the value's length, never with its openers, each is
+shown as written, and an instruction that closes before them is still raw HTML. They admit round
 2's input holding round 1's review, published before round 2 read it, and refuse round 1's input
 holding round 2's review record, whole as a document or its answer alone in a reference, and round
 2's holding the answer of round 1's lineage record, whose fix round 2 withholds; and when round 2
 does not list that fix, the corpus check admits it, `verify` fails round 2 by the fix's committer
 time and the score refuses it, while without the copy round 2 verifies and scores, the fix
-unlisted. They refuse a round or a
+unlisted. They refuse, in every command, round 2's candidate named round 1 of PR 2 under a record
+of its own binding its own head and its January 4 start, beside round 1's case and its January 3
+start, as the corpus check refuses the two with neither record captured, while the two distinct
+rounds verify and score. They refuse a round or a
 squash given issue 99's context, issue item and inventory entry under its unchanged review or merge
 record, and a squash of no issue under a record naming one, or the reverse. They refuse a second
 finding of a round, at another span of the same file with the same introduction and fix, under the

@@ -18,7 +18,7 @@ import stat
 import string
 import subprocess
 import unicodedata
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -604,15 +604,19 @@ def plain(text: str) -> str:
 #
 # A copy of a record can be marked up so that it reads, rendered, as the record
 # does while its text holds letters the record's does not: a link's destination,
-# an HTML tag. ``rendered`` models what CommonMark (with GitHub's footnotes)
-# shows of a text, so the record check reads each value both as written and as
-# rendered. It is a model, not a renderer: what it does not model it reads as
-# prose. It reads a text's blocks line by line as cmark does (``blocks``): the
-# block quotes and list items each line continues, and in them the code
-# blocks, HTML blocks, headings and paragraphs; then the inline markup of each
-# paragraph and heading, which never runs from one block into another, and of
-# each HTML block. Its work is linear in the text, but for a link's destination
-# and title, which it scans within ``MARKUP_BUDGET`` times the text's length.
+# an HTML tag. ``rendered`` models what CommonMark 0.31.2 (with GitHub's
+# footnotes) shows of a text, so the record check reads each value both as
+# written and as rendered. It is a model, not a renderer: what it does not model
+# it reads as prose. It reads a text's blocks line by line as cmark does
+# (``blocks``): the block quotes and list items each line continues, and in them
+# the code blocks, HTML blocks, headings and paragraphs; then the inline markup
+# of each paragraph and heading, which never runs from one block into another,
+# and of each HTML block, from left to right as cmark does (``inline_markup``,
+# ``raw_markup``). Its work is linear in the text: each search for what ends
+# raw HTML reads the text at most once (``Reader``), and the reads a bracket
+# or an angle bracket starts (a link's destination and title, a tag, an
+# autolink) stop at ``MARKUP_BUDGET`` times the text's length (``Work``): a
+# text that would need more is refused.
 
 # A line, its line ending included. CommonMark ends a line at a line feed, a
 # carriage return or both (``rendered`` makes each a line feed), and at
@@ -650,26 +654,33 @@ REFERENCE = re.compile(r"\[((?:[^\[\]\\]|\\.){0,999})\]", re.DOTALL)
 # attributes, each set apart by whitespace, and an optional ``/``) or a
 # closing tag (its name alone). Whitespace is spaces and tabs and, in a
 # paragraph, at most one line ending; at an HTML block's start, which reads
-# its own line, none.
+# its own line, none. ``tag_end`` reads a tag in a paragraph by these parts,
+# ``LINE_TAG`` one alone on its line.
 TAG_NAME = r"[A-Za-z][A-Za-z0-9-]*"
-ATTRIBUTE_VALUE = r"[^ \t\n\"'=<>`]+|'[^']*'|\"[^\"]*\""
+ATTRIBUTE_NAME = r"[A-Za-z_:][A-Za-z0-9_.:-]*"
+UNQUOTED = r"[^ \t\n\"'=<>`]+"
+ATTRIBUTE_VALUE = rf"{UNQUOTED}|'[^']*'|\"[^\"]*\""
+NAME_AT = re.compile(TAG_NAME)
+ATTRIBUTE_AT = re.compile(ATTRIBUTE_NAME)
+UNQUOTED_AT = re.compile(UNQUOTED)
+TAG_SPACE = re.compile(r"[ \t]*(?:\n[ \t]*)?")
+LETTERS = frozenset(string.ascii_letters)
+# An autolink: a scheme and a colon, or an e-mail address, between angle
+# brackets, holding no space, control character or angle bracket.
+AUTOLINK = re.compile(r"[^\x00-\x20\x7f<>]*")
+URI = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{1,31}:")
+EMAIL = re.compile(
+    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*"
+)
 
 
 def tag_grammar(optional: str, required: str) -> str:
     """An open or a closing tag, ``optional`` and ``required`` its whitespace."""
-    attribute = (
-        rf"{required}[A-Za-z_:][A-Za-z0-9_.:-]*(?:{optional}={optional}(?:{ATTRIBUTE_VALUE}))?"
-    )
+    attribute = rf"{required}{ATTRIBUTE_NAME}(?:{optional}={optional}(?:{ATTRIBUTE_VALUE}))?"
     return rf"<{TAG_NAME}(?:{attribute})*{optional}/?>|</{TAG_NAME}{optional}>"
 
 
-# Inline raw HTML: a tag, a processing instruction, a declaration or a CDATA
-# section (an HTML comment is ``comments``'s).
-TAG = re.compile(
-    tag_grammar(r"[ \t]*(?:\n[ \t]*)?", r"(?:[ \t]+(?:\n[ \t]*)?|\n[ \t]*)")
-    + r"|<\?.*?\?>|<![A-Za-z][^>]*>|<!\[CDATA\[.*?\]\]>",
-    re.DOTALL,
-)
 # How each kind of HTML block starts and what line ends it (CommonMark 4.6):
 # ``None`` for a blank line.
 VERBATIM = "pre|script|style|textarea"
@@ -693,17 +704,18 @@ HTML_BLOCKS: tuple[tuple[re.Pattern, re.Pattern | None], ...] = (
 LINE_TAG = tag_grammar(r"[ \t]*", r"[ \t]+")
 HTML_LINE = re.compile(rf"(?!</?(?i:{VERBATIM})(?![A-Za-z0-9-]))(?:{LINE_TAG}) *$")
 BACKTICKS = re.compile(r"`+")
-# What the inline scan stops at: an escape (a backslash before ASCII
-# punctuation) or a bracket.
-INLINE = re.compile(r"\\[!-/:-@\[-`{-~]|[\[\]]")
+# What the inline scan stops at: a backslash, a backtick, an angle bracket, an
+# image's ``!`` or a bracket.
+SPECIAL = re.compile(r"[\\`<!\[\]]")
 SPACE = re.compile(r"[ \t]*(?:\r\n|\n|\r)?[ \t]*")
 # A bare destination's run up to a parenthesis, a backslash, a space or an
 # ASCII control character, any of which it stops at.
 DESTINATION = re.compile(r"[^\x00-\x20\x7f()\\]+")
 PUNCTUATION = frozenset(string.punctuation)  # what a backslash escapes
 MAX_DESTINATION_DEPTH = 32  # cmark's bound on a destination's nested parentheses
-MARKUP_BUDGET = 4  # link scans read at most four times a value, plus 4096
+MARKUP_BUDGET = 4  # markup scans read at most four times a value, plus 4096
 MAX_LABEL = 999  # CommonMark's bound on a link label's length
+BLANKS = " \t\n\v\f\r"  # what cmark trims from a link label
 
 
 def label_key(label: str) -> str:
@@ -711,27 +723,127 @@ def label_key(label: str) -> str:
     return " ".join(label.split()).casefold()
 
 
-def code_spans(text: str, breaks: list[int]) -> list[tuple[int, int]]:
-    """Where ``text``'s code spans stand: each a run of backticks up to the next
-    run of the same length in its paragraph, which a renderer shows as written.
-    ``breaks`` are where each paragraph's or heading's last line ends."""
-    runs = [match.span() for match in BACKTICKS.finditer(text)]
-    following: list[int | None] = [None] * len(runs)
-    last: dict[int, int] = {}
-    for index in range(len(runs) - 1, -1, -1):
-        size = runs[index][1] - runs[index][0]
-        following[index] = last.get(size)
-        last[size] = index
-    spans: list[tuple[int, int]] = []
-    for index, (start, end) in enumerate(runs):
-        if (spans and start < spans[-1][1]) or text[start - 1 : start] == "\\":
+class Work:
+    """What the markup scans of one value read beyond its one left-to-right
+    pass (``read``), and what they may still read again (``left``).
+
+    A link's destination and title, a tag and an autolink are read from where
+    they start, and many brackets or angle brackets can each start a read of
+    the same characters: those reads stop at ``MARKUP_BUDGET`` times the
+    value's length, plus 4096 characters, and a value that would need more is
+    refused rather than read on. The search for what ends a comment, a
+    processing instruction, a declaration, a CDATA section or a quoted
+    attribute value reads the value at most once for each (``Reader.find``),
+    and is counted but not bounded.
+    """
+
+    def __init__(self, size: int) -> None:
+        self.left = MARKUP_BUDGET * size + 4096
+        self.read = 0
+
+    def spend(self, read: int) -> None:
+        self.read += read
+        self.left -= read
+        require(self.left >= 0, "a value the reviewer reads is within the markup bound")
+
+    def search(self, read: int) -> None:
+        self.read += read
+
+
+class Reader:
+    """A text's markup scans, each read counted by its ``Work``.
+
+    What ends a comment, a processing instruction, a declaration, a CDATA
+    section or a quoted attribute value is searched for from where it was last
+    searched for, up to where it was found, once: no opener asks again for
+    what an earlier one found missing. So a text of openers that never close
+    is read once for each kind, not once for each opener, as cmark reads it.
+    """
+
+    def __init__(self, text: str, work: Work) -> None:
+        self.text, self.work = text, work
+        self.ahead: dict[str, tuple[int, int]] = {}  # each end: searched from, found at
+
+    def match(self, pattern: re.Pattern, at: int, stop: int) -> re.Match | None:
+        found = pattern.match(self.text, at, stop)
+        if found:
+            self.work.spend(found.end() - at)
+        return found
+
+    def find(self, needle: str, at: int) -> int:
+        since, found = self.ahead.get(needle, (len(self.text) + 1, -1))
+        if not since <= at <= (len(self.text) if found == -1 else found):
+            found = self.text.find(needle, at)
+            self.work.search(max(0, (len(self.text) if found == -1 else found + len(needle)) - at))
+            self.ahead[needle] = (at, found)
+        return found
+
+    def through(self, needle: str, at: int, stop: int) -> int | None:
+        """Just past the first ``needle`` from ``at``, if it ends by ``stop``."""
+        found = self.find(needle, at)
+        return None if found == -1 or found + len(needle) > stop else found + len(needle)
+
+
+def tag_end(reader: Reader, at: int, stop: int) -> int | None:
+    """Where the open or closing tag that starts at ``at`` ends, or ``None``."""
+    text = reader.text
+    closing = text.startswith("</", at)
+    name = reader.match(NAME_AT, at + 1 + closing, stop)
+    if name is None:
+        return None
+    i = name.end()
+    while True:
+        gap = reader.match(TAG_SPACE, i, stop).end()  # type: ignore[union-attr]
+        if text.startswith(">", gap) and gap < stop:
+            return gap + 1
+        if closing:
+            return None
+        if text.startswith("/>", gap) and gap + 2 <= stop:
+            return gap + 2
+        attribute = reader.match(ATTRIBUTE_AT, gap, stop) if gap > i else None
+        if attribute is None:
+            return None  # an attribute is set apart by whitespace
+        i = attribute.end()
+        equals = reader.match(TAG_SPACE, i, stop).end()  # type: ignore[union-attr]
+        if not text.startswith("=", equals) or equals >= stop:
             continue
-        close = following[index]
-        at = bisect_left(breaks, end)
-        bound = breaks[at] if at < len(breaks) else len(text)
-        if close is not None and runs[close][0] < bound:
-            spans.append((start, runs[close][1]))
-    return spans
+        value = reader.match(TAG_SPACE, equals + 1, stop).end()  # type: ignore[union-attr]
+        if text[value : value + 1] in ("'", '"'):
+            end = reader.through(text[value], value + 1, stop)
+        else:
+            unquoted = reader.match(UNQUOTED_AT, value, stop)
+            end = None if unquoted is None else unquoted.end()
+        if end is None:
+            return None
+        i = end
+
+
+def html_end(reader: Reader, at: int, stop: int) -> int | None:
+    """Where the raw HTML that starts at ``at`` (a ``<``) ends, by ``stop``, as
+    CommonMark reads it: a comment, a processing instruction, a CDATA section,
+    a declaration or a tag; ``None`` when none starts there."""
+    text = reader.text
+    if text.startswith("<!--", at):
+        for empty in ("<!-->", "<!--->"):
+            if text.startswith(empty, at):
+                return at + len(empty)
+        return reader.through("-->", at + 4, stop)
+    if text.startswith("<?", at):
+        return reader.through("?>", at + 2, stop)
+    if text.startswith("<![CDATA[", at):
+        return reader.through("]]>", at + 9, stop)
+    if text.startswith("<!", at) and text[at + 2 : at + 3] in LETTERS:
+        return reader.through(">", at + 3, stop)
+    return tag_end(reader, at, stop)
+
+
+def autolink_end(reader: Reader, at: int, stop: int) -> int | None:
+    """Where the autolink that starts at ``at`` (a ``<``) ends, or ``None``."""
+    run = reader.match(AUTOLINK, at + 1, stop).end()  # type: ignore[union-attr]
+    inside = reader.text[at + 1 : run]
+    if not reader.text.startswith(">", run) or run >= stop:
+        return None
+    return run + 1 if URI.match(inside) or EMAIL.fullmatch(inside) else None
 
 
 def bare_end(text: str, i: int) -> tuple[int | None, int]:
@@ -798,96 +910,153 @@ def segments(size: int, breaks: list[int]) -> Iterable[tuple[int, int]]:
     return zip([0, *breaks], [*breaks, size], strict=True)
 
 
-def comments(text: str, breaks: list[int]) -> list[tuple[int, int]]:
-    """Where ``text``'s HTML comments stand, each from ``<!--`` to the next
-    ``-->`` of its block: none after an opening its block does not close."""
-    spans = []
+def raw_markup(text: str, work: Work) -> list[tuple[int, int]]:
+    """The spans of HTML blocks' ``text`` a renderer does not show: their raw
+    HTML (``html_end``), read from left to right, so what starts first of a
+    comment and a tag is the one there. Nothing else of an HTML block is
+    markup."""
+    reader = Reader(text, work)
+    out = []
+    i = 0
+    while (i := text.find("<", i)) != -1:
+        end = html_end(reader, i, len(text))
+        if end is None:
+            i += 1
+        else:
+            out.append((i, end))
+            i = end
+    return out
+
+
+@dataclass
+class Opener:
+    """An open bracket of a paragraph: where its ``[`` stands, whether it opens
+    an image, and whether another bracket opened after it, which keeps its
+    text from being a reference's label."""
+
+    at: int
+    image: bool
+    after: bool = False
+
+
+def reference_end(
+    text: str, at: int, stop: int, opener: Opener, close: int, links: set
+) -> int | None:
+    """Where a reference link ends whose text closes at ``close`` (its ``]``),
+    ``at`` just past it, as cmark reads one: past the ``[label]`` that follows
+    (a full reference), the ``[]`` (a collapsed one), or at ``at`` (a
+    shortcut, the text its own label); ``None`` when the label is not
+    defined. A full reference is looked up by its own label, never by its
+    text, and a text that holds another bracket is no label."""
+    reference = REFERENCE.match(text, at)
+    if reference and reference.end() > stop:
+        reference = None
+    if reference and len(reference[1]) <= MAX_LABEL and reference[1].strip(BLANKS):
+        return reference.end() if label_key(reference[1]) in links else None
+    if opener.after or close - opener.at - 1 > MAX_LABEL:
+        return None
+    if label_key(text[opener.at + 1 : close]) not in links:
+        return None
+    return reference.end() if reference and not reference[1].strip(BLANKS) else at
+
+
+def inline_markup(
+    text: str, breaks: list[int], links: set, notes: set, work: Work
+) -> list[tuple[int, int]]:
+    """The spans of paragraphs' and headings' ``text`` that a renderer does
+    not show: raw HTML (``html_end``), a link's or image's destination and
+    title, a defined reference's label and a defined footnote's marker.
+    ``breaks`` are where each block's last line ends, which none of them runs
+    past.
+
+    Each block is read from left to right as cmark reads it. A backslash
+    escapes the punctuation after it. A code span, an autolink and raw HTML
+    bind alike, so whichever starts first is the one there and nothing
+    starts inside it: a backtick in a comment or a tag opens no code span,
+    and a comment, a tag or a bracket in a code span or an autolink is shown
+    as written. A code span runs from its backticks to the next run of as
+    many in its block, or its backticks are text. A ``]`` closes the last
+    bracket still open: its link's destination and title are read from
+    there, as written, then a reference's label, then a footnote's marker. A
+    link (not an image) leaves the brackets open before it opening no link,
+    since a link holds no other link.
+    """
+    reader = Reader(text, work)
+    runs = [match.span() for match in BACKTICKS.finditer(text)]
+    # Each run's next run of as many backticks, and of one fewer (what is left
+    # of a run whose first backtick is escaped).
+    same: list[int | None] = [None] * len(runs)
+    fewer: list[int | None] = [None] * len(runs)
+    last: dict[int, int] = {}
+    for index in range(len(runs) - 1, -1, -1):
+        size = runs[index][1] - runs[index][0]
+        same[index], fewer[index] = last.get(size), last.get(size - 1)
+        last[size] = index
+    run_at = {start: index for index, (start, _) in enumerate(runs)}
+    out: list[tuple[int, int]] = []
     for start, stop in segments(len(text), breaks):
-        at = start
-        while (begin := text.find("<!--", at, stop)) != -1 and (
-            end := text.find("-->", begin + 4, stop)
-        ) != -1:
-            spans.append((begin, end + 3))
-            at = end + 3
-    return spans
-
-
-def raw_markup(text: str) -> list[tuple[int, int]]:
-    """The spans of HTML blocks' ``text`` a renderer does not show: their tags
-    and comments. Nothing else of an HTML block is markup."""
-    hushed = comments(text, [])
-    flat = list(text)
-    for start, end in hushed:
-        flat[start:end] = "-" * (end - start)
-    return [match.span() for match in TAG.finditer("".join(flat))] + hushed
-
-
-def inline_markup(text: str, breaks: list[int], links: set, notes: set) -> list[tuple[int, int]]:
-    """The spans of paragraphs' and headings' ``text`` outside code that a
-    renderer does not show: raw HTML tags and comments, a link's or image's
-    destination and title, a defined reference's label and a defined
-    footnote's marker. ``breaks`` are where each block's last line ends, which
-    none of them runs past."""
-    flat = list(text)
-    for start, end in code_spans(text, breaks):
-        flat[start:end] = "`" * (end - start)
-    hushed = comments("".join(flat), breaks)
-    for start, end in hushed:
-        flat[start:end] = "-" * (end - start)  # nothing in a comment is shown
-    masked = "".join(flat)
-    out = [
-        match.span()
-        for start, stop in segments(len(masked), breaks)
-        for match in TAG.finditer(masked, start, stop)
-    ]
-    starts = [start for start, _ in out]
-    ends = [end for _, end in out]
-    budget = MARKUP_BUDGET * len(text) + 4096
-    openers: list[tuple[int, bool]] = []  # each open bracket, and whether an image's
-    floor = at = 0  # brackets before ``floor`` open no link; read up to ``at``
-    block = 0  # the index of the break that ends the block being read
-    for match in INLINE.finditer(masked):
-        i = match.start()
-        while block < len(breaks) and breaks[block] < i:
-            openers.clear()  # a link never spans two blocks
-            block += 1
-        bound = breaks[block] if block < len(breaks) else len(text)
-        tag = bisect_right(starts, i) - 1
-        if i < at or (tag >= 0 and i < ends[tag]):
-            continue
-        token = match.group()
-        if token == "[":
-            openers.append((i, masked[i - 1 : i] == "!"))
-        elif token == "]" and openers:
-            start, image = openers.pop()
-            if not image and start < floor:
-                continue  # a link holds no other link
-            if (
-                masked.startswith("^", start + 1)
-                and i - start <= MAX_LABEL + 2
-                and label_key(masked[start + 2 : i]) in notes
-            ):
-                out.append((start, i + 1))
-            elif masked.startswith("(", i + 1):
-                end, read = link_end(masked, i + 2, bound)
-                budget -= read
-                require(budget >= 0, "a value the reviewer reads is within the markup bound")
-                if end is not None and end <= bound:
-                    out.append((i + 1, end))
-                    at = end
-                    if not image:
+        openers: list[Opener] = []
+        floor = i = start  # brackets before ``floor`` open no link
+        while found := SPECIAL.search(text, i, stop):
+            i = found.start()
+            char = text[i]
+            if char == "\\":
+                i += 2 if i + 1 < stop and text[i + 1] in PUNCTUATION else 1
+            elif char == "`":
+                index = run_at.get(i)
+                if index is None:  # the rest of a run after an escaped backtick
+                    index = run_at[i - 1]
+                    closer = fewer[index]
+                else:
+                    closer = same[index]
+                if closer is not None and runs[closer][0] < stop:
+                    i = runs[closer][1]  # a code span, shown as written
+                else:
+                    i = runs[index][1]
+            elif char == "<":
+                end = autolink_end(reader, i, stop)  # shown as written
+                if end is None and (end := html_end(reader, i, stop)) is not None:
+                    out.append((i, end))
+                i = i + 1 if end is None else end
+            elif char == "!" and not text.startswith("[", i + 1):
+                i += 1
+            elif char in "![":
+                if openers:
+                    openers[-1].after = True
+                image = char == "!"
+                openers.append(Opener(at=i + image, image=image))
+                i += 1 + image
+            else:  # "]"
+                close, i = i, i + 1
+                if not openers:
+                    continue
+                opener = openers.pop()
+                if not opener.image and opener.at < floor:
+                    continue  # a link holds no other link
+                end = None
+                if text.startswith("(", i):
+                    end, read = link_end(text, i + 1, stop)
+                    work.spend(read)
+                    if end is not None and end > stop:
+                        end = None
+                if end is None:
+                    end = reference_end(text, i, stop, opener, close, links)
+                if end is not None:
+                    if end > i:
+                        out.append((i, end))
+                    i = end
+                    if not opener.image:
                         floor = end
-            elif (
-                (reference := REFERENCE.match(masked, i + 1))
-                and len(reference[1]) <= MAX_LABEL
-                and reference.end() <= bound
-                and label_key(reference[1]) in links
-            ):
-                out.append((i + 1, reference.end()))
-                at = reference.end()
-                if not image:
-                    floor = at
-    return out + hushed
+                elif (
+                    # A footnote's label holds no bracket, so a text that holds
+                    # one is read for none, and no two texts read overlap.
+                    not opener.after
+                    and text.startswith("^", opener.at + 1)
+                    and close - opener.at <= MAX_LABEL + 2
+                    and label_key(text[opener.at + 2 : close]) in notes
+                ):
+                    out.append((opener.at, close + 1))
+    return out
 
 
 def fence_opening(body: str, at: int) -> re.Match | None:
@@ -1230,17 +1399,22 @@ def rendered(text: str) -> str:
     or an indented block) is shown as written, and so is the rest of an HTML
     block. The blocks are read as cmark reads them (``blocks``): a fence ends
     at its closing fence or where the block quote or list item holding it
-    ends, so what follows it there is prose. Each removal keeps the line
+    ends, so what follows it there is prose. So is their inline markup, from
+    left to right (``inline_markup``): what starts first of a code span, an
+    autolink and raw HTML is the one there. Each removal keeps the line
     breaks it held, so the text keeps its lines; its line endings are line
     feeds and its tabs spaces, and a byte order mark it starts with, which
     cmark skips, is gone, none of which a reader sees.
     """
     text = text.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n").expandtabs(4)
     scan = blocks(text)
-    drop = scan.drop + inline_markup("".join(scan.prose), scan.breaks, scan.links, scan.notes)
+    work = Work(len(text))
+    prose = "".join(scan.prose)
+    drop = scan.drop + inline_markup(prose, scan.breaks, scan.links, scan.notes, work)
     if scan.raw:
         lines = enumerate(scan.prose)
-        drop += raw_markup("".join(scan.raw.get(index) or blank(row) for index, row in lines))
+        raw = "".join(scan.raw.get(index) or blank(row) for index, row in lines)
+        drop += raw_markup(raw, work)
     kept, at = [], 0
     for start, end in sorted(drop):
         if end <= at:
@@ -1896,14 +2070,39 @@ def check_merges(corpus) -> None:
             )
 
 
-def round_starts(corpus, cases: dict) -> dict[tuple[int, int], list[datetime]]:
-    """When each review round of a PR the corpus holds read its input: the
-    cutoff of every case of that round, by PR and round."""
-    rounds: dict[tuple[int, int], list[datetime]] = {}
+def check_rounds(corpus) -> None:
+    """One review round of a PR is one case.
+
+    A round read one head against one base revision, from one instant, and
+    left one record: a case of it is that round's review, and its record (one
+    case's alone, ``check_records``) binds all of it. Two cases naming one
+    round of one PR cannot both be it, each however consistent with its own
+    record and with git: one of them binds a head, a base or a start the
+    round never had. The corpus is refused rather than either trusted, and
+    rather than its scores counting one round twice. A round reviewed twice
+    (a retried review, say) is one case in version 1, the attempt whose record
+    it retains; the format has no field to tell two attempts apart. A round of
+    a PR no record numbers (``pr`` is ``null``) cannot be told from another
+    PR's round of the same issue, so it is held to nothing here.
+    """
+    rounds: dict[tuple[int, int], str] = {}
     for case_id, case in sorted(corpus["cases"].items()):
         origin = case["provenance"]
         if origin["pr"] is not None and origin["round"] is not None:
-            rounds.setdefault((origin["pr"], origin["round"]), []).append(cases[case_id].cutoff)
+            require(
+                rounds.setdefault((origin["pr"], origin["round"]), case_id) == case_id,
+                "one review round of a PR is one case",
+            )
+
+
+def round_starts(corpus, cases: dict) -> dict[tuple[int, int], datetime]:
+    """When each review round of a PR the corpus holds read its input: the
+    cutoff of its one case (``check_rounds``), by PR and round."""
+    rounds: dict[tuple[int, int], datetime] = {}
+    for case_id, case in sorted(corpus["cases"].items()):
+        origin = case["provenance"]
+        if origin["pr"] is not None and origin["round"] is not None:
+            rounds[(origin["pr"], origin["round"])] = cases[case_id].cutoff
     return rounds
 
 
@@ -1927,9 +2126,9 @@ def check_discoveries(corpus, cases: dict) -> None:
             found = defect["discovery"]
             if found["round"] is None:
                 continue
-            discovered = day(found["discovered"])
+            start = rounds.get((pr, found["round"]))
             require(
-                all(start.date() <= discovered for start in rounds.get((pr, found["round"]), [])),
+                start is None or start.date() <= day(found["discovered"]),
                 "a review's discovery is no earlier than its round",
             )
 
@@ -1942,8 +2141,8 @@ def captured_records(corpus, cases: dict) -> list[tuple]:
     A record cannot exist before what it records: a review record before its
     round read its input (its case's cutoff), a merge record before its merge
     (a squash case's cutoff, the squash's committer time), a lineage record
-    before the round that found its defect, whose review of the PR starts no
-    earlier than the cutoff of any case of that round. Nor can one exist
+    before the round that found its defect, whose review of the PR starts at
+    the cutoff of that round's case, when the corpus holds it. Nor can one exist
     before a commit its binding names: ``check_later_records`` reads that
     from what a case withholds, ``check_record_dates`` from git.
     """
@@ -1954,7 +2153,7 @@ def captured_records(corpus, cases: dict) -> list[tuple]:
         bounds = [cutoff]
         for _, defect in sorted(case["defects"].items()):
             reported = defect["discovery"]["round"]
-            bounds.append(max([cutoff, *rounds.get((pr, reported), [])]))
+            bounds.append(max(cutoff, rounds.get((pr, reported), cutoff)))
         for (form, record), bound in zip(retained_records(case), bounds, strict=True):
             if record["status"] == "captured":
                 line, binding = record_binding(record["text"], form)
@@ -2058,6 +2257,7 @@ def check_corpus(corpus) -> Corpus:
     check_defects(corpus)
     check_records(corpus)
     check_merges(corpus)
+    check_rounds(corpus)
     check_discoveries(corpus, cases)
     check_later_records(corpus, cases)
     check_clusters(corpus, cases)
