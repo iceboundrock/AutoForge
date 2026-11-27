@@ -643,7 +643,8 @@ the review corpus (REV-R1, #356)      test_review_corpus.py (the synthetic score
                                       bindings and their absence from every value the
                                       reviewer reads, the recorded or provisional base
                                       revision and merge base, a squash's PR and one parent,
-                                      environment pins, fix and squash lineage, and recorded
+                                      environment pins and the registered declaration they
+                                      follow, fix, revert and squash lineage, and recorded
                                       scoring bound to it; each run observed once)
 troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
                                       a test that exists; the guide's links and the links

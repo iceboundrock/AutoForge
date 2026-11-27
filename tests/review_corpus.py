@@ -10,11 +10,13 @@ model, reaches a network or writes to GitHub. See ``docs/review-corpus.md``.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
 import stat
 import subprocess
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -111,14 +113,40 @@ class Form:
     fields: str
 
 
-# A review round's record: what it reviewed, against which base revision, and
-# when it read its input.
-REVIEW = Form("review", "review-record: ", "pr round base_ref base_tip head merge_base input_read")
-# A PR's merge record: the commit its PR merged into its base ref as.
-MERGE = Form("merge", "merge-record: ", "pr base_ref merged")
-# A defect's lineage record: the fix or revert that addresses it, and the
-# merge it escaped through.
-LINEAGE = Form("lineage", "lineage-record: ", "pr introduced paths merged fix")
+# A review round's record: the issue and PR it reviewed, what it reviewed,
+# against which base revision, and when it read its input.
+REVIEW = Form(
+    "review", "review-record: ", "pr issue round base_ref base_tip head merge_base input_read"
+)
+# A PR's merge record: the issue it was for and the commit its PR merged into
+# its base ref as.
+MERGE = Form("merge", "merge-record: ", "pr issue base_ref merged")
+# A defect's lineage record: which registered defect it is, how it was found,
+# the fix or revert that addresses it, and the merge it escaped through.
+LINEAGE = Form("lineage", "lineage-record: ", "defect pr introduced paths found merged fix")
+# How a defect was found, as its lineage record states it: by a review round
+# (the same or a later one, which depends on the head registering it), after
+# its merge, or by a revert.
+FOUND = {
+    "same_review": "review",
+    "later_review": "review",
+    "post_merge": "post_merge",
+    "revert": "revert",
+}
+# Found after the merge, a defect has no review round to evidence it: only the
+# commit that fixed or reverted it, through its lineage record.
+AFTER_MERGE = ("post_merge", "revert")
+# Each repository's test environment, declared here, in reviewed source, and
+# not by any corpus: the files every case of it pins and the commands a runner
+# validates it with, by the repository's slug and root commit. A historical
+# corpus declares its repository's environment as registered here, and none of
+# the cases of a repository not registered here is runnable.
+ENVIRONMENTS = {
+    ("iceboundrock/AutoForge", "e5d562e85f2d6eb5c10a1bfe02707f1e554ecb2d"): {
+        "files": ["pyproject.toml", "uv.lock"],
+        "validation": ["make check"],
+    },
+}
 CLAIM = "scorecards only: no benchmark decision, gate or rollout follows from this report"
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 OBJECT_ID = re.compile(r"[0-9a-f]{40}")
@@ -263,12 +291,16 @@ def reviewer_text(case) -> Iterable[str]:
 LABEL_FIELDS = "by role verdict decided artifact"
 
 
-def check_labels(labels, verdicts, *, frozen: date, barred: frozenset, match=None) -> None:
+def check_labels(
+    labels, verdicts, *, frozen: date, barred: frozenset, match=None, since: date | None = None
+) -> None:
     """One label per identity, decided by the freeze, never by a barred identity.
 
     ``barred`` holds the identities that acted on what is labeled: the case's
     historical producer, reviewer and fixer, and for a finding the reviewer
-    variants. A curator proposes; only adjudicators and arbiters decide.
+    variants. A curator proposes; only adjudicators and arbiters decide. A
+    case's own labels are decided no earlier than ``since``, its cutoff's day:
+    a verdict on a candidate cannot precede the candidate as it was reviewed.
     """
     require(isinstance(labels, list), "labels")
     seen = set()
@@ -276,7 +308,9 @@ def check_labels(labels, verdicts, *, frozen: date, barred: frozenset, match=Non
         closed(label, LABEL_FIELDS + (" defect" if match is not None else ""))
         require(nonempty(label["by"]) and nonempty(label["artifact"]), "label provenance")
         require(label["role"] in ROLES and label["verdict"] in verdicts, "label verdict")
-        require(day(label["decided"]) <= frozen, "label decided after the freeze")
+        decided = day(label["decided"])
+        require(decided <= frozen, "label decided after the freeze")
+        require(since is None or since <= decided, "label decided before its case's cutoff")
         require(label["by"].strip() not in barred, "an actor cannot adjudicate")
         require(label["by"].strip() not in seen, "one label per identity")
         seen.add(label["by"].strip())
@@ -533,31 +567,54 @@ def record_binding(text: str, form: Form) -> tuple[str, dict]:
     return lines[0], binding
 
 
-def squeezed(text: str) -> str:
-    """``text`` compared without case or whitespace."""
-    return "".join(text.casefold().split())
+def plain(text: str) -> str:
+    """``text`` as its letters and digits alone, without case.
+
+    How a text is presented is not what it says. Whitespace and line breaks (a
+    line reflowed, or two joined), punctuation, and markup (a Markdown quote,
+    list, heading, table, emphasis or code span, an HTML entity, a character's
+    compatibility form) change the first and never the second, so none of them
+    is compared.
+    """
+    folded = unicodedata.normalize("NFKC", html.unescape(text)).casefold()
+    return "".join(char for char in folded if char.isalnum())
 
 
-def exposes(texts: Sequence[str], record, line: str) -> bool:
+@dataclass(frozen=True)
+class Visible:
+    """Every free-text value of a case's reviewer input (``reviewer_text``) as
+    the record check reads it: each value's digest, and each value as its
+    letters and digits (``plain``), kept apart from the others."""
+
+    digests: frozenset
+    words: str
+
+    @classmethod
+    def of(cls, texts: Sequence[str]) -> Visible:
+        return cls(
+            digests=frozenset(sha256(text.encode()).hexdigest() for text in texts),
+            # No plain text holds the separator, so nothing matches across two values.
+            words="\0".join(plain(text) for text in texts),
+        )
+
+
+def exposes(visible: Visible, record, line: str) -> bool:
     """Whether the reviewer's input holds a retained record.
 
-    ``texts`` is every free-text value of the input (``reviewer_text``): each
-    context item's id, kind, source, reference and text, the environment's
-    paths and commands and the base ref. One of them is the record (its digest
-    is the record's), or one carries the record's binding statement, or
-    together they hold every other line of the record, each compared without
-    case or whitespace, wherever each line stands. A paraphrase, or a part of
-    the record, cannot be told.
+    ``visible`` is every free-text value of the input: each context item's id,
+    kind, source, reference and text, the environment's paths and commands and
+    the base ref. One of them is the record (its digest is the record's), or
+    one carries the record's binding statement, or every other line of the
+    record stands in one value or another, wherever each stands. Each is
+    compared as its letters and digits alone (``plain``), so quoting, listing
+    or emphasising a line, reflowing or joining lines, or changing their case,
+    spacing or punctuation hides none of them. A paraphrase, or a part of the
+    record, cannot be told.
     """
-    body = {squeezed(row) for row in record["text"].splitlines() if row != line} - {""}
-    held: set[str] = set()
-    for text in texts:
-        if sha256(text.encode()).hexdigest() == record["sha256"] or squeezed(line) in squeezed(
-            text
-        ):
-            return True
-        held |= {squeezed(row) for row in text.splitlines()}
-    return bool(body) and body <= held
+    if record["sha256"] in visible.digests or plain(line) in visible.words:
+        return True
+    body = {plain(row) for row in record["text"].splitlines() if row != line} - {""}
+    return bool(body) and all(row in visible.words for row in body)
 
 
 def check_source(record, form: Form, *, origin, context) -> None:
@@ -601,8 +658,8 @@ def check_record(record, *, case, cutoff: datetime, context: list) -> str | None
     corpus: a record of the round (``REVIEW``), named by its stable source so
     anyone can read it again (``check_source``), whose digest matches its text
     and whose text carries one binding statement (``record_binding``) naming
-    the case's PR, round, base ref, base revision, head and merge base and the
-    instant the review read its input. That instant is then the cutoff.
+    the case's PR, issue, round, base ref, base revision, head and merge base
+    and the instant the review read its input. That instant is then the cutoff.
     Without one the cutoff is the head's committer time and the base revision
     the ref's tip by committer times, both of which ``verify`` checks, the
     second only provisionally, and the case is never runnable.
@@ -610,6 +667,11 @@ def check_record(record, *, case, cutoff: datetime, context: list) -> str | None
     A squash candidate's record is its PR's merge record (``MERGE``): the
     commit the PR merged as, which its commit subject only suggests. Without
     one a squash candidate is never runnable either.
+
+    Either binding names the case's issue, or ``null`` when its provenance
+    names none, so the issue whose context the case holds is the one the
+    round or the merge was for: a case given another issue's context, issue
+    item and inventory entry under an unchanged record is refused.
 
     Either record holds what the reviewer must not be given, so neither is
     ever part of the reviewer's input (``exposes``, in ``check_case``).
@@ -634,8 +696,11 @@ def check_record(record, *, case, cutoff: datetime, context: list) -> str | None
         require(record["started"] is None, "a merge record states no review start")
         line, binding = retained(record, form)
         require(
-            integer(binding["pr"], 1) and binding["pr"] == origin["pr"],
-            "the merge record's binding names the case's PR",
+            integer(binding["pr"], 1)
+            and binding["pr"] == origin["pr"]
+            and pr_number(binding["issue"])
+            and binding["issue"] == origin["issue"],
+            "the merge record's binding names the case's PR and issue",
         )
         require(
             binding["base_ref"] == review["base_ref"] and binding["merged"] == review["head"],
@@ -647,9 +712,11 @@ def check_record(record, *, case, cutoff: datetime, context: list) -> str | None
     require(
         pr_number(binding["pr"])
         and binding["pr"] == origin["pr"]
+        and pr_number(binding["issue"])
+        and binding["issue"] == origin["issue"]
         and integer(binding["round"], 1)
         and binding["round"] == origin["round"],
-        "the review record's binding names the case's PR and round",
+        "the review record's binding names the case's PR, issue and round",
     )
     require(
         all(binding[key] == review[key] for key in ("base_ref", "base_tip", "head", "merge_base")),
@@ -663,17 +730,23 @@ def check_record(record, *, case, cutoff: datetime, context: list) -> str | None
     return line
 
 
-def check_lineage(defect, *, case) -> str | None:
+def check_lineage(key: str, defect, *, case) -> str | None:
     """A defect's lineage record; its binding line, if captured.
 
     That a later commit is a defect's fix or revert, and that a squash is the
     merge it escaped through, is what the record evidences: its binding names
-    the case's PR, the defect's introducing commit and the files it is located
-    in, the merged revision (or ``null``) and the fix. ``verify``'s checks of
-    the same lineage against git (ancestry, the squash's subject, the lines it
-    carried, the files and lines the fix changed) are consistency checks: a
-    later commit can satisfy every one of them without fixing anything. A
-    case is runnable only when each fix it names has its record.
+    the registered defect (its id, ``key``, which names one defect in every
+    case registering it: ``check_defects``), the case's PR, the defect's
+    introducing commit and the files it is located in, how it was found
+    (``FOUND``), the merged revision (or ``null``) and the fix. Defects that
+    share all but their id (one PR, introduction, file and fix) therefore
+    never share a record, while one defect registered at several heads of its
+    PR can. ``verify``'s checks of the same lineage against git (ancestry, the
+    squash's subject, the lines it carried, the files and lines the fix
+    changed) are consistency checks: a later commit can satisfy every one of
+    them without fixing anything. A case is runnable only when each fix it
+    names has its record, and each defect found after its merge its record
+    too (``check_case``).
     """
     found = defect["discovery"]
     lineage = found["lineage"]
@@ -689,16 +762,14 @@ def check_lineage(defect, *, case) -> str | None:
         return None
     require(found["fix"] is not None, "a lineage record evidences a fix")
     line, binding = retained(lineage, LINEAGE)
-    paths = sorted({place["path"] for place in defect["location"]})
+    stated = lineage_statement(key, defect, pr=origin["pr"])
     require(
         pr_number(binding["pr"])
-        and binding["pr"] == origin["pr"]
-        and binding["introduced"] == defect["introduced"]
-        and binding["paths"] == paths,
+        and all(binding[name] == stated[name] for name in ("defect", "pr", "introduced", "paths")),
         "the lineage record's binding names the defect",
     )
     require(
-        binding["merged"] == found["merged"] and binding["fix"] == found["fix"],
+        all(binding[name] == stated[name] for name in ("found", "merged", "fix")),
         "the lineage record's binding names the defect's lineage",
     )
     return line
@@ -771,7 +842,9 @@ def check_defect(key, defect, *, case, cutoff: datetime, frozen: date, withheld,
         require(found["fix"] is not None, "a merged revision leads to a fix")
         require(merged in withheld, "a merged revision is withheld from the reviewer")
         require(merged not in (introduced, found["fix"]), "a merged revision is its own commit")
-    check_labels(defect["labels"], DEFECT_VERDICTS, frozen=frozen, barred=barred)
+    check_labels(
+        defect["labels"], DEFECT_VERDICTS, frozen=frozen, barred=barred, since=cutoff.date()
+    )
     status = settle(defect["labels"], critical_needs_two(defect["severity"]))
     return Defect(
         severity=defect["severity"],
@@ -782,7 +855,13 @@ def check_defect(key, defect, *, case, cutoff: datetime, frozen: date, withheld,
     )
 
 
-def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
+def check_case(case_id, case, *, mode: str, frozen: date, declared, registered: bool) -> Case:
+    """One case, against its corpus's mode, freeze and declared environment.
+
+    ``declared`` is the repository's test environment, its files and
+    validation commands, and ``registered`` whether this module registers it
+    for the repository (``ENVIRONMENTS``), which a historical case needs to run.
+    """
     require(isinstance(case_id, str) and IDENTIFIER.fullmatch(case_id), "case id")
     closed(case, CASE_FIELDS)
     require(case["stratum"] in STRATA, "case stratum")
@@ -814,12 +893,13 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
     require(cutoff.date() <= frozen, "a candidate reviewed by the freeze")
     environment = case["environment"]
     closed(environment, "files validation")
-    # Each file the repository declares its test environment (``check_corpus``
-    # holds the names to that list), as its blob at the head or ``None`` when
-    # the head has none, and at least one command a runner may validate with:
-    # leaving a pin out is never how a case says it has none. A case none of
-    # whose declared files is at its head pins no environment at all, so it
-    # never runs (``pinned`` below): an absent placeholder pins nothing.
+    # Each file the repository declares its test environment, as its blob at
+    # the head or ``None`` when the head has none, and the commands it declares
+    # a runner validates with: leaving a pin out is never how a case says it
+    # has none, and a case's own list of either is never what a runner trusts.
+    # A case none of whose declared files is at its head pins no environment
+    # at all, so it never runs (``pinned`` below): an absent placeholder pins
+    # nothing.
     require(isinstance(environment["files"], dict), "environment files")
     for path, blob in environment["files"].items():
         relative_path(path)
@@ -830,6 +910,14 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
         and environment["validation"]
         and all(nonempty(command) for command in environment["validation"]),
         "environment validation",
+    )
+    require(
+        set(environment["files"]) == set(declared["files"]),
+        "a case pins each of the repository's environment files",
+    )
+    require(
+        environment["validation"] == declared["validation"],
+        "a case validates with the repository's declared commands",
     )
     withheld = case["withheld"]
     require(isinstance(withheld, list), "withheld commits")
@@ -872,6 +960,7 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
         not any(names_commit(text, forbidden) for text in texts),
         "the reviewer's input names a withheld commit",
     )
+    visible = Visible.of(texts)
     require(isinstance(case["defects"], dict), "defects")
     if STRATA[case["stratum"]]:
         require(case["defects"] and case["negative"] is None, "a defect case registers its defects")
@@ -883,7 +972,9 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
         )
         for key, defect in case["defects"].items()
     }
-    lineages = {key: check_lineage(defect, case=case) for key, defect in case["defects"].items()}
+    lineages = {
+        key: check_lineage(key, defect, case=case) for key, defect in case["defects"].items()
+    }
     # Every record retained for the case holds what its reviewer must not be
     # given: the round's own result, a merge, a fix. None reaches the input,
     # through a context item's text or any other value the reviewer reads.
@@ -894,20 +985,30 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
     ]
     for form, kept, line in held:
         require(
-            line is None or not exposes(texts, kept, line),
+            line is None or not exposes(visible, kept, line),
             f"the {form.kind} record is not the reviewer's context",
         )
     # A case runs only on what its records evidence: a review round on the
     # cutoff and base revision its review record states, a squash on its PR's
-    # merge record, and every defect's fix on its lineage record; and only on
-    # a test environment it pins.
-    evidenced = recorded is not None or origin["source"] == "synthetic"
+    # merge record, and every defect's fix on its lineage record. A historical
+    # defect found after its merge (an escape, a revert) has no review round
+    # to evidence it, only the commit that fixed or reverted it, so it runs
+    # only on that commit's lineage record, which states how it was found: a
+    # claim of a revert, or of an escape, without one stays unplanned. And a
+    # case runs only on a test environment it pins, as its repository's
+    # registered declaration names it.
+    synthetic = origin["source"] == "synthetic"
+    evidenced = recorded is not None or synthetic
     lineaged = all(
-        lineages[key] is not None or defect["discovery"]["fix"] is None
+        lineages[key] is not None
+        or (
+            defect["discovery"]["fix"] is None
+            and (synthetic or defect["discovery"]["source"] not in AFTER_MERGE)
+        )
         for key, defect in case["defects"].items()
     )
     pinned = any(blob is not None for blob in environment["files"].values())
-    runnable = on_context and evidenced and lineaged and pinned
+    runnable = on_context and evidenced and lineaged and pinned and registered
     negative = None
     labels = [label for defect in case["defects"].values() for label in defect["labels"]]
     if STRATA[case["stratum"]]:
@@ -918,7 +1019,9 @@ def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
         through = day(case["negative"]["observed_through"])
         require(cutoff.date() <= through <= frozen, "observed between cutoff and freeze")
         labels = case["negative"]["labels"]
-        check_labels(labels, NEGATIVE_VERDICTS, frozen=frozen, barred=barred)
+        # A clean pass dated before the candidate as reviewed cannot have
+        # judged it, however long the observation that follows its cutoff.
+        check_labels(labels, NEGATIVE_VERDICTS, frozen=frozen, barred=barred, since=cutoff.date())
         verdict = settle(labels)
         if verdict == "defective":
             negative = "refuted"
@@ -966,6 +1069,79 @@ def check_clusters(corpus, cases: dict) -> None:
                 )
 
 
+def lineage_statement(key: str, defect, *, pr) -> dict:
+    """What a lineage record of a registered defect binds (``check_lineage``)."""
+    found = defect["discovery"]
+    return {
+        "defect": key,
+        "pr": pr,
+        "introduced": defect["introduced"],
+        "paths": sorted({place["path"] for place in defect["location"]}),
+        "found": FOUND[found["source"]],
+        "merged": found["merged"],
+        "fix": found["fix"],
+    }
+
+
+def check_defects(corpus) -> None:
+    """Registrations one lineage record would serve are one defect.
+
+    A lineage record serves every registration its binding names: one defect
+    id of one PR, with one introduction, set of paths, way of being found,
+    merge and fix. One defect may be registered so at several heads of its PR,
+    and its record then serves each of them. Any two such registrations must
+    be one defect: of one severity and class, with one summary, found by one
+    round's finding (or none) by one day. Only their lines (each head's own),
+    their discovery source (``same_review`` or ``later_review`` by each head's
+    round) and their labels may differ. Another defect under the same id, a
+    different finding at a different span, say, would be served by the same
+    record, so it is refused.
+    """
+    seen: dict[bytes, tuple] = {}
+    for _, case in sorted(corpus["cases"].items()):
+        for key, defect in sorted(case["defects"].items()):
+            found = defect["discovery"]
+            served = canonical(lineage_statement(key, defect, pr=case["provenance"]["pr"]))
+            identity = (
+                defect["severity"],
+                defect["class"],
+                defect["summary"],
+                found["round"],
+                found["finding"],
+                found["discovered"],
+            )
+            require(seen.setdefault(served, identity) == identity, "a defect id names one defect")
+
+
+def check_records(corpus) -> None:
+    """Each retained record evidences one case, or one defect.
+
+    A captured review or merge record is one case's, and a lineage record one
+    defect id's (which ``check_defects`` holds to one defect): its source
+    holds that one text and its text has that one source. So no record stands
+    for two cases or two defects, under its own source or another, while one
+    defect registered at several heads may hold the same record in each.
+    """
+    sources: dict[str, tuple] = {}
+    digests: dict[str, tuple] = {}
+    for case_id, case in sorted(corpus["cases"].items()):
+        kept = [(("case", case_id), case["record"])]
+        kept += [
+            (("defect", key), defect["discovery"]["lineage"])
+            for key, defect in sorted(case["defects"].items())
+        ]
+        for owner, record in kept:
+            if record["status"] != "captured":
+                continue
+            by_source = (owner, record["sha256"])
+            by_digest = (owner, record["source"])
+            require(
+                sources.setdefault(record["source"], by_source) == by_source
+                and digests.setdefault(record["sha256"], by_digest) == by_digest,
+                "a retained record evidences one case or defect",
+            )
+
+
 def check_corpus(corpus) -> Corpus:
     closed(corpus, CORPUS_FIELDS)
     require(corpus["format"] == CORPUS_FORMAT, "corpus format")
@@ -984,23 +1160,45 @@ def check_corpus(corpus) -> Corpus:
     for ref, tip in refs.items():
         require(nonempty(ref), "repository refs")
         object_id(tip)
-    # The files that define the test environment, which every case pins.
+    # The test environment every case pins and validates with: the files that
+    # define it and the commands a runner runs. A historical corpus's is its
+    # repository's as this module registers it, independent of any corpus or
+    # case pin; a corpus of a repository registered otherwise is refused, and
+    # one of a repository not registered runs nothing.
     declared = repository["environment"]
-    require(isinstance(declared, list) and declared, "repository environment")
-    for path in declared:
+    closed(declared, "files validation")
+    files, commands = declared["files"], declared["validation"]
+    require(isinstance(files, list) and files, "repository environment")
+    for path in files:
         relative_path(path)
-    require(len(set(declared)) == len(declared), "repository environment file repeated")
+    require(len(set(files)) == len(files), "repository environment file repeated")
+    require(
+        isinstance(commands, list) and commands and all(nonempty(c) for c in commands),
+        "repository environment",
+    )
+    registration = ENVIRONMENTS.get((repository["slug"], repository["root"]))
+    require(
+        registration is None
+        or (set(files) == set(registration["files"]) and commands == registration["validation"]),
+        "a repository's environment is the one registered for it",
+    )
+    registered = corpus["mode"] != "historical" or registration is not None
     require(isinstance(corpus["cases"], dict) and corpus["cases"], "registered cases")
     cases = {
-        case_id: check_case(case_id, case, mode=corpus["mode"], frozen=frozen)
+        case_id: check_case(
+            case_id,
+            case,
+            mode=corpus["mode"],
+            frozen=frozen,
+            declared=declared,
+            registered=registered,
+        )
         for case_id, case in sorted(corpus["cases"].items())
     }
     for case in corpus["cases"].values():
         require(case["review"]["base_ref"] in refs, "a case's base ref is frozen")
-        require(
-            set(case["environment"]["files"]) == set(declared),
-            "a case pins each of the repository's environment files",
-        )
+    check_defects(corpus)
+    check_records(corpus)
     check_clusters(corpus, cases)
     inputs = [case.input for case in cases.values()]
     require(len(set(inputs)) == len(inputs), "two cases with one review input")

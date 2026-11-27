@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 from collections import Counter
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -350,6 +351,8 @@ def test_a_disagreement_stays_unknown_until_an_arbiter_settles_it(corpus):
         (label("reviewer-alpha", "confirmed"), "an actor cannot adjudicate"),
         (label("adjudicator-1", "rejected"), "one label per identity"),
         (label("adjudicator-9", "confirmed", decided="2026-07-01"), "after the freeze"),
+        # alpha-defect was reviewed on 2026-05-01: nothing could judge it before.
+        (label("adjudicator-9", "confirmed", decided="2026-04-30"), "before its case's cutoff"),
         (label("adjudicator-9", "approved"), "label verdict"),
         (label("adjudicator-9", "confirmed", role="reviewer"), "label verdict"),
         (dict(label("adjudicator-9", "confirmed"), artifact=" "), "label provenance"),
@@ -452,6 +455,11 @@ def test_a_refuted_negative_leaves_the_fpr(corpus, subs):
     [
         (lambda c: c["negative"].update(observed_through="2026-07-01"), "observed between"),
         (lambda c: c["negative"].update(observed_through="2026-04-30"), "observed between"),
+        # A clean pass dated before the cutoff, under the unchanged window.
+        (
+            lambda c: c["negative"]["labels"][0].update(decided="2026-04-30"),
+            "label decided before its case's cutoff",
+        ),
         (lambda c: c.update(defects={"d1": None}), "a negative case registers no defect"),
         (lambda c: c.update(negative=None), "fields: observed_through labels"),
     ],
@@ -512,6 +520,17 @@ def test_every_reviewer_visible_field_is_held_to_the_leakage_rule(corpus, place,
     case = corpus["cases"]["alpha-defect"]
     place(case, withheld(corpus)[:digits])
     case["context"]["inventory"]["sources"] = [item["source"] for item in items(case)]
+    # The repository declares the environment the case was given, every case
+    # pinning it, so that the leakage rule, not the declaration, refuses it.
+    environment = case["environment"]
+    corpus["repository"]["environment"] = {
+        "files": sorted(environment["files"]),
+        "validation": list(environment["validation"]),
+    }
+    for other in corpus["cases"].values():
+        other["environment"]["validation"] = list(environment["validation"])
+        for path in environment["files"]:
+            other["environment"]["files"].setdefault(path, None)
     with pytest.raises(CorpusError, match="the reviewer's input names a withheld commit"):
         check_corpus(corpus)
 
@@ -734,7 +753,7 @@ def test_a_run_must_review_the_frozen_input(corpus, subs):
     with pytest.raises(CorpusError, match="frozen input"):
         score(corpus, subs)
     subs = json.loads(SYNTHETIC_SUBMISSIONS.read_bytes())
-    corpus["cases"]["alpha-defect"]["environment"]["validation"].append("pytest -x")
+    corpus["cases"]["alpha-defect"]["environment"]["files"]["uv.lock"] = "2" * 40
     subs["corpus"] = corpus_digest(corpus)
     with pytest.raises(CorpusError, match="frozen input"):
         score(corpus, subs)
@@ -758,16 +777,28 @@ def test_a_run_must_review_the_frozen_input(corpus, subs):
             "a case pins each of the repository's environment files",
         ),
         (lambda r, c: c["environment"]["files"].update({"uv.lock": "soon"}), "object id shape"),
-        # No command to validate with.
+        # No command to validate with, or a command of the case's own.
         (lambda r, c: c["environment"].update(validation=[]), "environment validation"),
         (lambda r, c: c["environment"].update(validation=[" "]), "environment validation"),
-        # The repository's declaration itself.
-        (lambda r, c: r.update(environment=[]), "repository environment"),
         (
-            lambda r, c: r.update(environment=["uv.lock", "uv.lock"]),
+            lambda r, c: c["environment"].update(validation=["true"]),
+            "a case validates with the repository's declared commands",
+        ),
+        (
+            lambda r, c: c["environment"]["validation"].append("pytest -x"),
+            "a case validates with the repository's declared commands",
+        ),
+        # The repository's declaration itself.
+        (lambda r, c: r["environment"].update(files=[]), "repository environment"),
+        (
+            lambda r, c: r["environment"].update(files=["uv.lock", "uv.lock"]),
             "repository environment file repeated",
         ),
-        (lambda r, c: r.update(environment=["../uv.lock"]), "repository path"),
+        (lambda r, c: r["environment"].update(files=["../uv.lock"]), "repository path"),
+        (lambda r, c: r["environment"].update(validation=[]), "repository environment"),
+        (lambda r, c: r["environment"].update(validation=[""]), "repository environment"),
+        (lambda r, c: r["environment"].pop("validation"), "fields: files validation"),
+        (lambda r, c: r.update(environment=["uv.lock"]), "fields: files validation"),
         (lambda r, c: r.pop("environment"), "fields: slug root refs environment"),
     ],
 )
@@ -1207,13 +1238,16 @@ def unlineaged():
     return {"status": "not_captured", "source": None, "text": None, "sha256": None}
 
 
-def lineage_binding(case, defect, **change):
-    """The binding statement of ``defect``'s lineage record, as one line of its text."""
+def lineage_binding(case, key, **change):
+    """The binding statement of ``key``'s lineage record, as one line of its text."""
+    defect = case["defects"][key]
     found = defect["discovery"]
     statement = {
+        "defect": key,
         "pr": case["provenance"]["pr"],
         "introduced": defect["introduced"],
         "paths": sorted({place["path"] for place in defect["location"]}),
+        "found": review_corpus.FOUND[found["source"]],
         "merged": found["merged"],
         "fix": found["fix"],
     } | change
@@ -1225,7 +1259,7 @@ def lineaged(case, key, text=None, source=None, **change):
     stands: the evidence that its fix, and any merge it escaped through, are
     what they are named as."""
     defect = case["defects"][key]
-    text = text or f"{lineage_binding(case, defect, **change)}\nThe fix of {key}, as recorded."
+    text = text or f"{lineage_binding(case, key, **change)}\nThe fix of {key}, as recorded."
     defect["discovery"]["lineage"] = {
         "status": "captured",
         "source": source or f"document/lineage/{key}.md",
@@ -1239,6 +1273,7 @@ def merge_record(case, text=None, source="document/merges/pr-2.json", **change):
     """A squash candidate's merge record: the commit its PR merged as."""
     statement = {
         "pr": case["provenance"]["pr"],
+        "issue": case["provenance"]["issue"],
         "base_ref": case["review"]["base_ref"],
         "merged": case["review"]["head"],
     } | change
@@ -1253,8 +1288,23 @@ def merge_record(case, text=None, source="document/merges/pr-2.json", **change):
     return case
 
 
+# The throwaway repository's test environment, as ``history`` registers it.
+TEST_ENVIRONMENT = {"files": ["pyproject.toml", "uv.lock"], "validation": ["make check"]}
+
+
+def register(monkeypatch, corpus, environment=None) -> None:
+    """Register ``environment`` (the corpus's own by default) for its repository,
+    as a reviewed change to ``review_corpus.ENVIRONMENTS`` would."""
+    repository = corpus["repository"]
+    monkeypatch.setitem(
+        review_corpus.ENVIRONMENTS,
+        (repository["slug"], repository["root"]),
+        deepcopy(environment or repository["environment"]),
+    )
+
+
 @pytest.fixture
-def history(tmp_path):
+def history(tmp_path, monkeypatch):
     repo = Repo(tmp_path / "repo")
     env = {"pyproject.toml": b"[project]\n", "uv.lock": b"version = 1\n"}
     root = repo.commit({"README.md": b"root\n"}, [], "2026-01-01T00:00:00Z")
@@ -1280,6 +1330,9 @@ def history(tmp_path):
         "after": after,
         "other": other,
     }
+    monkeypatch.setitem(
+        review_corpus.ENVIRONMENTS, ("example/test", root), deepcopy(TEST_ENVIRONMENT)
+    )
     return repo, ids
 
 
@@ -1363,7 +1416,7 @@ def historical(repo: Repo, ids) -> dict:
             "slug": "example/test",
             "root": ids["root"],
             "refs": {"main": ids["after"]},
-            "environment": ["pyproject.toml", "uv.lock"],
+            "environment": deepcopy(TEST_ENVIRONMENT),
         },
         "cases": {
             "round1": case(
@@ -1529,11 +1582,12 @@ def test_verify_holds_a_squash_case_to_its_merge_time(history):
     assert failed == ["the cutoff is the head's committer time"]
 
 
-def test_verify_holds_each_environment_pin_to_the_head(history, subs):
+def test_verify_holds_each_environment_pin_to_the_head(history, subs, monkeypatch):
     repo, ids = history
     corpus = reviewed(repo, ids)
     # A declared file the head does not have is pinned as absent, not left out.
-    corpus["repository"]["environment"].append("requirements.txt")
+    corpus["repository"]["environment"]["files"].append("requirements.txt")
+    register(monkeypatch, corpus)
     for case in corpus["cases"].values():
         case["environment"]["files"]["requirements.txt"] = None
     assert verify(corpus, repo.path)["ok"]
@@ -1558,14 +1612,40 @@ def test_verify_holds_each_environment_pin_to_the_head(history, subs):
         score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
 
 
-def test_an_absent_placeholder_pins_no_environment(history, subs):
+def blob_at(repo, head, path):
+    """``path``'s blob at ``head``, or ``None`` where ``head`` has none."""
+    listed = repo.git("ls-tree", head, "--", path)
+    return listed.split()[2] if listed else None
+
+
+def declare(repo, corpus, files, validation=("make check",)) -> None:
+    """The repository's environment declared as ``files`` and ``validation``,
+    each case pinning every file as its blob at its head, or ``None`` where its
+    head has none."""
+    corpus["repository"]["environment"] = {"files": list(files), "validation": list(validation)}
+    for case in corpus["cases"].values():
+        head = case["review"]["head"]
+        case["environment"] = {
+            "files": {path: blob_at(repo, head, path) for path in files},
+            "validation": list(validation),
+        }
+
+
+def environment_case(repo, ids):
+    """``reviewed``'s corpus with a third declared file, ``requirements.txt``,
+    that no head has: registered, it is pinned ``null`` beside the two real pins."""
+    corpus = reviewed(repo, ids)
+    declare(repo, corpus, ["pyproject.toml", "requirements.txt", "uv.lock"])
+    return corpus
+
+
+def test_an_absent_placeholder_pins_no_environment(history, subs, monkeypatch):
     repo, ids = history
     corpus = reviewed(repo, ids)
     # One declared file no head has, pinned as absent in place of every real
-    # pin, though each head has both of the original files.
-    corpus["repository"]["environment"] = ["requirements-none.txt"]
-    for case in corpus["cases"].values():
-        case["environment"]["files"] = {"requirements-none.txt": None}
+    # pin, though each head has both of the original files, and registered so.
+    declare(repo, corpus, ["requirements-none.txt"])
+    register(monkeypatch, corpus)
     # Each pin is true of its head, so git finds nothing wrong, but a case that
     # pins no file of its environment never runs.
     assert verify(corpus, repo.path)["ok"]
@@ -1573,13 +1653,77 @@ def test_an_absent_placeholder_pins_no_environment(history, subs):
     with pytest.raises(CorpusError, match="a planned case is runnable"):
         score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
     # One declared file present is a pin, the absent one beside it still null.
-    corpus["repository"]["environment"].append("uv.lock")
-    for case in corpus["cases"].values():
-        case["environment"]["files"]["uv.lock"] = repo.git(
-            "rev-parse", f"{case['review']['head']}:uv.lock"
-        )
+    declare(repo, corpus, ["requirements-none.txt", "uv.lock"])
+    register(monkeypatch, corpus)
+    assert corpus["cases"]["round1"]["environment"]["files"]["requirements-none.txt"] is None
     assert describe(corpus)["runnable"] == ["round1"]
     assert score(corpus, recorded(corpus, subs, ["round1"]), repo.path)["verified"]["ok"]
+
+
+def test_an_unrelated_blob_cannot_stand_in_for_the_registered_environment(
+    history, subs, monkeypatch
+):
+    repo, ids = history
+    register(
+        monkeypatch,
+        historical(repo, ids),
+        TEST_ENVIRONMENT | {"files": ["pyproject.toml", "requirements.txt", "uv.lock"]},
+    )
+    corpus = environment_case(repo, ids)
+    # As registered, a declared file no head has stays null beside the others,
+    # and the case runs.
+    pins = corpus["cases"]["round1"]["environment"]["files"]
+    assert pins["requirements.txt"] is None and None not in (
+        pins["uv.lock"],
+        pins["pyproject.toml"],
+    )
+    assert verify(corpus, repo.path)["ok"]
+    assert score(corpus, recorded(corpus, subs, ["round1"]), repo.path)["verified"]["ok"]
+    rule = "a repository's environment is the one registered for it"
+    # An existing, unrelated blob declared as the whole environment and pinned
+    # truly at every head, ``make check`` unchanged and both real environment
+    # files present but unpinned: git finds nothing wrong, but the declaration
+    # is not the one registered for the repository.
+    declare(repo, corpus, ["src/a.py"])
+    assert all(
+        case["environment"]["files"]["src/a.py"] is not None for case in corpus["cases"].values()
+    )
+    with pytest.raises(CorpusError, match=rule):
+        describe(corpus)
+    with pytest.raises(CorpusError, match=rule):
+        score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+    # Nor is the registered files' environment validated otherwise, nor one
+    # of its files left out of the declaration.
+    for files, validation in (
+        (["pyproject.toml", "requirements.txt", "uv.lock"], ["true"]),
+        (["pyproject.toml", "requirements.txt", "uv.lock"], ["make check", "make lint"]),
+        (["pyproject.toml", "uv.lock"], ["make check"]),
+        (["pyproject.toml", "requirements.txt", "src/a.py", "uv.lock"], ["make check"]),
+    ):
+        declare(repo, corpus, files, validation)
+        with pytest.raises(CorpusError, match=rule):
+            check_corpus(corpus)
+    # A repository nobody registered declares what it likes, and runs nothing.
+    declare(repo, corpus, ["src/a.py"])
+    corpus["repository"]["slug"] = "example/unregistered"
+    assert verify(corpus, repo.path)["ok"]
+    assert describe(corpus)["runnable"] == []
+    with pytest.raises(CorpusError, match="a planned case is runnable"):
+        score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+
+
+def test_the_seed_declares_its_repositorys_registered_environment():
+    seed = read_json(SEED)
+    repository = seed["repository"]
+    registered = review_corpus.ENVIRONMENTS[(repository["slug"], repository["root"])]
+    assert repository["environment"] == registered
+    assert registered == {"files": ["pyproject.toml", "uv.lock"], "validation": ["make check"]}
+    # The seed declaring another environment is refused, not left unplanned.
+    repository["environment"]["files"] = ["src/autoforge/engine.py"]
+    for case in seed["cases"].values():
+        case["environment"]["files"] = {"src/autoforge/engine.py": "1" * 40}
+    with pytest.raises(CorpusError, match="a repository's environment is the one registered"):
+        check_corpus(seed)
 
 
 def test_a_recorded_run_is_bound_to_its_variants_pins(history, subs):
@@ -1602,6 +1746,7 @@ def binding(case, started, **change):
     review = case["review"]
     statement = {
         "pr": case["provenance"]["pr"],
+        "issue": case["provenance"]["issue"],
         "round": case["provenance"]["round"],
         "base_ref": review["base_ref"],
         "base_tip": review["base_tip"],
@@ -1967,12 +2112,18 @@ def test_a_review_record_binds_its_input_read_not_its_publication(history, subs)
             lambda c: c["record"].update(source="pr/2"),
             "a review record is a comment on the case's PR or a document",
         ),
-        # A binding of another PR or round.
-        (lambda c: rebound(c, pr=3), "the review record's binding names the case's PR and round"),
-        (lambda c: rebound(c, pr=None), "binding names the case's PR and round"),
-        (lambda c: rebound(c, pr="2"), "binding names the case's PR and round"),
-        (lambda c: rebound(c, round=2), "binding names the case's PR and round"),
-        (lambda c: rebound(c, round=True), "binding names the case's PR and round"),
+        # A binding of another PR, issue or round.
+        (
+            lambda c: rebound(c, pr=3),
+            "the review record's binding names the case's PR, issue and round",
+        ),
+        (lambda c: rebound(c, pr=None), "binding names the case's PR, issue and round"),
+        (lambda c: rebound(c, pr="2"), "binding names the case's PR, issue and round"),
+        (lambda c: rebound(c, issue=99), "binding names the case's PR, issue and round"),
+        (lambda c: rebound(c, issue=None), "binding names the case's PR, issue and round"),
+        (lambda c: rebound(c, issue=True), "binding names the case's PR, issue and round"),
+        (lambda c: rebound(c, round=2), "binding names the case's PR, issue and round"),
+        (lambda c: rebound(c, round=True), "binding names the case's PR, issue and round"),
         # ...of another review of the round's head.
         (
             lambda c: rebound(c, base_ref="next"),
@@ -1992,7 +2143,7 @@ def test_a_review_record_binds_its_input_read_not_its_publication(history, subs)
         ),
         (lambda c: rebound(c, input_read="2026-01-03T01:00:00Z"), "binding states its start"),
         # A binding that is none.
-        (lambda c: rebound(c, extra=1), "fields: pr round"),
+        (lambda c: rebound(c, extra=1), "fields: pr issue round"),
         (
             lambda c: record(
                 c, "2026-01-03T02:00:00Z", text=binding(c, "2026-01-03T02:00:00Z")[:-1]
@@ -2025,6 +2176,33 @@ def test_a_review_record_may_be_a_document_kept_apart(history):
     assert verify(corpus, repo.path)["ok"]
 
 
+def body(text: str) -> list[str]:
+    """A retained record's lines without its binding statement: its answer."""
+    return text.splitlines()[1:]
+
+
+# The answer a review record holds, without its binding statement, presented
+# otherwise: its wording, and so what it tells a reviewer, unchanged.
+PRESENTED = [
+    # As a Markdown block quote.
+    lambda text: "\n".join(f"> {row}" for row in body(text)),
+    # ...nested in a quote, after a line of the quoting text's own.
+    lambda text: "Earlier notes:\n" + "\n".join(f">> {row}" for row in body(text)),
+    # As a list, its items emphasised.
+    lambda text: "\n".join(f"- **{row}**" for row in body(text)),
+    # As a table row.
+    lambda text: "| " + " | ".join(body(text)) + " |",
+    # Reflowed into one line, and broken again in other places.
+    lambda text: " ".join(body(text)),
+    lambda text: "\n".join(textwrap.wrap(" ".join(body(text)), 12)),
+    # In a code span, its punctuation and spacing changed.
+    lambda text: "\n".join(f"`{row.replace(':', ' -').replace(' ', '  ')}`" for row in body(text)),
+    # Its characters escaped as HTML entities, and in full-width forms.
+    lambda text: "\n".join(row.replace("a", "&#97;") for row in body(text)),
+    lambda text: "\n".join(row.replace("R1", "\uff32\uff11") for row in body(text)),
+]
+
+
 @pytest.mark.parametrize(
     "copy",
     [
@@ -2033,9 +2211,10 @@ def test_a_review_record_may_be_a_document_kept_apart(history):
         # Inside a longer document, indented and upper-cased.
         lambda text: "Notes:\n" + "\n".join(f"    {row.upper()}" for row in text.splitlines()),
         # Without its binding statement.
-        lambda text: "\n".join(text.splitlines()[1:]),
+        lambda text: "\n".join(body(text)),
         # Its binding statement alone, quoted.
         lambda text: "> " + text.splitlines()[0],
+        *PRESENTED,
     ],
 )
 def test_the_review_record_never_reaches_its_reviewer_under_another_source(history, subs, copy):
@@ -2062,28 +2241,47 @@ def test_the_review_record_never_reaches_its_reviewer_under_another_source(histo
         score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
 
 
+def declared_command(corpus, command):
+    """``command`` declared as a validation command of the repository, and so
+    given to every case's runner."""
+    environment = corpus["repository"]["environment"]
+    environment["validation"].append(command)
+    for case in corpus["cases"].values():
+        case["environment"]["validation"] = list(environment["validation"])
+
+
 @pytest.mark.parametrize(
     "place",
     [
         # The whole record as the issue's reference.
-        lambda c, text: items(c)[0].update(ref=text),
-        # ...as a validation command a runner is given.
-        lambda c, text: c["environment"]["validation"].append(text),
+        lambda r, c, text: items(c)[0].update(ref=text),
+        # ...as a validation command a runner is given, the repository
+        # declaring it (and the declaration registered).
+        lambda r, c, text: declared_command(r, text),
         # ...its lines split over two references, one in each.
-        lambda c, text: (
+        lambda r, c, text: (
             items(c)[0].update(ref=text.splitlines()[1]),
             items(c)[1].update(ref=text.splitlines()[2]),
         ),
         # ...its binding statement alone, in a reference.
-        lambda c, text: items(c)[1].update(ref="as of " + text.splitlines()[0]),
+        lambda r, c, text: items(c)[1].update(ref="as of " + text.splitlines()[0]),
+        # ...its answer, without the binding, in one reference, presented as a
+        # Markdown quote, a list, a table, reflowed, escaped, in a code span.
+        *(lambda r, c, text, show=show: items(c)[0].update(ref=show(text)) for show in PRESENTED),
+        # ...its answer quoted, a line in each of two references.
+        lambda r, c, text: (
+            items(c)[0].update(ref="> " + body(text)[0]),
+            items(c)[1].update(ref="> " + body(text)[1]),
+        ),
     ],
 )
-def test_no_value_the_reviewer_reads_holds_the_review_record(history, subs, place):
+def test_no_value_the_reviewer_reads_holds_the_review_record(history, subs, monkeypatch, place):
     repo, ids = history
     corpus = reviewed(repo, ids)
     case = corpus["cases"]["round1"]
     texts = [(item["text"], item["sha256"]) for item in items(case)]
-    place(case, case["record"]["text"])
+    place(corpus, case, case["record"]["text"])
+    register(monkeypatch, corpus)
     # The context's own text and digests are as they were: only the copy differs.
     assert [(item["text"], item["sha256"]) for item in items(case)] == texts
     rule = "the review record is not the reviewer's context"
@@ -2333,6 +2531,16 @@ def test_a_lineage_runs_only_on_its_record_since_git_only_shows_it_consistent(hi
     ("change", "rule"),
     [
         (lambda c: lineaged(c, "d1", pr=3), "the lineage record's binding names the defect"),
+        (lambda c: lineaged(c, "d1", defect="d2"), "the lineage record's binding names the defect"),
+        (lambda c: lineaged(c, "d1", defect=None), "the lineage record's binding names the defect"),
+        (
+            lambda c: lineaged(c, "d1", found="same_review"),
+            "the lineage record's binding names the defect's lineage",
+        ),
+        (
+            lambda c: lineaged(c, "d1", found="revert"),
+            "the lineage record's binding names the defect's lineage",
+        ),
         (lambda c: lineaged(c, "d1", pr=True), "the lineage record's binding names the defect"),
         (
             lambda c: lineaged(c, "d1", introduced=c["review"]["merge_base"]),
@@ -2350,7 +2558,7 @@ def test_a_lineage_runs_only_on_its_record_since_git_only_shows_it_consistent(hi
             lambda c: lineaged(c, "d1", merged=c["withheld"][1]),
             "the lineage record's binding names the defect's lineage",
         ),
-        (lambda c: lineaged(c, "d1", extra=1), "fields: pr introduced"),
+        (lambda c: lineaged(c, "d1", extra=1), "fields: defect pr introduced"),
         (
             lambda c: lineaged(c, "d1", text="The fix of d1, in prose only."),
             "a lineage record states one binding",
@@ -2525,6 +2733,285 @@ def test_verify_holds_exposure_evidence_to_the_commits(history):
     check_corpus(corpus)
     failed = verify(corpus, repo.path)["cases"]["round1"]["failed"]
     assert failed == ["exposure possible no later than the commits it is about"]
+
+
+# -- what each retained record identifies --------------------------------------
+
+
+def moved_to_issue(case, number):
+    """``case`` moved to issue ``number``: its provenance, its issue item and its
+    inventory entry, all agreeing with one another."""
+    case["provenance"]["issue"] = number
+    items(case)[0] = captured(
+        "issue",
+        "issue",
+        f"#{number}",
+        "2026-01-02T12:00:00Z",
+        f"Issue {number}: other work.",
+        f"issue/{number}",
+    )
+    complete(case, "2026-01-10T00:00:00Z")
+
+
+def squashed(corpus):
+    """``reviewed``'s squash case made runnable: its context and merge record."""
+    merged = corpus["cases"]["merged"]
+    merged["context"]["items"] = [
+        captured("issue", "issue", "#1", "2026-01-02T12:00:00Z", "Issue 1: add a.py.", "issue/1"),
+        captured("pr-body", "pr_body", "#2", "2026-01-03T01:00:00Z", "Adds src/a.py.", "pr/2"),
+    ]
+    complete(merged, "2026-01-10T00:00:00Z")
+    merge_record(merged)
+    return merged
+
+
+def refused_everywhere(corpus, repo, subs, cases, rule):
+    for run in (
+        describe,
+        lambda c: verify(c, repo.path),
+        lambda c: score(c, recorded(c, subs, cases), repo.path),
+    ):
+        with pytest.raises(CorpusError, match=rule):
+            run(corpus)
+
+
+def test_a_candidate_is_scored_only_with_the_issue_its_record_names(history, subs):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    merged = squashed(corpus)
+    round1 = corpus["cases"]["round1"]
+    assert score(corpus, recorded(corpus, subs, ["round1", "merged"]), repo.path)["verified"]["ok"]
+    # Issue 99's context, issue item and inventory entry, all agreeing, under
+    # the round's unchanged review and lineage records: nothing offline or in
+    # git contradicts them, but the review record names issue 1.
+    moved_to_issue(round1, 99)
+    rule = "the review record's binding names the case's PR, issue and round"
+    refused_everywhere(corpus, repo, subs, ["round1"], rule)
+    # A record of a round for issue 99 would evidence it.
+    record(round1, round1["record"]["started"])
+    assert describe(corpus)["runnable"] == ["merged", "round1"]
+    # The squash likewise, under its unchanged merge record.
+    moved_to_issue(merged, 99)
+    rule = "the merge record's binding names the case's PR and issue"
+    refused_everywhere(corpus, repo, subs, ["merged"], rule)
+    merge_record(merged)
+    assert verify(corpus, repo.path)["ok"]
+    # A squash of no issue holds none, and its record states that absence: a
+    # record naming an issue is refused for it, and one naming none is refused
+    # for a case given an issue.
+    merged["provenance"]["issue"] = None
+    items(merged).pop(0)
+    complete(merged, "2026-01-10T00:00:00Z")
+    refused_everywhere(corpus, repo, subs, ["merged"], rule)
+    merge_record(merged)
+    assert describe(corpus)["runnable"] == ["merged", "round1"]
+    assert score(corpus, recorded(corpus, subs, ["round1", "merged"]), repo.path)["verified"]["ok"]
+    merged["provenance"]["issue"] = 1
+    items(merged).insert(
+        0,
+        captured("issue", "issue", "#1", "2026-01-02T12:00:00Z", "Issue 1: add a.py.", "issue/1"),
+    )
+    complete(merged, "2026-01-10T00:00:00Z")
+    refused_everywhere(corpus, repo, subs, ["merged"], rule)
+
+
+def second_finding(case, lines=(4, 5)):
+    """A second finding of round 1 in the same file, at another span,
+    introduced by the same commit and fixed by the same FIX: everything a
+    lineage binding names but its id is d1's."""
+    second = deepcopy(case["defects"]["d1"])
+    second["summary"] = "lines 4 and 5 are unchecked"
+    second["discovery"]["finding"] = "R1-F2"
+    second["location"] = [{"path": "src/a.py", "lines": list(lines)}]
+    return second
+
+
+def test_one_lineage_record_never_serves_two_defects(history, subs):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    case = corpus["cases"]["round1"]
+    case["defects"]["d1"]["labels"] = [label("adjudicator-1", "confirmed", decided="2026-01-20")]
+    report = score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+    assert metric(report, "baseline", "recall")["observations"] == [0, 0, 1]
+    # The second finding holding d1's record: git finds the same fix touching
+    # its lines, but the record is d1's.
+    case["defects"]["d2"] = second_finding(case)
+    assert (
+        case["defects"]["d2"]["discovery"]["lineage"]
+        == case["defects"]["d1"]["discovery"]["lineage"]
+    )
+    refused_everywhere(
+        corpus, repo, subs, ["round1"], "the lineage record's binding names the defect"
+    )
+    # Its own record, rebound to d2 but held under d1's source: one source
+    # holds one record.
+    lineaged(case, "d2", source="document/lineage/d1.md")
+    refused_everywhere(
+        corpus, repo, subs, ["round1"], "a retained record evidences one case or defect"
+    )
+    # Its own record under its own source evidences it, and it counts.
+    lineaged(case, "d2")
+    report = score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+    assert metric(report, "baseline", "recall")["observations"] == [0, 0, 2]
+    # Nor does a case's review record serve another case.
+    round2 = deepcopy(case)
+    round2["provenance"]["round"] = 2
+    round2["review"]["head"] = "1" * 40
+    round2["defects"] = {}
+    round2["stratum"] = "hard_negative"
+    round2["negative"] = {"observed_through": "2026-02-01", "labels": []}
+    corpus["cases"]["round2"] = round2
+    record(round2, "2026-01-04T00:00:00Z", source="pr/2/comment/review-2")
+    check_corpus(corpus)
+    record(round2, "2026-01-04T00:00:00Z", source=case["record"]["source"])
+    with pytest.raises(CorpusError, match="a retained record evidences one case or defect"):
+        check_corpus(corpus)
+
+
+def test_one_defect_registered_at_two_heads_shares_one_lineage_record(history):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    round1 = corpus["cases"]["round1"]
+    # d1 is round 2's finding: at round 1's head a later review's, at round 2's
+    # head (a later commit of the same PR) the same review's.
+    round1["defects"]["d1"]["discovery"].update(source="later_review", round=2, finding="R2-F1")
+    lineaged(round1, "d1")
+    round2 = deepcopy(round1)
+    corpus["cases"]["round2"] = round2
+    round2["provenance"]["round"] = 2
+    round2["review"]["head"] = "1" * 40
+    round2["defects"]["d1"]["discovery"]["source"] = "same_review"
+    # Its lines are each head's own.
+    round2["defects"]["d1"]["location"] = [{"path": "src/a.py", "lines": [3, 6]}]
+    record(round2, "2026-01-04T00:00:00Z", source="pr/2/comment/review-2")
+    assert (
+        round2["defects"]["d1"]["discovery"]["lineage"]
+        == round1["defects"]["d1"]["discovery"]["lineage"]
+    )
+    assert describe(corpus)["runnable"] == ["round1", "round2"]
+    # Another defect under its id, served by the same record, is refused: a
+    # different finding, summary, severity or day, or a defect another round
+    # found.
+    rule = "a defect id names one defect"
+    for change in (
+        lambda d: d["discovery"].update(finding="R2-F2"),
+        lambda d: d.update(summary="another defect"),
+        lambda d: d.update(severity="high"),
+        lambda d: d["discovery"].update(discovered="2026-01-05"),
+    ):
+        other = deepcopy(corpus)
+        change(other["cases"]["round2"]["defects"]["d1"])
+        with pytest.raises(CorpusError, match=rule):
+            check_corpus(other)
+
+
+def test_the_seeds_defects_of_one_fix_would_each_need_a_record_of_their_own():
+    seed = read_json(SEED)
+    case = seed["cases"]["pr459-round1"]
+    keys = ("r1-f2-replan-reread", "r1-f3-legacy-reentry", "r1-f4-fix-records")
+    statements = [
+        review_corpus.lineage_statement(key, case["defects"][key], pr=459) for key in keys
+    ]
+    # One PR, introduction, file and fix: without its id, one binding for three.
+    assert len({json.dumps({k: v for k, v in s.items() if k != "defect"}) for s in statements}) == 1
+    assert len({json.dumps(s) for s in statements}) == 3
+
+
+def test_a_case_counts_for_revert_recall_only_on_its_reverts_lineage_record(history, subs):
+    repo, ids = history
+    env = {"pyproject.toml": b"[project]\n", "uv.lock": b"version = 1\n"}
+    # On main after the squash and the commit after it, a revert of the squash.
+    revert = repo.commit(env, [ids["after"]], "2026-01-09T00:00:00Z", 'Revert "Add a.py (#2)"')
+    corpus = reviewed(repo, ids)
+    corpus["repository"]["refs"]["main"] = revert
+    case = corpus["cases"]["round1"]
+    review_fix = deepcopy(case["defects"]["d1"])
+    case["stratum"] = "revert"
+    case["withheld"] += [ids["after"], revert]
+    d1 = case["defects"]["d1"]
+    d1["discovery"].update(
+        source="revert",
+        round=None,
+        finding=None,
+        discovered="2026-01-09",
+        fix=revert,
+        merged=ids["squash"],
+    )
+    d1["labels"] = [label("adjudicator-1", "confirmed", decided="2026-01-20")]
+    # Bound by the revert's own lineage record, which states it was a revert,
+    # the case runs and its defect counts for revert recall.
+    lineaged(case, "d1")
+    assert "revert" in d1["discovery"]["lineage"]["text"].splitlines()[0]
+    assert verify(corpus, repo.path)["ok"]
+    report = score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+    assert metric(report, "baseline", "recall/discovery/revert")["observations"] == [0, 0, 1]
+    bound = deepcopy(d1)
+    # Claimed without any revert, its fix and lineage cleared: git finds
+    # nothing to contradict, and the claim stays representable, but unplanned.
+    d1["discovery"].update(fix=None, merged=None, lineage=unlineaged())
+    assert verify(corpus, repo.path)["ok"]
+    assert describe(corpus)["runnable"] == []
+    assert describe(corpus)["labels"]["defects_by_discovery"]["revert"]["confirmed"] == 1
+    with pytest.raises(CorpusError, match="a planned case is runnable"):
+        score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+    # Naming the revert without its record is unplanned too.
+    case["defects"]["d1"] = deepcopy(bound)
+    case["defects"]["d1"]["discovery"]["lineage"] = unlineaged()
+    assert describe(corpus)["runnable"] == []
+    # And a review's FIX, claimed as a revert under its own lineage record,
+    # which says a review found it, is refused.
+    case["defects"]["d1"] = review_fix
+    case["defects"]["d1"]["discovery"].update(source="revert", round=None, finding=None)
+    refused_everywhere(
+        corpus, repo, subs, ["round1"], "the lineage record's binding names the defect's lineage"
+    )
+
+
+def test_an_escape_without_its_fixs_lineage_record_stays_unplanned(history, subs):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    case = corpus["cases"]["round1"]
+    case["stratum"] = "escape"
+    case["withheld"] += [ids["after"]]
+    case["defects"] = {"e1": escaped(ids)}
+    lineaged(case, "e1")
+    assert score(corpus, recorded(corpus, subs, ["round1"]), repo.path)["verified"]["ok"]
+    # Found after the merge and never fixed, nothing evidences when it was found.
+    case["defects"]["e1"]["discovery"].update(fix=None, merged=None, lineage=unlineaged())
+    assert verify(corpus, repo.path)["ok"]
+    assert describe(corpus)["runnable"] == []
+    # A review's defect without a fix still runs on the round's own record.
+    case["stratum"] = "reviewed_defect"
+    case["defects"]["e1"]["discovery"].update(source="same_review", round=1, finding="R1-F2")
+    assert describe(corpus)["runnable"] == ["round1"]
+
+
+def test_a_clean_verdict_dated_before_its_candidate_never_settles_it(history, subs):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    corpus["frozen"] = "2026-02-20"
+    merged = squashed(corpus)
+    # A clean pass of January 1, five days before the squash it judges landed,
+    # with an observation window long enough to settle it.
+    merged["negative"] = {
+        "observed_through": "2026-02-15",
+        "labels": [label("adjudicator-1", "clean", decided="2026-01-01")],
+    }
+    refused_everywhere(
+        corpus, repo, subs, ["round1", "merged"], "label decided before its case's cutoff"
+    )
+    # Dated the day the squash landed, it settles the negative, whose runs
+    # enter the false-positive rate.
+    merged["negative"]["labels"][0]["decided"] = "2026-01-06"
+    report = score(corpus, recorded(corpus, subs, ["round1", "merged"]), repo.path)
+    assert report["labels"]["negatives"]["settled"] == 1
+    assert metric(report, "baseline", "false_positive_rate")["observations"] == [0, 0, 1]
+    # A defect's label is held to its case's cutoff day too.
+    corpus["cases"]["round1"]["defects"]["d1"]["labels"] = [
+        label("adjudicator-1", "confirmed", decided="2026-01-02")
+    ]
+    with pytest.raises(CorpusError, match="label decided before its case's cutoff"):
+        check_corpus(corpus)
 
 
 def test_verify_stops_at_an_unknown_candidate(history):

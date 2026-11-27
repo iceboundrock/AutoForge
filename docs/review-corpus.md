@@ -22,15 +22,22 @@ repository's objects can rebuild exactly what the reviewer was given:
   head, the head's tree, and the review-time cutoff (a UTC instant). The reviewer reads the diff
   from the merge base to the head. The corpus pins each base ref's tip at the freeze
   (`repository.refs`), whose first-parent line the base revision is on.
-- **Environment:** each file the corpus declares as its test environment (`repository.environment`;
-  the seed's are `pyproject.toml` and `uv.lock`), pinned as its blob id at the head or as `null`
-  when the head has no such file, and at least one validation command a runner may run. A case
-  names every declared file and no other, so leaving a pin out is never how a case says it has
-  none. A case none of whose declared files is at its head pins no environment at all and is never
-  runnable, so a declared path that no head has, pinned `null`, cannot stand in for the real pins;
-  `null` stays for a declared file one head lacks beside others it has. Version 1 has no exception
-  for a candidate that genuinely has no environment file: such a case stays unrunnable. A case with
-  no validation command cannot be expressed in version 1.
+- **Environment:** the corpus declares its repository's test environment (`repository.environment`):
+  the files that define it and the validation commands a runner runs (the seed's are
+  `pyproject.toml` and `uv.lock`, and `make check`). A historical corpus does not choose it: it
+  must declare exactly what `ENVIRONMENTS` in `tests/review_corpus.py` registers for its
+  repository's slug and root commit, a declaration in reviewed source, independent of every case's
+  pins. A corpus declaring anything else for a registered repository is refused, and no case of a
+  repository that is not registered is runnable. So an existing but unrelated file (a source file,
+  say), declared as the whole environment and pinned truly at every head, cannot stand in for the
+  real environment files, and a case cannot validate with commands of its own. Each case pins
+  every declared file and no other, each as its blob id at the head or as `null` when the head has
+  no such file, and validates with exactly the declared commands. Leaving a pin out is never how a
+  case says it has none. A case none of whose declared files is at its head pins no environment at
+  all and is never runnable, so a declared path that no head has, pinned `null`, cannot stand in for
+  the real pins; `null` stays for a declared file one head lacks beside others it has. Version 1
+  has no exception for a candidate that genuinely has no environment file: such a case stays
+  unrunnable. A repository with no validation command cannot be expressed in version 1.
 - **Context:** what the reviewer reads besides the diff (the issue, the PR body, issue and PR
   comments, documents), and an **inventory** of it. Each item names its stable **source**:
   `issue/<n>` and `pr/<n>` for the issue and PR body, `issue/<n>/comment/<id>` and
@@ -45,10 +52,17 @@ repository's objects can rebuild exactly what the reviewer was given:
   case's own PR, or a document), held as its text and SHA-256 or as `not_captured`, and never part
   of the reviewer's input (section 2): a `pr_branch` case's **review record** of its historical
   round; a `squash` case's **merge record**, naming the commit its PR merged as; and, in each
-  defect's discovery that names a fix or revert, its **lineage record**, naming that fix and the
-  squash the defect escaped through, if any.
+  defect's discovery that names a fix or revert, its **lineage record**, naming the defect, how it
+  was found, that fix and the squash the defect escaped through, if any. Each record is one case's
+  or one defect's: no source holds two records, no record is held under two sources, and no review
+  or merge record serves two cases, nor a lineage record two defects.
 - **Defects** of a defect case, each located in at least one file, by its lines or as the whole
-  file, or the **negative** record of a negative case (sections 3 and 4).
+  file, or the **negative** record of a negative case (sections 3 and 4). A defect's id is its
+  identity across the corpus: one defect may be registered at several heads of its PR under one
+  id (its lines and its `same_review` or `later_review` source being each head's own), and
+  registrations one lineage record would serve (one id, PR, introduction, set of paths, way of
+  being found, merge and fix) must be one defect, of one severity, class and summary, found by one
+  round's finding on one day. Another defect under that id is refused.
 - **Withheld commits:** commits that would reveal an answer (the fixes, later rounds, the later
   merge). They are never part of the reviewer's input.
 - **Actors:** who produced, reviewed, fixed or merged the candidate. None may adjudicate it.
@@ -94,13 +108,19 @@ from what was learned afterwards. These rules hold that line; each is enforced w
   must have one. The corpus check refuses any other, so leaving an item out, or holding another
   copy of a comment in place of one the listing names, makes a case refused, never runnable. The
   check cannot tell a copy given the right source; reading each source again at capture is #592's.
-- A case is **runnable** only when its inventory is complete, every item it holds is captured, at
-  least one of its environment pins is a file at its head, and every record it needs is captured: a
-  `pr_branch` case's review record, a `squash` case's merge record, and the lineage record of each
-  defect that names a fix or revert. Reviewing a case without its issue or with part of its
-  discussion would be a different task, and scoring one whose boundary, base, PR or lineage only
-  git's timestamps and subjects suggest would rest its labels on a guess, so the scorer refuses a
-  plan naming any other case.
+- A case is **runnable** only when its inventory is complete, every item it holds is captured, its
+  repository's environment is registered (section 1), at least one of its environment pins is a
+  file at its head, and every record it needs is captured: a `pr_branch` case's review record, a
+  `squash` case's merge record, and the lineage record of each defect that names a fix or revert.
+  In a historical corpus every defect found after its merge (`post_merge` or `revert`) must also
+  name the commit that fixed or reverted it and hold that commit's lineage record: a review's
+  defect is found by a round, but an escape or a revert has no round to evidence it, only that
+  commit, and its lineage record states how the defect was found. So a case claiming a revert, or
+  an escape, without one stays representable and unplanned, and adds nothing to revert or escape
+  recall. Reviewing
+  a case without its issue or with part of its discussion would be a different task, and scoring
+  one whose boundary, base, PR or lineage only git's timestamps and subjects suggest would rest its
+  labels on a guess, so the scorer refuses a plan naming any other case.
 - The cutoff is the review-time boundary below. The base revision is the base ref's commit the
   review read, on the first-parent line of the ref as frozen, and the merge base is exactly the
   merge base of the base revision and the head: an older ancestor of the head would be another
@@ -166,12 +186,15 @@ carries exactly one **binding statement**, a line that begins `review-record: ` 
 object of exactly these fields:
 
 ```text
-review-record: {"pr": 539, "round": 1, "base_ref": "main", "base_tip": "<40 hex>", "head": "<40 hex>", "merge_base": "<40 hex>", "input_read": "2026-11-23T19:05:15Z"}
+review-record: {"pr": 539, "issue": 329, "round": 1, "base_ref": "main", "base_tip": "<40 hex>", "head": "<40 hex>", "merge_base": "<40 hex>", "input_read": "2026-11-23T19:05:15Z"}
 ```
 
-`pr` and `round` must be the case's (`pr` is `null` when its provenance names none), `base_ref`,
-`base_tip`, `head` and `merge_base` its review binding's, and `input_read` the record's `started`,
-which is the cutoff. Nothing else of the text is read: an instant it names elsewhere, such as when
+`pr`, `issue` and `round` must be the case's (`pr` is `null` when its provenance names none),
+`base_ref`, `base_tip`, `head` and `merge_base` its review binding's, and `input_read` the
+record's `started`, which is the cutoff. The issue binds the case's context to the round: a case
+holding another issue's text, issue item and inventory entry, all agreeing with one another, is
+refused under the round's record, since nothing else offline or in git names the issue a round was
+for. Nothing else of the text is read: an instant it names elsewhere, such as when
 it was published, is never taken for its start, and prose that names one is no binding. A record
 carrying no such line, or two, is refused; whether any record of this repository's history carries
 one is #592's to establish, and a round none does stays unplanned. `verify` bounds the cutoff by
@@ -187,23 +210,31 @@ own findings.
 The other two records follow the same rules, each with its own binding statement:
 
 ```text
-merge-record: {"pr": 540, "base_ref": "main", "merged": "<40 hex>"}
-lineage-record: {"pr": 539, "introduced": "<40 hex>", "paths": ["src/autoforge/doctor.py"], "merged": null, "fix": "<40 hex>"}
+merge-record: {"pr": 540, "issue": 329, "base_ref": "main", "merged": "<40 hex>"}
+lineage-record: {"defect": "r1-f1-reply-text", "pr": 539, "introduced": "<40 hex>", "paths": ["src/autoforge/doctor.py"], "found": "review", "merged": null, "fix": "<40 hex>"}
 ```
 
-A `squash` case's merge record names its PR, its base ref and its head as the commit the PR merged
-as, and states no start (`started` is `null`). A defect's lineage record names the case's PR (`null`
-when its provenance names none), the defect's introducing commit, the paths it is located in,
-sorted and each once, its merged revision or `null`, and its fix or revert; a defect that names no
-fix holds none. A record of either kind that names anything else is refused.
+A `squash` case's merge record names its PR, its issue (`null` when its provenance names none, so
+the absence is stated, not assumed), its base ref and its head as the commit the PR merged as, and
+states no start (`started` is `null`). A defect's lineage record names the defect's id, the case's
+PR (`null` when its provenance names none), the defect's introducing commit, the paths it is
+located in, sorted and each once, how it was found (`review` for a `same_review` or `later_review`
+discovery, else `post_merge` or `revert`), its merged revision or `null`, and its fix or revert; a
+defect that names no fix holds none. The id is what tells apart defects that share a PR, an
+introduction, a file and a fix (round 1's R1-F2, R1-F3 and R1-F4 of #459's branch in the seed, say),
+which would otherwise share one binding, while one defect registered at several heads of its PR
+holds the same record at each. A record of either kind that names anything else is refused.
 
 No retained record is ever part of the reviewer's input, since each holds what the reviewer must
 not be given: the round's own result, the merge, the fix. Not under its own source, and not in any
 value the reviewer is given (each context item's id, kind, source, reference and text, the
 environment's paths and validation commands, and the base ref): none of them may be the record (its
-digest), carry its binding statement, or hold, between them, every other line of its text, each
-compared without case or whitespace, wherever each line stands. A paraphrase or a part of a record
-cannot be told offline. What the format cannot check offline either is that a record is what its
+digest), carry its binding statement, or hold, between them, every other line of its text,
+wherever each line stands. Each is compared by its letters and digits alone, without case, after
+decoding HTML entities and compatibility forms, so a copy that only presents the record otherwise
+(each line as a Markdown block quote, a list item or a table cell, emphasised or in a code span,
+reflowed or joined into one line, its spacing or punctuation changed) is refused as the record
+itself. A paraphrase or a part of a record cannot be told offline. What the format cannot check offline either is that a record is what its
 source holds; capturing records is #592's.
 
 What a future runner must still provide, and nothing here implements: a disposable repository whose
@@ -223,7 +254,8 @@ once, no actor of the case may label it, and no label is decided after the corpu
 reviewer variant may label any record of the corpus, in any role: the corpus is checked before
 its variants are known, so the scorer refuses submissions with a variant whose identity labeled a
 defect or a negative of any case, planned or not. An identity is a string, not an authentication,
-as in REV-R0.
+as in REV-R0. No label of a case's defect or negative is decided before the day of the case's
+cutoff: a verdict on a candidate cannot precede the candidate as it was reviewed.
 
 A finding is matched against the case's registered defects by adjudicators who are neither a
 reviewer variant nor an actor of the case: `match` to one defect, `false`, or `unknown`, two
@@ -239,6 +271,8 @@ Absence of evidence is not a label, and the corpus keeps the difference:
 - A negative is **settled** only when an independent pass labels it clean and its observation
   window, from the cutoff to `observed_through`, is at least 30 days. A shorter window is
   **censored**, no settled pass is **unlabeled**, and a pass that finds a defect **refutes** it.
+  A clean pass dated before the case's cutoff day is refused however long the window, since the
+  window cannot make a pass on a candidate that did not yet stand valid.
   Only settled negatives enter the false-positive rate. The 30 days is a preregistered choice, not
   a measurement: it was fixed before any reviewer ran, and changes only by section 9.
 - A defect discovered after the freeze is outside the release. No case is ever "clean" because
@@ -392,8 +426,10 @@ revision the review read. The clusters follow the issues: #329's four rounds and
 #540's squash, #414's round and #460's squash, and #262's round.
 
 **Verification.** `uv run python -m tests.review_corpus verify --repo .` was run on 2026-11-27
-against this repository's object store, with git 2.47.3, after the round-4 checks were added: all
-eight cases passed every check of section 2. Each cutoff equals its head's committer time. For each
+against this repository's object store, with git 2.47.3, after the round-5 checks were added: all
+eight cases passed every check of section 2. The seed declares its repository's environment as
+`ENVIRONMENTS` registers it for `iceboundrock/AutoForge` at root `e5d562e8` (`pyproject.toml`,
+`uv.lock`, `make check`). Each cutoff equals its head's committer time. For each
 round main's first-parent line splits cleanly at its cutoff and the base revision is main's tip
 there by committer time, which `verify` reports as `provisional`. Each squash is a one-parent
 commit of main whose parent is its merge base and whose subject names its PR (`squash_parent`).
@@ -465,6 +501,27 @@ They refuse an absent placeholder pinned in place of every environment file, and
 one cluster with 12,000 registered defects and 20,000 completed runs, each file within the size
 cap and the plan within its limits, computing each run's observations once and its case's tally
 once.
+They refuse a review record's answer, without its binding, in one reference as a Markdown block
+quote, nested in a quote, as an emphasised list, as a table row, reflowed into one line or broken
+elsewhere, in code spans with its punctuation changed, and escaped as HTML entities or in
+full-width forms, and a line of it quoted in each of two references. They refuse a round or a
+squash given issue 99's context, issue item and inventory entry under its unchanged review or merge
+record, and a squash of no issue under a record naming one, or the reverse. They refuse a second
+finding of a round, at another span of the same file with the same introduction and fix, under the
+first finding's lineage record or under its source, and score it, the confirmed weight going from
+one to two, only with a record of its own; let one defect registered at two heads of its PR share
+one lineage record, its lines differing, and refuse another finding, summary, severity or discovery
+day under its id; and show that the seed's three defects of #459's one FIX are bound apart only by
+their ids. They count a revert of the squash on main for revert recall only under the revert's own
+lineage record, leave unplanned a revert claimed without any revert or without its record and an
+escape without its fix's record, and refuse a review's FIX claimed as a revert under its own
+record. They refuse a clean pass dated five days before the squash it judges, under a window long
+enough to settle it, which settles once dated on the squash's day, and a defect label dated before
+its case's cutoff. They refuse an existing, unrelated file declared as the whole environment and
+pinned truly at every head, the real environment files present but unpinned, as well as the
+registered files validated otherwise or one of them left out, and the seed declaring another
+environment; a repository nobody registered runs nothing, and a registered file absent at every
+head stays `null` beside the real pins while the case runs.
 They show exposure `possible` for a defect disclosed at an earlier revision, `unknown` between a
 candidate and its first discovery day and without evidence or a stated cutoff, refuse one issue, PR
 or defect commit split over two clusters, and let related issues share one. They pin the seed's
@@ -488,6 +545,6 @@ either was merged; no run preceded any amendment.
 
 Fixture SHA-256:
 
-- `autoforge_seed.json`: `120370adf561d9fdac1fbceaaead1800820c6fe39a65e1db508a8e30dae81f02`
-- `synthetic_corpus.json`: `474573124b051723693653933c1ed6926b01bb5187d853aa93c1bfda28effee7`
-- `synthetic_submissions.json`: `7af926c94b67a89ce0adf6aba74ec659327e4cd012400cce1fecf5a49f096fc3`
+- `autoforge_seed.json`: `47ae2f21d33a42f6d0cb7bdea8e6823ca638695d66714edf16d7d0fbfcbac4d0`
+- `synthetic_corpus.json`: `227a64b15790899a5535e3c87a73c3c617674bc2e5fd29e02dc11bf9bc976e0c`
+- `synthetic_submissions.json`: `69c776b0fa7c6110c3c3825f1bccdd470288bd0772249a8cfbd9e0c5e5b08f3b`
