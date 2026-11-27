@@ -122,7 +122,12 @@ from what was learned afterwards. These rules hold that line; each is enforced w
   record evidences that it landed), otherwise the merged revision its lineage record binds. A
   revert of a branch commit before its PR merged reverts nothing that landed, however truly its
   record states it. So a case claiming a revert, or an escape, without all of this stays
-  representable and unplanned, and adds nothing to revert or escape recall. Reviewing
+  representable and unplanned, and adds nothing to revert or escape recall. And it was found no
+  earlier than it landed: a `squash` case's discovery day is no earlier than its cutoff, the
+  squash's committer time, and `verify` refuses a `pr_branch` case whose `post_merge` or `revert`
+  discovery day precedes the committer day of the merged revision it names. A fix descending from
+  the merge does not make an earlier report a post-merge one; a disclosure before the merge is
+  exposure evidence (below), beside a discovery after it. Reviewing
   a case without its issue or with part of its discussion would be a different task, and scoring
   one whose boundary, base, PR or lineage only git's timestamps and subjects suggest would rest its
   labels on a guess, so the scorer refuses a plan naming any other case.
@@ -163,6 +168,13 @@ from what was learned afterwards. These rules hold that line; each is enforced w
   located by its lines. The corpus check refuses a defect located nowhere, a fix or merged revision
   that is not withheld, a withheld head, base revision or merge base, and a withheld commit named as
   a present defect's introduction.
+- **One PR merged once, as one commit.** A `squash` case's candidate is the commit its PR merged
+  as, and a defect's merged revision is the commit its case's PR merged as. The corpus check
+  refuses two of them naming different commits for one PR, between a squash case and a lineage,
+  between two lineages or between two squash cases, whatever records each holds: each can be
+  consistent with git on its own (a later commit whose subject also names the PR, keeping the
+  defect's lines, then a descendant changing them), and they cannot all be right. Any number of
+  cases naming the one merge agree.
 - A reviewer's input is identified by its digest: the review binding, the environment and each
   context item's id, kind, source, reference and text digest. Nothing about the answer (defects,
   labels, the retained records, withheld commits, actors, risk, exposure, case ids) enters it, and
@@ -246,13 +258,21 @@ decoding HTML entities and compatibility forms, both as written and as a Markdow
 it. The rendered form drops what adds letters no reader of it sees: a link's or image's
 destination and title, a defined reference's label and its definition, a defined footnote's
 marker, raw HTML tags and comments, and a code fence's info string, while code spans and fenced
-code read as written and a definition never interrupts a paragraph, as in CommonMark. So a copy
-that only presents the record otherwise (each line as a Markdown block quote, a list item or a
-table cell, emphasised, linked or in a code span, reflowed or joined into one line, its spacing or
-punctuation changed) is refused as the record itself. The rendered form is a model of CommonMark,
-not a renderer: markup it does not model reads as written, and a value whose link destinations
-would have it read more than four times the value's length (plus 4096 characters) is refused
-rather than read on.
+code read as written, as in CommonMark. A link reference definition is read as CommonMark defines
+one, on one line or several: its label (over lines, matched without case or spacing), then its
+destination and an optional title, each after at most one line break, the title over lines too,
+and nothing after either on its line; a title that does not end its line leaves the destination
+alone the definition when a line break comes between them. A definition starts a paragraph and
+never continues one: it may follow a blank line, a heading or its underline, a fence, or start a
+list item (a bullet, or the number 1) or a block quote that interrupts a paragraph, and it runs on
+over the paragraph's lines, lazily continued in a block quote, up to a blank line or a line that
+opens another block. So a copy that only presents the record otherwise (each line as a Markdown
+block quote, a list item or a table cell, emphasised, linked inline or by reference, or in a code
+span, reflowed or joined into one line, its spacing or punctuation changed) is refused as the
+record itself. The rendered form is a model of CommonMark, not a renderer: markup it does not model
+(an indented code block, an HTML block, a list item's indentation past three spaces) reads as
+prose, and a value whose link destinations would have it read more than four times the value's
+length (plus 4096 characters) is refused rather than read on.
 
 The same holds across cases for every record that is demonstrably later than a case's cutoff,
 whichever case retains it. A record cannot exist before what it records: a review record before
@@ -261,9 +281,14 @@ found its defect (no earlier than the cutoff of any case of that round of the PR
 fix, which each case registering the defect withholds, and no record before a commit its binding
 names. A record of another case whose own cutoff, or whose finding round's, is no earlier than a
 case's cutoff, or whose binding names a commit the case withholds (which `verify` holds to after
-the cutoff), was never what that case's reviewer read, and the case's input may not hold it. An
-earlier record may have been: a later round's reviewer can read an earlier round's review, which
-stays admitted. A paraphrase, a look-alike character from another script or a part of a record
+the cutoff), was never what that case's reviewer read, and the case's input may not hold it: the
+corpus check refuses it. Nor may the input hold a record whose binding names a commit that git
+dates after the case's cutoff, whether or not the case withholds it: `verify` dates each record
+no earlier than the newest committer time of the commits its binding names, and fails the case
+whose input holds one dated after its cutoff, so a later round need not list another round's fix
+to keep that round's lineage record out. An earlier record may have been read: a later round's
+reviewer can read an earlier round's review, whose commits all precede its cutoff, which stays
+admitted. A paraphrase, a look-alike character from another script or a part of a record
 cannot be told offline. What the format cannot check offline either is that a record is what its
 source holds; capturing records is #592's.
 
@@ -538,14 +563,25 @@ elsewhere, in code spans with its punctuation changed, escaped as HTML entities 
 forms, and with its file made a Markdown link (inline, titled, in angle brackets, with nested
 parentheses, an image, a reference link and its definition), an HTML link, a tag whose attribute
 holds a `>`, a footnote's marker or an HTML comment inside the line, and a line of it quoted in
-each of two references; each in a reference as a document's text alike. They check what the
-rendered form drops and keeps on CommonMark's own cases (code spans and fences as written, no link
-inside a link, an undefined reference and a definition inside a paragraph as text), admit a PR
-body that links its file and holds no record, and refuse a value whose link destinations would be
-read past the bound. They admit round 2's input holding round 1's review, published before round 2
-read it, and refuse round 1's input holding round 2's review record, whole as a document or its
-answer alone in a reference, and round 2's holding the answer of round 1's lineage record, whose
-fix round 2 withholds. They refuse a round or a
+each of two references; each in a reference as a document's text alike. The reference link's
+definition is also refused over several lines: its destination on the line after its label, its
+destination in angle brackets and a title over two lines each on lines of their own, its label
+broken over lines and in another case, in a block quote continued lazily, opening a list item
+that interrupts a paragraph, and after a heading's underline. They check what the rendered form
+drops and keeps on CommonMark's own cases (code spans and fences as written, no link inside a
+link, an undefined reference and a definition inside a paragraph as text, and the definitions of
+its examples 193 to 218, those it reads as text included: a blank line inside a title, text after
+a title, a missing destination, a title not set apart from it, a definition past a list item or a
+block quote that interrupts it, or where a list item cannot interrupt), and that a backslash
+escapes only punctuation and a destination ends only at an ASCII space or control character. They
+admit a PR body that links its file inline and by a reference defined over two lines and holds no
+record, and refuse a value whose link destinations would be read past the bound. They admit round
+2's input holding round 1's review, published before round 2 read it, and refuse round 1's input
+holding round 2's review record, whole as a document or its answer alone in a reference, and round
+2's holding the answer of round 1's lineage record, whose fix round 2 withholds; and when round 2
+does not list that fix, the corpus check admits it, `verify` fails round 2 by the fix's committer
+time and the score refuses it, while without the copy round 2 verifies and scores, the fix
+unlisted. They refuse a round or a
 squash given issue 99's context, issue item and inventory entry under its unchanged review or merge
 record, and a squash of no issue under a record naming one, or the reverse. They refuse a second
 finding of a round, at another span of the same file with the same introduction and fix, under the
@@ -563,6 +599,14 @@ revert or without its record, a revert made on the branch before its squash land
 that states it truly, and an escape without its fix's record, count a squash candidate's own
 revert on main, and refuse the branch's earlier revert named as the squash's, which follows neither
 the squash nor its cutoff, and a review's FIX claimed as a revert under its own record. They
+count an escape found the day after its squash for post-merge recall, refuse it in `verify` and
+the score when found two days before the squash landed, though its fix descends from the squash,
+accept it found on the squash's own day, and count the earlier report as exposure evidence beside
+the later discovery. They score a squash case's merge record and a branch round's lineage record
+naming the same merge of PR 2, and refuse, in every command, the lineage record naming instead a
+later commit whose subject also names PR 2, which keeps the defect's line and whose descendant
+changes it (consistent with git on its own, which `verify` shows without the squash case), as
+they refuse two lineage records of the PR naming two merges. They
 refuse a clean pass dated five days before the squash it judges, under a window long enough to
 settle it, which settles once dated on the squash's day, a defect label dated before its case's
 cutoff, and a finding judged false five days before the squash its run reviewed, which once dated

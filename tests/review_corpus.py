@@ -15,6 +15,7 @@ import json
 import os
 import re
 import stat
+import string
 import subprocess
 import unicodedata
 from bisect import bisect_left, bisect_right
@@ -597,24 +598,36 @@ def plain(text: str) -> str:
 # an HTML tag. ``rendered`` models what CommonMark (with GitHub's footnotes)
 # shows of a text, so the record check reads each value both as written and as
 # rendered. It is a model, not a renderer: what it does not model it reads as
-# written. Its work is linear in the text, but for a link's destination and
+# prose. Its work is linear in the text, but for a link's destination and
 # title, which it scans within ``MARKUP_BUDGET`` times the text's length.
 
-# A line's block quote and list markers, before the block the line holds.
-CONTAINER = re.compile(r"(?:[ \t]{0,3}(?:>[ \t]?|(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$)))*")
+# One of a line's block quote and list markers, before the block the line
+# holds: a block quote's ``>``, or a list item's bullet or number.
+MARKER = re.compile(r"[ \t]{0,3}(?:(>)[ \t]?|([-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$))")
 # A code fence (its run, then its info string), and a line no paragraph
 # continues past: an ATX heading or a thematic break.
 FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
 HEADING = re.compile(
     r" {0,3}(?:#{1,6}(?:[ \t].*)?|(?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})"
 )
-# A link reference definition on one line, and a footnote definition's marker.
+# The underline that makes the paragraph above it a heading (a line of ``-``
+# is ``HEADING``'s thematic break, which ends a paragraph as well).
+SETEXT = re.compile(r" {0,3}=+[ \t]*")
+# How any of those three can start, which most lines do not.
+OPENING = re.compile(r" {0,3}[#*\-_=`~]")
+# A link reference definition (CommonMark 4.7) starts with its label and a
+# colon, the label on one line or several, never ``^`` first (a footnote's);
+# then its destination, in angle brackets or bare, and an optional title, each
+# after spaces and at most one line break, the last of them ending its line.
+DEFINITION = re.compile(r" {0,3}\[((?:[^\[\]\\]|\\.){1,999})\]:", re.DOTALL)
+POINTY = re.compile(r"<(?:[^<>\\\n\r]|\\[^\n\r])*>")
+TITLE = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|\((?:[^()\\]|\\.)*\)", re.DOTALL)
+LINE_REST = re.compile(r"[ \t]*(?=\n|\Z)")
+# A footnote definition's marker.
 LABEL = r"((?:[^\[\]\\\n]|\\.)+)"
-DEFINITION = re.compile(
-    rf" {{0,3}}\[(?!\^){LABEL}\]:[ \t]*(?:<[^<>\n]*>|[^\s<>]+)"
-    r"(?:[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*"
-)
 FOOTNOTE = re.compile(rf" {{0,3}}\[\^{LABEL}\]:")
+# A full reference's label, just after its link text: ``[text][label]``.
+REFERENCE = re.compile(r"\[((?:[^\[\]\\]|\\.){0,999})\]", re.DOTALL)
 # A raw HTML open or closing tag, as CommonMark defines one.
 TAG = re.compile(
     r"</?[A-Za-z][A-Za-z0-9-]*"
@@ -623,10 +636,14 @@ TAG = re.compile(
 )
 BACKTICKS = re.compile(r"`+")
 PARAGRAPH_BREAK = re.compile(r"\n[ \t\r]*(?=\n|$)")
-# What the inline scan stops at: an escape, a bracket, a paragraph break.
-INLINE = re.compile(r"\\.|[\[\]]|\n[ \t\r]*(?=\n|$)", re.DOTALL)
+# What the inline scan stops at: an escape (a backslash before ASCII
+# punctuation), a bracket, a paragraph break.
+INLINE = re.compile(r"\\[!-/:-@\[-`{-~]|[\[\]]|\n[ \t\r]*(?=\n|$)")
 SPACE = re.compile(r"[ \t]*(?:\r\n|\n|\r)?[ \t]*")
-DESTINATION = re.compile(r"[^\s()\\]+")
+# A bare destination's run up to a parenthesis, a backslash, a space or an
+# ASCII control character, any of which it stops at.
+DESTINATION = re.compile(r"[^\x00-\x20\x7f()\\]+")
+PUNCTUATION = frozenset(string.punctuation)  # what a backslash escapes
 MAX_DESTINATION_DEPTH = 32  # cmark's bound on a destination's nested parentheses
 MARKUP_BUDGET = 4  # link scans read at most four times a value, plus 4096
 MAX_LABEL = 999  # CommonMark's bound on a link label's length
@@ -660,6 +677,29 @@ def code_spans(text: str, breaks: list[int]) -> list[tuple[int, int]]:
     return spans
 
 
+def bare_end(text: str, i: int) -> tuple[int | None, int]:
+    """Where a link destination not in angle brackets, from ``i``, ends: at a
+    space, an ASCII control character or a ``)`` that closes nothing, as cmark
+    reads one. ``None`` when its parentheses do not balance or nest deeper than
+    ``MAX_DESTINATION_DEPTH``; and how far the scan read. A backslash escapes
+    only ASCII punctuation, so a space or a line break after one ends it."""
+    size = len(text)
+    depth = 0
+    while i < size:
+        if chunk := DESTINATION.match(text, i):
+            i = chunk.end()
+        if i >= size or text[i] <= " " or text[i] == "\x7f" or (text[i] == ")" and not depth):
+            break
+        if text[i] == "\\":
+            i += 2 if i + 1 < size and text[i + 1] in PUNCTUATION else 1
+            continue
+        depth += 1 if text[i] == "(" else -1
+        if depth > MAX_DESTINATION_DEPTH:
+            return None, i
+        i += 1
+    return (None if depth else i), i
+
+
 def link_end(text: str, at: int, bound: int) -> tuple[int | None, int]:
     """Where an inline link's destination and title, from ``at`` (just past its
     ``(``), end: just past their ``)``, or ``None`` when they are no link's;
@@ -668,28 +708,16 @@ def link_end(text: str, at: int, bound: int) -> tuple[int | None, int]:
     size = len(text)
     i = SPACE.match(text, at).end()  # type: ignore[union-attr]
     if text.startswith("<", i):
-        stop = text.find("\n", i)
-        stop = size if stop == -1 else stop
-        close = text.find(">", i + 1, stop)
-        if close == -1 or text.find("<", i + 1, close) != -1 or "\r" in text[i:close]:
-            return None, stop - at
-        i = close + 1
+        pointy = POINTY.match(text, i)
+        if pointy is None:
+            stop = text.find("\n", i)
+            return None, (size if stop == -1 else stop) - at
+        i = pointy.end()
     else:
-        depth = 0
-        while i < size:
-            if chunk := DESTINATION.match(text, i):
-                i = chunk.end()
-            if i >= size or text[i].isspace() or (text[i] == ")" and not depth):
-                break
-            if text[i] == "\\":
-                i += 2
-                continue
-            depth += 1 if text[i] == "(" else -1
-            if depth > MAX_DESTINATION_DEPTH:
-                return None, i - at
-            i += 1
-        if depth or i > size:
-            return None, min(i, size) - at
+        end, read = bare_end(text, i)
+        if end is None:
+            return None, read - at
+        i = end
     end = SPACE.match(text, i).end()  # type: ignore[union-attr]
     if i < end < size and text[end] in "\"'(":
         close = ")" if text[end] == "(" else text[end]
@@ -766,12 +794,145 @@ def inline_markup(text: str, links: set, notes: set) -> list[tuple[int, int]]:
                     at = end
                     if not image:
                         floor = end
-            elif masked.startswith("[", i + 1):
-                close = masked.find("]", i + 2, i + 3 + MAX_LABEL)
-                if close != -1 and label_key(masked[i + 2 : close]) in links:
-                    out.append((i + 1, close + 1))
-                    at = close + 1
+            elif (
+                (reference := REFERENCE.match(masked, i + 1))
+                and len(reference[1]) <= MAX_LABEL
+                and not PARAGRAPH_BREAK.search(reference[1])
+                and label_key(reference[1]) in links
+            ):
+                out.append((i + 1, reference.end()))
+                at = reference.end()
+                if not image:
+                    floor = at
     return out + hushed
+
+
+def containers(body: str) -> tuple[int, int, bool]:
+    """A line's block quote and list markers: where its content starts past
+    them, how many block quotes it is in, and whether its first list marker
+    opens an item that can interrupt a paragraph (a bullet, or the number 1,
+    holding something, as CommonMark has it)."""
+    match = MARKER.match(body)
+    if match is None:
+        return 0, 0, False
+    at = depth = 0
+    first = None
+    while match:
+        at = match.end()
+        if match[1]:
+            depth += 1
+        elif first is None:
+            first = match[2]
+        match = MARKER.match(body, at)
+    item = (
+        first is not None and (first in "-+*" or int(first[:-1]) == 1) and bool(body[at:].strip())
+    )
+    return at, depth, item
+
+
+def fence_opening(content: str) -> re.Match | None:
+    """The code fence ``content`` opens, if it opens one."""
+    if not OPENING.match(content):
+        return None
+    opened = FENCE.fullmatch(content)
+    return None if opened is None or (opened[1][0] == "`" and "`" in opened[2]) else opened
+
+
+def definition(text: str, at: int) -> tuple[str, int] | None:
+    """The link reference definition that starts at ``at`` of a paragraph's
+    ``text`` (its lines' contents, one per line): its label and where it ends,
+    at the end of its last line; ``None`` when none starts there.
+
+    A title that does not end its line, or does not close, leaves the
+    destination alone the definition when a line break comes between them,
+    and no definition otherwise, as CommonMark has it.
+    """
+    label = DEFINITION.match(text, at)
+    if (
+        label is None
+        or label[1].startswith("^")
+        or len(label[1]) > MAX_LABEL
+        or not label[1].strip()
+    ):
+        return None
+    i = SPACE.match(text, label.end()).end()  # type: ignore[union-attr]
+    if text.startswith("<", i):
+        pointy = POINTY.match(text, i)
+        if pointy is None:
+            return None
+        end = pointy.end()
+    else:
+        found, _ = bare_end(text, i)
+        if found is None or found == i:
+            return None
+        end = found
+    gap = SPACE.match(text, end).end()  # type: ignore[union-attr]
+    if gap > end and (title := TITLE.match(text, gap)):
+        if rest := LINE_REST.match(text, title.end()):
+            return label[1], rest.end()
+    rest = LINE_REST.match(text, end)
+    return None if rest is None else (label[1], rest.end())
+
+
+def definitions(
+    lines: list[str], index: int, at: int, lead: int, depth: int, drop: list, links: set
+) -> int:
+    """The link reference definitions a paragraph whose first line is
+    ``lines[index]``, at offset ``at``, its content from ``lead`` and in
+    ``depth`` block quotes, starts with: each label joins ``links`` and each
+    definition, all its lines, joins ``drop``. Returns how many lines they
+    span.
+
+    The paragraph's lines run to a blank line, or to a line that opens
+    another block: a fence, a heading, a thematic break, a setext underline,
+    a list item that can interrupt it or a block quote it is not in. A line
+    in fewer block quotes than the first continues it lazily.
+    """
+    first = lines[index].rstrip("\r\n")
+    if not first[lead : lead + 4].lstrip(" ").startswith("["):
+        return 0
+    contents = [first[lead:]]
+    spans = [(at + lead, at + len(first))]
+    offset = at + len(lines[index])
+    # A label is decided within its 999 characters (escapes count two), so
+    # the paragraph is read on only once one has closed.
+    size, decided = len(contents[0]), False
+    for following in range(index + 1, len(lines)):
+        if not decided and size > 2 * MAX_LABEL + 8:
+            if DEFINITION.match("\n".join(contents)) is None:
+                return 0
+            decided = True
+        line = lines[following]
+        body = line.rstrip("\r\n")
+        start, inside, item = containers(body)
+        content = body[start:]
+        if (
+            inside > depth
+            or item
+            or not content.strip()
+            or (
+                OPENING.match(content) is not None
+                and (
+                    HEADING.fullmatch(content) is not None
+                    or (inside == depth and SETEXT.fullmatch(content) is not None)
+                    or fence_opening(content) is not None
+                )
+            )
+        ):
+            break
+        contents.append(content)
+        spans.append((offset + start, offset + len(body)))
+        offset += len(line)
+        size += len(content) + 1
+    text = "\n".join(contents)
+    consumed = position = 0
+    while consumed < len(contents) and (found := definition(text, position)):
+        label, stop = found
+        links.add(label_key(label))
+        last = consumed + text.count("\n", position, stop)
+        drop.append((spans[consumed][0], spans[last][1]))
+        consumed, position = last + 1, stop + 1
+    return consumed
 
 
 def rendered(text: str) -> str:
@@ -779,53 +940,72 @@ def rendered(text: str) -> str:
 
     What it removes adds letters no reader of the rendered text sees: a link's
     or image's destination and title, a defined reference's label and its
-    definition, a defined footnote's marker, raw HTML tags and comments, and a
-    code fence's info string. Code (a span or a fenced block) is shown as
-    written, and a definition never interrupts a paragraph. Each removal keeps
-    the line breaks it held, so the text keeps its lines.
+    definition (on one line or several), a defined footnote's marker, raw HTML
+    tags and comments, and a code fence's info string. Code (a span or a
+    fenced block) is shown as written. A definition starts a paragraph, never
+    continues one: after a blank line, a heading, a fence, or where a list item
+    or a block quote interrupts the paragraph. Each removal keeps the line
+    breaks it held, so the text keeps its lines.
     """
     drop: list[tuple[int, int]] = []
     links: set[str] = set()
     notes: set[str] = set()
-    prose = []  # the text with every fenced line blanked, its offsets kept
+    prose = []  # the text with every fenced line and definition blanked, its offsets kept
+    lines = text.splitlines(keepends=True)
     fence = None
-    paragraph = False
-    at = 0
-    for line in text.splitlines(keepends=True):
+    paragraph: int | None = None  # the open paragraph's block quote depth
+    # The line after a paragraph's definitions, which starts no other.
+    index = at = 0
+    tried = -1
+    while index < len(lines):
+        line = lines[index]
         body = line.rstrip("\r\n")
-        lead = CONTAINER.match(body).end()  # type: ignore[union-attr]
+        lead, depth, item = containers(body)
         content = body[lead:]
-        opened = FENCE.fullmatch(content)
-        fenced = fence is not None
-        if fence is None and opened and not (opened[1][0] == "`" and "`" in opened[2]):
-            fence, fenced = opened[1], True
+        if fence is not None:
+            closing = FENCE.fullmatch(content)
+            if (
+                closing
+                and closing[1][0] == fence[0]
+                and len(closing[1]) >= len(fence)
+                and not closing[2].strip()
+            ):
+                fence = None
+            prose.append(" " * len(body) + line[len(body) :])
+            paragraph = None
+        elif opened := fence_opening(content):
+            fence = opened[1]
             # Its info string names a language, which no reader sees.
             drop.append((at + lead + opened.start(2), at + len(body)))
-        elif (
-            fence is not None
-            and opened
-            and opened[1][0] == fence[0]
-            and len(opened[1]) >= len(fence)
-            and not opened[2].strip()
-        ):
-            fence = None
-        if fenced:
             prose.append(" " * len(body) + line[len(body) :])
-            paragraph = False
-        else:
+            paragraph = None
+        elif not content.strip() or (OPENING.match(content) and HEADING.fullmatch(content)):
             prose.append(line)
-            if not content.strip() or HEADING.fullmatch(content):
-                paragraph = False
-            elif not paragraph and (match := DEFINITION.fullmatch(content)):
-                links.add(label_key(match[1]))
-                drop.append((at + lead, at + len(body)))
-            elif not paragraph and (match := FOOTNOTE.match(content)):
+            paragraph = None
+        elif paragraph is not None and depth <= paragraph and not item:
+            # The paragraph continues, or its underline makes it a heading.
+            prose.append(line)
+            if depth == paragraph and OPENING.match(content) and SETEXT.fullmatch(content):
+                paragraph = None
+        elif index != tried and (
+            consumed := definitions(lines, index, at, lead, depth, drop, links)
+        ):
+            for held in lines[index : index + consumed]:
+                shown = held.rstrip("\r\n")
+                prose.append(" " * len(shown) + held[len(shown) :])
+                at += len(held)
+            index += consumed
+            tried = index
+            paragraph = None
+            continue
+        else:
+            if match := FOOTNOTE.match(content):
                 notes.add(label_key(match[1]))
                 drop.append((at + lead, at + lead + match.end()))
-                paragraph = True
-            else:
-                paragraph = True
+            prose.append(line)
+            paragraph = depth
         at += len(line)
+        index += 1
     drop += inline_markup("".join(prose), links, notes)
     kept, at = [], 0
     for start, end in sorted(drop):
@@ -968,7 +1148,7 @@ def check_record(record, *, case, cutoff: datetime, context: list) -> str | None
     Either record holds what the reviewer must not be given, so neither is
     ever part of the reviewer's input (``exposes``, in ``check_case``), nor,
     once demonstrably later than another case's cutoff, of that case's
-    (``check_later_records``).
+    (``check_later_records`` by the corpus, ``check_record_dates`` by git).
     """
     closed(record, RECORD_FIELDS)
     origin = case["provenance"]
@@ -1454,40 +1634,89 @@ def check_records(corpus) -> None:
             )
 
 
-def check_later_records(corpus, cases: dict) -> None:
-    """No case's reviewer is given a record retained for another case of the
-    corpus that is demonstrably later than its own cutoff.
+def check_merges(corpus) -> None:
+    """One PR merged once, as one commit, whatever records say of it.
+
+    A squash candidate is the commit its PR merged as (its merge record binds
+    that), and a defect's merged revision the commit its case's PR merged as
+    (its lineage record binds that). So two squash candidates of one PR, a
+    squash candidate and a merged revision, or two merged revisions, of one
+    PR and different commits cannot all be right, each record however
+    consistent with git on its own: a later commit naming the PR can pass
+    every check of a merged revision. The corpus is refused rather than any of
+    them trusted, while any number of cases naming the one merge agree.
+    """
+    merges: dict[int, str] = {}
+    for _, case in sorted(corpus["cases"].items()):
+        origin = case["provenance"]
+        named = [case["review"]["head"]] if origin["source"] == "squash" else []
+        named += [
+            defect["discovery"]["merged"]
+            for _, defect in sorted(case["defects"].items())
+            if defect["discovery"]["merged"] is not None
+        ]
+        for merged in named:
+            require(
+                merges.setdefault(origin["pr"], merged) == merged,
+                "one PR merged as one commit",
+            )
+
+
+def captured_records(corpus, cases: dict) -> list[tuple]:
+    """Every record retained in the corpus and captured, each as its case,
+    the earliest the corpus shows it can exist, its form, the record, its
+    binding line and its binding.
 
     A record cannot exist before what it records: a review record before its
     round read its input (its case's cutoff), a merge record before its merge
     (a squash case's cutoff, the squash's committer time), a lineage record
-    before its fix, which every case registering the defect withholds as
-    committed after its cutoff, nor before the round that found the defect,
-    whose review of the PR starts no earlier than the cutoff of any case of
-    that round. Nor can a record exist before a commit its binding names, so
-    one naming a commit a case withholds, which ``verify`` holds to after that
-    case's cutoff, is later than the cutoff too. A record no earlier than a
-    case's cutoff by either was never part of what that case's reviewer read,
-    and is held to ``exposes`` against the case's input as the case's own
-    records are. Any other may have been: a later round's reviewer can have
-    read an earlier round's review, which is never refused here.
+    before the round that found its defect, whose review of the PR starts no
+    earlier than the cutoff of any case of that round. Nor can one exist
+    before a commit its binding names: ``check_later_records`` reads that
+    from what a case withholds, ``check_record_dates`` from git.
     """
     rounds: dict[tuple[int, int], list[datetime]] = {}
     for case_id, case in corpus["cases"].items():
         origin = case["provenance"]
         if origin["pr"] is not None and origin["round"] is not None:
             rounds.setdefault((origin["pr"], origin["round"]), []).append(cases[case_id].cutoff)
-    later = []  # (owner, the earliest it can exist, form, record, binding line)
+    found = []
     for case_id, case in sorted(corpus["cases"].items()):
         cutoff, pr = cases[case_id].cutoff, case["provenance"]["pr"]
         bounds = [cutoff]
         for _, defect in sorted(case["defects"].items()):
-            found = defect["discovery"]["round"]
-            bounds.append(max([cutoff, *rounds.get((pr, found), [])]))
+            reported = defect["discovery"]["round"]
+            bounds.append(max([cutoff, *rounds.get((pr, reported), [])]))
         for (form, record), bound in zip(retained_records(case), bounds, strict=True):
             if record["status"] == "captured":
-                line, _ = record_binding(record["text"], form)
-                later.append((case_id, bound, form, record, line))
+                line, binding = record_binding(record["text"], form)
+                found.append((case_id, bound, form, record, line, binding))
+    return found
+
+
+def later_rule(form: Form) -> str:
+    return f"a later case's {form.kind} record is not the reviewer's context"
+
+
+def check_later_records(corpus, cases: dict) -> None:
+    """No case's reviewer is given a record retained for another case of the
+    corpus that is demonstrably later than its own cutoff, as far as the
+    corpus alone shows it.
+
+    A record is later than a case's cutoff when the corpus bounds it no
+    earlier (``captured_records``), or when its binding names a commit the
+    case withholds, which ``verify`` holds to after that case's cutoff. So a
+    lineage record naming a fix a case withholds is later than the case,
+    whichever case it is retained for. Such a record was never part of what
+    that case's reviewer read, and is held to ``exposes`` against the case's
+    input as the case's own records are. A record named by no such evidence
+    may have been: a later round's reviewer can have read an earlier round's
+    review, which is never refused here. A commit a record names that a case
+    does not withhold is dated by git alone, which ``verify`` reads
+    (``check_record_dates``), so no case has to withhold every commit another
+    case's records name.
+    """
+    later = captured_records(corpus, cases)
     for case_id, case in sorted(corpus["cases"].items()):
         cutoff = cases[case_id].cutoff
         held = [
@@ -1499,11 +1728,8 @@ def check_later_records(corpus, cases: dict) -> None:
         if not held:
             continue
         visible = Visible.of(list(reviewer_text(case)))
-        for _, _, form, record, line in held:
-            require(
-                not exposes(visible, record, line),
-                f"a later case's {form.kind} record is not the reviewer's context",
-            )
+        for _, _, form, record, line, _ in held:
+            require(not exposes(visible, record, line), later_rule(form))
 
 
 def check_corpus(corpus) -> Corpus:
@@ -1563,6 +1789,7 @@ def check_corpus(corpus) -> Corpus:
         require(case["review"]["base_ref"] in refs, "a case's base ref is frozen")
     check_defects(corpus)
     check_records(corpus)
+    check_merges(corpus)
     check_later_records(corpus, cases)
     check_clusters(corpus, cases)
     inputs = [case.input for case in cases.values()]
@@ -1986,6 +2213,18 @@ def verify_case(git: Git, case, repository) -> list[str]:
                 f"defect {key} survives its merge",
             )
             check(git.is_ancestor(merged, fix), f"defect {key} fix follows its merge")
+            if defect["discovery"]["source"] in AFTER_MERGE:
+                # Found after its merge, so no earlier than the day the merged
+                # revision was committed, as its squash is when it lands. A
+                # fix descending from the merge makes no earlier report a
+                # post-merge one: a disclosure before the merge is exposure
+                # evidence (the case's ``exposure``), never this discovery.
+                landed = git.committed(merged) if changed is not None else None
+                check(
+                    landed is not None
+                    and utc_day(landed) <= day(defect["discovery"]["discovered"]),
+                    f"defect {key} found no earlier than its merge",
+                )
         if fix is not None:
             # The fix or revert itself changed what the defect is located in:
             # consistent with its lineage record, though a comment beside the
@@ -2013,8 +2252,48 @@ def verify_case(git: Git, case, repository) -> list[str]:
     return failed
 
 
+def check_record_dates(git: Git, corpus, cases: dict, failed: dict) -> None:
+    """No case's reviewer is given another case's record that a commit its
+    binding names dates after the case's cutoff.
+
+    A record cannot exist before the commits it names, so it is no earlier
+    than the newest of their committer times, which git holds and the corpus
+    does not. A record so dated after a case's cutoff was never part of what
+    that case's reviewer read, whether or not the case withholds the commit
+    (``check_later_records`` reads only what it withholds): a lineage record
+    naming a fix committed after a later round's cutoff stays out of that
+    round's input even when the round does not list the fix. A record whose
+    commits are all no later than the cutoff is not refused here: an earlier
+    round's review can have been read by a later round's reviewer. Each
+    exposure is a failure of the case it reaches, appended to ``failed``.
+    """
+    stamps: dict[str, int | None] = {}
+
+    def committed(commit: str) -> int | None:
+        if commit not in stamps:
+            stamps[commit] = git.committed(commit) if git.kind(commit) == "commit" else None
+        return stamps[commit]
+
+    visible: dict[str, Visible] = {}
+    for owner, _, form, record, line, binding in captured_records(corpus, cases):
+        named = [v for v in binding.values() if isinstance(v, str) and OBJECT_ID.fullmatch(v)]
+        dated = [stamp for stamp in map(committed, named) if stamp is not None]
+        if not dated:
+            continue
+        earliest = max(dated)
+        for case_id, case in sorted(corpus["cases"].items()):
+            if case_id == owner or earliest <= cases[case_id].cutoff.timestamp():
+                continue
+            if case_id not in visible:
+                visible[case_id] = Visible.of(list(reviewer_text(case)))
+            rule = later_rule(form)
+            if rule not in failed[case_id] and exposes(visible[case_id], record, line):
+                failed[case_id].append(rule)
+
+
 def verify(corpus, repo: Path) -> dict:
-    """Re-derive every pin of a historical corpus from a local object store."""
+    """Re-derive every pin of a historical corpus from a local object store,
+    and date its records by the commits they name (``check_record_dates``)."""
     checked = check_corpus(corpus)
     require(checked.mode == "historical", "only a historical corpus names real objects")
     git = Git(repo)
@@ -2022,6 +2301,7 @@ def verify(corpus, repo: Path) -> dict:
     cases = {
         case_id: verify_case(git, corpus["cases"][case_id], repository) for case_id in checked.cases
     }
+    check_record_dates(git, corpus, checked.cases, cases)
     # Each case says what its base revision rests on; ``provisional`` is a
     # guess from committer times that no record confirms.
     return {

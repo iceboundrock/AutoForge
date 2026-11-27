@@ -2222,6 +2222,29 @@ PRESENTED = [
     # ...a footnote's marker, its note below, or an HTML comment inside the line.
     lambda text: linked(text, "src/a.py[^head]") + "\n\n[^head]: as reviewed.",
     lambda text: linked(text, "src/a.py <!-- the reviewed head -->"),
+    # ...a reference link whose definition's destination is on the line after
+    # its label, as CommonMark allows.
+    lambda text: linked(text, "[src/a.py][file]") + "\n\n[file]:\nhttps://example.invalid/a.py",
+    # ...its destination in angle brackets and its title, over two lines, each
+    # on lines of their own; or its label, in the link and the definition,
+    # broken over lines and in another case.
+    lambda text: (
+        linked(text, "[src/a.py][file]")
+        + '\n\n[file]:\n  <https://example.invalid/a.py>\n  "the file\n  as reviewed"'
+    ),
+    lambda text: (
+        linked(text, "[src/a.py][the\nfile]") + "\n\n[The\nFile]:\nhttps://example.invalid/a.py"
+    ),
+    # ...the definition in a block quote, its destination a lazy continuation,
+    # or opening a list item that interrupts a paragraph, or after a heading
+    # underlined below its text.
+    lambda text: linked(text, "[src/a.py][file]") + "\n\n> [file]:\nhttps://example.invalid/a.py",
+    lambda text: (
+        linked(text, "[src/a.py][file]") + "\n\nLinks:\n- [file]:\n  https://example.invalid/a.py"
+    ),
+    lambda text: (
+        linked(text, "[src/a.py][file]") + "\n\nLinks\n=====\n[file]:\nhttps://example.invalid/a.py"
+    ),
 ]
 
 
@@ -2361,6 +2384,45 @@ def test_no_value_the_reviewer_reads_holds_a_merge_or_lineage_record(history):
         ("a[^n]\n\n[^n]: note", "a\n\n note"),
         # Every line break a removal held is kept.
         ("[a](\nb\n) c", "[a]\n\n c"),
+        # A definition over several lines (CommonMark's examples 193 to 218):
+        # its destination and title each after at most one line break, a
+        # title over lines, a label over lines, several in one paragraph.
+        ("   [r]: \n      /url  \n           'the title'  \n\n[a][r]", "\n\n\n\n[a]"),
+        ("[r b]:\n<my url>\n'title'\n\n[a][R  B]", "\n\n\n\n[a]"),
+        ("[r]: /url '\ntitle\nline1\n'\n\n[a][r]", "\n\n\n\n\n[a]"),
+        ("[r]:\n/url\n\n[a][r]", "\n\n\n[a]"),
+        ("[r]: <>\n\n[a][r]", "\n\n[a]"),
+        ('[r]: /u\\r\\*l "t\\"i"\n\n[a][r]', "\n\n[a]"),
+        ("[\nr\n]: /url\nbar\n\n[a][r]", "\n\n\nbar\n\n[a]"),
+        ('[r]: /url\n"title" ok\n\n[a][r]', '\n"title" ok\n\n[a]'),
+        ('[r]: /1 "x"\n[s]: /2\n  "y"\n[t]: /3\n\n[a][r][b][s][c][t]', "\n\n\n\n\n[a][b][c]"),
+        # ...none where a blank line cuts it, a title is followed on its line,
+        # a destination is missing or not set apart from its title.
+        ("[r]: /url 't\n\nu'\n\n[a][r]", "[r]: /url 't\n\nu'\n\n[a][r]"),
+        ('[r]: /url "title" ok\n\n[a][r]', '[r]: /url "title" ok\n\n[a][r]'),
+        ("[r]:\n\n[a][r]", "[r]:\n\n[a][r]"),
+        ("[r]: </url>(t)\n\n[a][r]", "[r]: (t)\n\n[a][r]"),
+        # Where a paragraph ends, one may start: after a heading, an underline,
+        # in a block quote (lazily continued) or a list item interrupting it;
+        # never within a paragraph, nor past a list item or a block quote that
+        # interrupts it, nor where a list item cannot interrupt one.
+        ("# h\n[r]: /url\n> q\n\n[a][r]", "# h\n\n> q\n\n[a]"),
+        ("p\n===\n[r]: /url\n\n[a][r]", "p\n===\n\n\n[a]"),
+        ("[r]: /url\n===\n[a][r]", "\n===\n[a]"),
+        ("> [r]:\n/url\n\n[a][r]", "> \n\n\n[a]"),
+        ("p\n- [r]: /url\n\n[a][r]", "p\n- \n\n[a]"),
+        ("p\n[r]: /url\n\n[a][r]", "p\n[r]: /url\n\n[a][r]"),
+        ("[r]:\n> /url\n\n[a][r]", "[r]:\n> /url\n\n[a][r]"),
+        ("- [r]:\n- /url\n\n[a][r]", "- [r]:\n- /url\n\n[a][r]"),
+        ("p\n2. [r]: /url\n\n[a][r]", "p\n2. [r]: /url\n\n[a][r]"),
+        # A backslash escapes punctuation alone, and an escaped bracket stays
+        # in a label; a destination ends at a space, not at other blanks.
+        ("[a](b\\ c) d", "[a](b\\ c) d"),
+        ("[a](<b\\>c>) d", "[a] d"),
+        ("[a](b\u00a0c) d", "[a] d"),
+        ("[a][r\\]]\n\n[r\\]]: /url", "[a]\n\n"),
+        # A reference link holds no other link either.
+        ("[a [b][r] c][r]\n\n[r]: /u", "[a [b] c][r]\n\n"),
     ],
 )
 def test_the_record_check_reads_markup_as_a_renderer_shows_it(text, shown):
@@ -2386,7 +2448,8 @@ def test_linked_context_that_holds_no_record_still_runs(history, subs):
         "pr_body",
         "[#2](https://example.invalid/pull/2)",
         "2026-01-03T01:00:00Z",
-        "Adds [`src/a.py`](https://example.invalid/src/a.py) for <b>issue 1</b>.",
+        "Adds [`src/a.py`](https://example.invalid/src/a.py) for <b>issue 1</b>,"
+        " as [the issue][issue] asks.\n\n[issue]:\nhttps://example.invalid/issues/1",
         "pr/2",
     )
     complete(case, "2026-01-10T00:00:00Z")
@@ -2478,6 +2541,21 @@ def test_an_earlier_case_never_shows_a_later_cases_record(history, subs):
     items(later["cases"]["round2"])[1]["ref"] = "\n".join(body(lineage))
     rule = "a later case's lineage record is not the reviewer's context"
     refused_everywhere(later, repo, subs, ["round1", "round2"], rule)
+    # ...and when round 2 does not list the fix: the record names it, and git
+    # dates it after round 2 read its input. The corpus alone cannot tell, so
+    # it describes both rounds as runnable, but verify refuses round 2 and so
+    # does the score.
+    later["cases"]["round2"]["withheld"].remove(ids["fix"])
+    assert describe(later)["runnable"] == ["round1", "round2"]
+    report = verify(later, repo.path)
+    assert report["cases"]["round1"]["ok"]
+    assert report["cases"]["round2"]["failed"] == [rule]
+    with pytest.raises(CorpusError, match="a recorded score verifies its corpus"):
+        score(later, recorded(later, subs, ["round1", "round2"]), repo.path)
+    # Without the copy, round 2 verifies and scores, the fix unlisted and
+    # round 1's earlier review still in its input.
+    items(later["cases"]["round2"])[1]["ref"] = "#2"
+    assert score(later, recorded(later, subs, ["round1", "round2"]), repo.path)["verified"]["ok"]
 
 
 # -- a defect that escaped through a squash ------------------------------------
@@ -2530,6 +2608,9 @@ def escaped(ids, **discovery):
 def test_verify_follows_a_squashed_defect_to_its_post_merge_fix(history, discovery, failed):
     repo, ids = history
     corpus = historical(repo, ids)
+    # Without the squash case, which would name the PR's merge itself
+    # (``test_one_pr_merges_as_one_commit``): only git can contradict these.
+    del corpus["cases"]["merged"]
     case = corpus["cases"]["round1"]
     case["stratum"] = "escape"
     case["withheld"] += [ids["after"], ids["other"]]
@@ -2629,9 +2710,14 @@ def test_a_same_file_rewrite_and_a_later_descendant_are_no_squash_lineage(histor
     # The rewrite and its descendant named in their place do not: the
     # defect's line is not in the rewrite, and the descendant changed no file
     # the defect is in. (Their own lineage record, were there one, would not
-    # make git agree.)
-    case["defects"] = {"e1": escaped(ids, merged=rewrite, fix=docs)}
+    # make git agree.) The squash case names the PR's genuine merge, which
+    # the corpus check holds the rewrite to; without it git alone refuses.
+    # Found after the rewrite, as a post-merge discovery through it would be.
+    case["defects"] = {"e1": escaped(ids, merged=rewrite, fix=docs, discovered="2026-01-10")}
     lineaged(case, "e1")
+    with pytest.raises(CorpusError, match="one PR merged as one commit"):
+        check_corpus(corpus)
+    del corpus["cases"]["merged"]
     check_corpus(corpus)
     assert verify(corpus, repo.path)["cases"]["round1"]["failed"] == [
         "defect e1 survives its merge",
@@ -2667,6 +2753,9 @@ def test_a_lineage_runs_only_on_its_record_since_git_only_shows_it_consistent(hi
     )
     corpus = reviewed(repo, ids)
     corpus["repository"]["refs"]["main"] = remark
+    # Without the squash case, which would name the PR's merge itself
+    # (``test_one_pr_merges_as_one_commit``): only the records tell.
+    del corpus["cases"]["merged"]
     case = corpus["cases"]["round1"]
     case["stratum"] = "escape"
     case["withheld"] += [ids["after"], polish, remark, aside]
@@ -2680,7 +2769,11 @@ def test_a_lineage_runs_only_on_its_record_since_git_only_shows_it_consistent(hi
     # merge names the PR, changed the file and holds the line, and each fix
     # touched the defect's lines. Under the genuine records they are refused.
     rule = "the lineage record's binding names the defect's lineage"
-    for key, false in (("e1", {"merged": polish, "fix": remark}), ("d1", {"fix": aside})):
+    # The false escape is found after the polish, as one through it would be.
+    for key, false in (
+        ("e1", {"merged": polish, "fix": remark, "discovered": "2026-01-09"}),
+        ("d1", {"fix": aside}),
+    ):
         genuine = deepcopy(case["defects"][key])
         case["defects"][key]["discovery"] |= false
         with pytest.raises(CorpusError, match=rule):
@@ -3278,6 +3371,99 @@ def test_an_escape_without_its_fixs_lineage_record_stays_unplanned(history, subs
     case["stratum"] = "reviewed_defect"
     case["defects"]["e1"]["discovery"].update(source="same_review", round=1, finding="R1-F2")
     assert describe(corpus)["runnable"] == ["round1"]
+
+
+def test_a_defect_found_before_its_merge_is_no_post_merge_discovery(history, subs):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    case = corpus["cases"]["round1"]
+    case["stratum"] = "escape"
+    case["withheld"] += [ids["after"]]
+    # Found on January 7, after the squash of January 6 it escaped through.
+    case["defects"] = {"e1": escaped(ids)}
+    case["defects"]["e1"]["labels"] = [label("adjudicator-1", "confirmed", decided="2026-01-20")]
+    lineaged(case, "e1")
+    subs["variants"]["baseline"]["knowledge_cutoff"] = "2026-01-05"
+    report = score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+    assert metric(report, "baseline", "recall/discovery/post_merge")["observations"] == [0, 0, 1]
+    assert report["variants"]["baseline"]["training_exposure"]["unknown"] == 1
+    # Reported on January 4, two days before the squash landed: its fix
+    # descends from the squash, but no report before the merge is one after
+    # it. The corpus alone cannot date the squash; verify does, and the score
+    # refuses it.
+    case["defects"]["e1"]["discovery"]["discovered"] = "2026-01-04"
+    check_corpus(corpus)
+    assert verify(corpus, repo.path)["cases"]["round1"]["failed"] == [
+        "defect e1 found no earlier than its merge"
+    ]
+    with pytest.raises(CorpusError, match="a recorded score verifies its corpus"):
+        score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+    # Reported the day it landed, it may have followed the merge.
+    case["defects"]["e1"]["discovery"]["discovered"] = "2026-01-06"
+    assert verify(corpus, repo.path)["ok"]
+    # The January 4 report stays representable as what it was, a disclosure
+    # before the merge, beside the discovery after it: exposure evidence, by
+    # which a knowledge cutoff of January 5 may hold the answer.
+    case["defects"]["e1"]["discovery"]["discovered"] = "2026-01-07"
+    case["exposure"]["public_by"] = "2026-01-04"
+    report = score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+    assert metric(report, "baseline", "recall/discovery/post_merge")["observations"] == [0, 0, 1]
+    assert report["variants"]["baseline"]["training_exposure"]["possible"] == 1
+
+
+def test_one_pr_merges_as_one_commit(history, subs):
+    repo, ids = history
+    env = {"pyproject.toml": b"[project]\n", "uv.lock": b"version = 1\n"}
+    code = b"".join(b"line %d\n" % n for n in range(1, 6))
+    # Later on main, after PR 2's squash: a commit whose subject also ends in
+    # "(#2)", which keeps the defect's line 1, and a descendant changing it.
+    polish = repo.commit(
+        {**env, "src/a.py": code + b"fixed\npolished\n"},
+        [ids["squash"]],
+        "2026-01-08T00:00:00Z",
+        "Polish a.py (#2)",
+    )
+    remark = repo.commit(
+        {**env, "src/a.py": b"LINE 1\n" + code[7:] + b"fixed\npolished\n"},
+        [polish],
+        "2026-01-09T00:00:00Z",
+    )
+    corpus = reviewed(repo, ids)
+    corpus["repository"]["refs"]["main"] = remark
+    squashed(corpus)  # the squash case, under PR 2's genuine merge record
+    case = corpus["cases"]["round1"]
+    case["stratum"] = "escape"
+    case["withheld"] += [ids["after"], polish, remark]
+    confirmed = [label("adjudicator-1", "confirmed", decided="2026-01-20")]
+    # The escape's lineage record names the merge the merge record names:
+    # consistent, the two cases verify and score together.
+    case["defects"]["e1"] = escaped(ids)
+    case["defects"]["e1"]["labels"] = deepcopy(confirmed)
+    lineaged(case, "e1")
+    report = score(corpus, recorded(corpus, subs, ["round1", "merged"]), repo.path)
+    assert report["verified"]["ok"]
+    assert metric(report, "baseline", "recall/discovery/post_merge")["observations"] == [0, 0, 1]
+    # Its lineage record naming the later "(#2)" commit as the merge instead,
+    # and its descendant as the fix: each consistent with git on its own,
+    # but PR 2 merged once. Refused everywhere, whichever record is right.
+    case["defects"]["e1"] = escaped(ids, merged=polish, fix=remark, discovered="2026-01-09")
+    case["defects"]["e1"]["labels"] = deepcopy(confirmed)
+    lineaged(case, "e1")
+    rule = "one PR merged as one commit"
+    refused_everywhere(corpus, repo, subs, ["round1", "merged"], rule)
+    alone = deepcopy(corpus)
+    del alone["cases"]["merged"]
+    assert verify(alone, repo.path)["ok"]
+    # Two lineage records of the PR naming two merges conflict as well, with
+    # no squash case to name either.
+    alone["cases"]["round1"]["defects"]["e2"] = escaped(ids)
+    alone["cases"]["round1"]["defects"]["e2"]["summary"] = "line 1 is unchecked"
+    lineaged(alone["cases"]["round1"], "e2")
+    with pytest.raises(CorpusError, match=rule):
+        check_corpus(alone)
+    # Records agreeing on the one merge, the squash's, score.
+    del alone["cases"]["round1"]["defects"]["e1"]
+    assert score(alone, recorded(alone, subs, ["round1"]), repo.path)["verified"]["ok"]
 
 
 def test_a_clean_verdict_dated_before_its_candidate_never_settles_it(history, subs):
