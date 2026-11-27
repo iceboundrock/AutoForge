@@ -17,6 +17,7 @@ import re
 import stat
 import subprocess
 import unicodedata
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -121,9 +122,17 @@ REVIEW = Form(
 # A PR's merge record: the issue it was for and the commit its PR merged into
 # its base ref as.
 MERGE = Form("merge", "merge-record: ", "pr issue base_ref merged")
-# A defect's lineage record: which registered defect it is, how it was found,
-# the fix or revert that addresses it, and the merge it escaped through.
-LINEAGE = Form("lineage", "lineage-record: ", "defect pr introduced paths found merged fix")
+# A defect's lineage record: which registered defect it is (its id, PR,
+# introduction and files, and the round, finding and summary that tell it from
+# another defect sharing those), how it was found, the fix or revert that
+# addresses it, and the merge it escaped through.
+LINEAGE = Form(
+    "lineage",
+    "lineage-record: ",
+    "defect pr introduced paths summary round finding found merged fix",
+)
+# What a lineage record binds that tells one defect from another under it.
+DESCRIBED = ("summary", "round", "finding")
 # How a defect was found, as its lineage record states it: by a review round
 # (the same or a later one, which depends on the head registering it), after
 # its merge, or by a revert.
@@ -574,17 +583,283 @@ def plain(text: str) -> str:
     line reflowed, or two joined), punctuation, and markup (a Markdown quote,
     list, heading, table, emphasis or code span, an HTML entity, a character's
     compatibility form) change the first and never the second, so none of them
-    is compared.
+    is compared. Markup that adds letters a renderer never shows (a link's
+    destination, an HTML tag) is ``rendered``'s.
     """
     folded = unicodedata.normalize("NFKC", html.unescape(text)).casefold()
     return "".join(char for char in folded if char.isalnum())
+
+
+# -- what a Markdown renderer shows ---------------------------------------------
+#
+# A copy of a record can be marked up so that it reads, rendered, as the record
+# does while its text holds letters the record's does not: a link's destination,
+# an HTML tag. ``rendered`` models what CommonMark (with GitHub's footnotes)
+# shows of a text, so the record check reads each value both as written and as
+# rendered. It is a model, not a renderer: what it does not model it reads as
+# written. Its work is linear in the text, but for a link's destination and
+# title, which it scans within ``MARKUP_BUDGET`` times the text's length.
+
+# A line's block quote and list markers, before the block the line holds.
+CONTAINER = re.compile(r"(?:[ \t]{0,3}(?:>[ \t]?|(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$)))*")
+# A code fence (its run, then its info string), and a line no paragraph
+# continues past: an ATX heading or a thematic break.
+FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
+HEADING = re.compile(
+    r" {0,3}(?:#{1,6}(?:[ \t].*)?|(?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})"
+)
+# A link reference definition on one line, and a footnote definition's marker.
+LABEL = r"((?:[^\[\]\\\n]|\\.)+)"
+DEFINITION = re.compile(
+    rf" {{0,3}}\[(?!\^){LABEL}\]:[ \t]*(?:<[^<>\n]*>|[^\s<>]+)"
+    r"(?:[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*"
+)
+FOOTNOTE = re.compile(rf" {{0,3}}\[\^{LABEL}\]:")
+# A raw HTML open or closing tag, as CommonMark defines one.
+TAG = re.compile(
+    r"</?[A-Za-z][A-Za-z0-9-]*"
+    r"(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?)*"
+    r"\s*/?>"
+)
+BACKTICKS = re.compile(r"`+")
+PARAGRAPH_BREAK = re.compile(r"\n[ \t\r]*(?=\n|$)")
+# What the inline scan stops at: an escape, a bracket, a paragraph break.
+INLINE = re.compile(r"\\.|[\[\]]|\n[ \t\r]*(?=\n|$)", re.DOTALL)
+SPACE = re.compile(r"[ \t]*(?:\r\n|\n|\r)?[ \t]*")
+DESTINATION = re.compile(r"[^\s()\\]+")
+MAX_DESTINATION_DEPTH = 32  # cmark's bound on a destination's nested parentheses
+MARKUP_BUDGET = 4  # link scans read at most four times a value, plus 4096
+MAX_LABEL = 999  # CommonMark's bound on a link label's length
+
+
+def label_key(label: str) -> str:
+    """A reference label as CommonMark matches it: without case or spacing."""
+    return " ".join(label.split()).casefold()
+
+
+def code_spans(text: str, breaks: list[int]) -> list[tuple[int, int]]:
+    """Where ``text``'s code spans stand: each a run of backticks up to the next
+    run of the same length in its paragraph, which a renderer shows as written.
+    ``breaks`` are where the text's paragraph breaks start."""
+    runs = [match.span() for match in BACKTICKS.finditer(text)]
+    following: list[int | None] = [None] * len(runs)
+    last: dict[int, int] = {}
+    for index in range(len(runs) - 1, -1, -1):
+        size = runs[index][1] - runs[index][0]
+        following[index] = last.get(size)
+        last[size] = index
+    spans: list[tuple[int, int]] = []
+    for index, (start, end) in enumerate(runs):
+        if (spans and start < spans[-1][1]) or text[start - 1 : start] == "\\":
+            continue
+        close = following[index]
+        at = bisect_left(breaks, end)
+        bound = breaks[at] if at < len(breaks) else len(text)
+        if close is not None and runs[close][0] < bound:
+            spans.append((start, runs[close][1]))
+    return spans
+
+
+def link_end(text: str, at: int, bound: int) -> tuple[int | None, int]:
+    """Where an inline link's destination and title, from ``at`` (just past its
+    ``(``), end: just past their ``)``, or ``None`` when they are no link's;
+    and how far the scan read. A title ends before ``bound``, its paragraph's
+    end."""
+    size = len(text)
+    i = SPACE.match(text, at).end()  # type: ignore[union-attr]
+    if text.startswith("<", i):
+        stop = text.find("\n", i)
+        stop = size if stop == -1 else stop
+        close = text.find(">", i + 1, stop)
+        if close == -1 or text.find("<", i + 1, close) != -1 or "\r" in text[i:close]:
+            return None, stop - at
+        i = close + 1
+    else:
+        depth = 0
+        while i < size:
+            if chunk := DESTINATION.match(text, i):
+                i = chunk.end()
+            if i >= size or text[i].isspace() or (text[i] == ")" and not depth):
+                break
+            if text[i] == "\\":
+                i += 2
+                continue
+            depth += 1 if text[i] == "(" else -1
+            if depth > MAX_DESTINATION_DEPTH:
+                return None, i - at
+            i += 1
+        if depth or i > size:
+            return None, min(i, size) - at
+    end = SPACE.match(text, i).end()  # type: ignore[union-attr]
+    if i < end < size and text[end] in "\"'(":
+        close = ")" if text[end] == "(" else text[end]
+        j = end + 1
+        while (j := text.find(close, j, bound)) != -1:
+            back = j
+            while back > end + 1 and text[back - 1] == "\\":
+                back -= 1
+            if (j - back) % 2 == 0:
+                break
+            j += 1
+        if j == -1:
+            return None, bound - at
+        end = SPACE.match(text, j + 1).end()  # type: ignore[union-attr]
+    return (end + 1 if end < size and text[end] == ")" else None), end - at
+
+
+def comments(text: str) -> list[tuple[int, int]]:
+    """Where ``text``'s HTML comments stand, each from ``<!--`` to the next
+    ``-->``: none after an opening that nothing closes."""
+    spans, at = [], 0
+    while (start := text.find("<!--", at)) != -1 and (end := text.find("-->", start + 4)) != -1:
+        spans.append((start, end + 3))
+        at = end + 3
+    return spans
+
+
+def inline_markup(text: str, links: set, notes: set) -> list[tuple[int, int]]:
+    """The spans of ``text`` outside code that a renderer does not show: raw
+    HTML tags and comments, a link's or image's destination and title, a
+    defined reference's label and a defined footnote's marker."""
+    breaks = [match.start() for match in PARAGRAPH_BREAK.finditer(text)]
+    flat = list(text)
+    for start, end in code_spans(text, breaks):
+        flat[start:end] = "`" * (end - start)
+    hushed = comments("".join(flat))
+    for start, end in hushed:
+        flat[start:end] = "-" * (end - start)  # nothing in a comment is shown
+    masked = "".join(flat)
+    out = [match.span() for match in TAG.finditer(masked)]
+    starts = [start for start, _ in out]
+    ends = [end for _, end in out]
+    budget = MARKUP_BUDGET * len(text) + 4096
+    openers: list[tuple[int, bool]] = []  # each open bracket, and whether an image's
+    floor = at = 0  # brackets before ``floor`` open no link; read up to ``at``
+    for match in INLINE.finditer(masked):
+        i = match.start()
+        tag = bisect_right(starts, i) - 1
+        if i < at or (tag >= 0 and i < ends[tag]):
+            continue
+        token = match.group()
+        if token.startswith("\n"):
+            openers.clear()  # a link never spans a paragraph break
+        elif token == "[":
+            openers.append((i, masked[i - 1 : i] == "!"))
+        elif token == "]" and openers:
+            start, image = openers.pop()
+            if not image and start < floor:
+                continue  # a link holds no other link
+            if (
+                masked.startswith("^", start + 1)
+                and i - start <= MAX_LABEL + 2
+                and label_key(masked[start + 2 : i]) in notes
+            ):
+                out.append((start, i + 1))
+            elif masked.startswith("(", i + 1):
+                paragraph = bisect_left(breaks, i)
+                bound = breaks[paragraph] if paragraph < len(breaks) else len(text)
+                end, read = link_end(masked, i + 2, bound)
+                budget -= read
+                require(budget >= 0, "a value the reviewer reads is within the markup bound")
+                if end is not None:
+                    out.append((i + 1, end))
+                    at = end
+                    if not image:
+                        floor = end
+            elif masked.startswith("[", i + 1):
+                close = masked.find("]", i + 2, i + 3 + MAX_LABEL)
+                if close != -1 and label_key(masked[i + 2 : close]) in links:
+                    out.append((i + 1, close + 1))
+                    at = close + 1
+    return out + hushed
+
+
+def rendered(text: str) -> str:
+    """``text`` as a Markdown renderer shows it, line for line.
+
+    What it removes adds letters no reader of the rendered text sees: a link's
+    or image's destination and title, a defined reference's label and its
+    definition, a defined footnote's marker, raw HTML tags and comments, and a
+    code fence's info string. Code (a span or a fenced block) is shown as
+    written, and a definition never interrupts a paragraph. Each removal keeps
+    the line breaks it held, so the text keeps its lines.
+    """
+    drop: list[tuple[int, int]] = []
+    links: set[str] = set()
+    notes: set[str] = set()
+    prose = []  # the text with every fenced line blanked, its offsets kept
+    fence = None
+    paragraph = False
+    at = 0
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        lead = CONTAINER.match(body).end()  # type: ignore[union-attr]
+        content = body[lead:]
+        opened = FENCE.fullmatch(content)
+        fenced = fence is not None
+        if fence is None and opened and not (opened[1][0] == "`" and "`" in opened[2]):
+            fence, fenced = opened[1], True
+            # Its info string names a language, which no reader sees.
+            drop.append((at + lead + opened.start(2), at + len(body)))
+        elif (
+            fence is not None
+            and opened
+            and opened[1][0] == fence[0]
+            and len(opened[1]) >= len(fence)
+            and not opened[2].strip()
+        ):
+            fence = None
+        if fenced:
+            prose.append(" " * len(body) + line[len(body) :])
+            paragraph = False
+        else:
+            prose.append(line)
+            if not content.strip() or HEADING.fullmatch(content):
+                paragraph = False
+            elif not paragraph and (match := DEFINITION.fullmatch(content)):
+                links.add(label_key(match[1]))
+                drop.append((at + lead, at + len(body)))
+            elif not paragraph and (match := FOOTNOTE.match(content)):
+                notes.add(label_key(match[1]))
+                drop.append((at + lead, at + lead + match.end()))
+                paragraph = True
+            else:
+                paragraph = True
+        at += len(line)
+    drop += inline_markup("".join(prose), links, notes)
+    kept, at = [], 0
+    for start, end in sorted(drop):
+        if end <= at:
+            continue
+        start = max(start, at)
+        kept += [text[at:start], "\n" * (len(f".{text[start:end]}.".splitlines()) - 1)]
+        at = end
+    kept.append(text[at:])
+    return "".join(kept)
+
+
+@lru_cache(maxsize=256)
+def forms(text: str) -> tuple[frozenset[str], ...]:
+    """Each line of ``text`` as its letters and digits (``plain``), as written
+    and as rendered (``rendered``), the empty form left out. A retained record
+    is compared with every case it may not reach, so its forms are kept."""
+    written = text.splitlines()
+    # Rendering keeps every line break, so only a last line it empties drops out.
+    shown = rendered(text).splitlines()
+    shown += [""] * (len(written) - len(shown))
+    if len(shown) != len(written):  # never, by construction; read as written
+        shown = written
+    return tuple(
+        frozenset({plain(a), plain(b)} - {""}) for a, b in zip(written, shown, strict=True)
+    )
 
 
 @dataclass(frozen=True)
 class Visible:
     """Every free-text value of a case's reviewer input (``reviewer_text``) as
     the record check reads it: each value's digest, and each value as its
-    letters and digits (``plain``), kept apart from the others."""
+    letters and digits (``plain``), as written and as rendered (``rendered``),
+    kept apart from the others."""
 
     digests: frozenset
     words: str
@@ -594,7 +869,9 @@ class Visible:
         return cls(
             digests=frozenset(sha256(text.encode()).hexdigest() for text in texts),
             # No plain text holds the separator, so nothing matches across two values.
-            words="\0".join(plain(text) for text in texts),
+            words="\0".join(
+                [plain(text) for text in texts] + [plain(rendered(text)) for text in texts]
+            ),
         )
 
 
@@ -606,15 +883,30 @@ def exposes(visible: Visible, record, line: str) -> bool:
     the base ref. One of them is the record (its digest is the record's), or
     one carries the record's binding statement, or every other line of the
     record stands in one value or another, wherever each stands. Each is
-    compared as its letters and digits alone (``plain``), so quoting, listing
-    or emphasising a line, reflowing or joining lines, or changing their case,
-    spacing or punctuation hides none of them. A paraphrase, or a part of the
-    record, cannot be told.
+    compared as its letters and digits alone (``plain``), both as written and
+    as a Markdown renderer shows it (``rendered``), so quoting, listing,
+    emphasising or linking a line, reflowing or joining lines, or changing
+    their case, spacing or punctuation hides none of them. A paraphrase, or a
+    part of the record, cannot be told.
     """
-    if record["sha256"] in visible.digests or plain(line) in visible.words:
+    if record["sha256"] in visible.digests:
         return True
-    body = {plain(row) for row in record["text"].splitlines() if row != line} - {""}
-    return bool(body) and all(row in visible.words for row in body)
+    rows = forms(record["text"])
+    written = record["text"].splitlines()
+    binding = [row for row, text in zip(rows, written, strict=True) if text == line]
+    if any(form in visible.words for row in binding for form in row):
+        return True
+    body = [row for row, text in zip(rows, written, strict=True) if text != line and row]
+    return bool(body) and all(any(form in visible.words for form in row) for row in body)
+
+
+def retained_records(case) -> list[tuple[Form, dict]]:
+    """Every record retained for a case, with its form: its review or merge
+    record, then each defect's lineage record, by defect id."""
+    form = MERGE if case["provenance"]["source"] == "squash" else REVIEW
+    return [(form, case["record"])] + [
+        (LINEAGE, defect["discovery"]["lineage"]) for _, defect in sorted(case["defects"].items())
+    ]
 
 
 def check_source(record, form: Form, *, origin, context) -> None:
@@ -674,7 +966,9 @@ def check_record(record, *, case, cutoff: datetime, context: list) -> str | None
     item and inventory entry under an unchanged record is refused.
 
     Either record holds what the reviewer must not be given, so neither is
-    ever part of the reviewer's input (``exposes``, in ``check_case``).
+    ever part of the reviewer's input (``exposes``, in ``check_case``), nor,
+    once demonstrably later than another case's cutoff, of that case's
+    (``check_later_records``).
     """
     closed(record, RECORD_FIELDS)
     origin = case["provenance"]
@@ -737,16 +1031,19 @@ def check_lineage(key: str, defect, *, case) -> str | None:
     merge it escaped through, is what the record evidences: its binding names
     the registered defect (its id, ``key``, which names one defect in every
     case registering it: ``check_defects``), the case's PR, the defect's
-    introducing commit and the files it is located in, how it was found
-    (``FOUND``), the merged revision (or ``null``) and the fix. Defects that
-    share all but their id (one PR, introduction, file and fix) therefore
-    never share a record, while one defect registered at several heads of its
-    PR can. ``verify``'s checks of the same lineage against git (ancestry, the
+    introducing commit and the files it is located in, the defect's summary
+    and the round and finding that reported it (each ``null`` when none did),
+    how it was found (``FOUND``), the merged revision (or ``null``) and the
+    fix. Defects that share all but their id (one PR, introduction, file and
+    fix) therefore never share a record, and no other finding or defect can
+    take a registration's place under its unchanged record, while one defect
+    registered at several heads of its PR, its lines each head's own, can.
+    ``verify``'s checks of the same lineage against git (ancestry, the
     squash's subject, the lines it carried, the files and lines the fix
     changed) are consistency checks: a later commit can satisfy every one of
     them without fixing anything. A case is runnable only when each fix it
     names has its record, and each defect found after its merge its record
-    too (``check_case``).
+    and a revision that landed (``check_case``).
     """
     found = defect["discovery"]
     lineage = found["lineage"]
@@ -765,7 +1062,10 @@ def check_lineage(key: str, defect, *, case) -> str | None:
     stated = lineage_statement(key, defect, pr=origin["pr"])
     require(
         pr_number(binding["pr"])
-        and all(binding[name] == stated[name] for name in ("defect", "pr", "introduced", "paths")),
+        and all(
+            binding[name] == stated[name]
+            for name in ("defect", "pr", "introduced", "paths", *DESCRIBED)
+        ),
         "the lineage record's binding names the defect",
     )
     require(
@@ -978,12 +1278,12 @@ def check_case(case_id, case, *, mode: str, frozen: date, declared, registered: 
     # Every record retained for the case holds what its reviewer must not be
     # given: the round's own result, a merge, a fix. None reaches the input,
     # through a context item's text or any other value the reviewer reads.
-    held = [(REVIEW if origin["source"] != "squash" else MERGE, case["record"], recorded)]
-    held += [
-        (LINEAGE, defect["discovery"]["lineage"], lineages[key])
-        for key, defect in sorted(case["defects"].items())
-    ]
-    for form, kept, line in held:
+    # Another case's later records are ``check_later_records``'.
+    for (form, kept), line in zip(
+        retained_records(case),
+        [recorded, *(lineages[key] for key in sorted(case["defects"]))],
+        strict=True,
+    ):
         require(
             line is None or not exposes(visible, kept, line),
             f"the {form.kind} record is not the reviewer's context",
@@ -993,18 +1293,25 @@ def check_case(case_id, case, *, mode: str, frozen: date, declared, registered: 
     # merge record, and every defect's fix on its lineage record. A historical
     # defect found after its merge (an escape, a revert) has no review round
     # to evidence it, only the commit that fixed or reverted it, so it runs
-    # only on that commit's lineage record, which states how it was found: a
-    # claim of a revert, or of an escape, without one stays unplanned. And a
-    # case runs only on a test environment it pins, as its repository's
-    # registered declaration names it.
+    # only on that commit's lineage record, which states how it was found, and
+    # only from a revision that landed: the squash candidate itself, whose
+    # merge record evidences it, or the merged revision its lineage record
+    # binds. A revert of a branch commit before its PR merged reverts nothing
+    # that landed. A claim of a revert, or of an escape, without either stays
+    # representable and unplanned. And a case runs only on a test environment
+    # it pins, as its repository's registered declaration names it.
     synthetic = origin["source"] == "synthetic"
     evidenced = recorded is not None or synthetic
     lineaged = all(
-        lineages[key] is not None
+        synthetic
+        or defect["discovery"]["source"] not in AFTER_MERGE
         or (
-            defect["discovery"]["fix"] is None
-            and (synthetic or defect["discovery"]["source"] not in AFTER_MERGE)
+            lineages[key] is not None
+            and (origin["source"] == "squash" or defect["discovery"]["merged"] is not None)
         )
+        for key, defect in case["defects"].items()
+    ) and all(
+        lineages[key] is not None or defect["discovery"]["fix"] is None
         for key, defect in case["defects"].items()
     )
     pinned = any(blob is not None for blob in environment["files"].values())
@@ -1077,6 +1384,9 @@ def lineage_statement(key: str, defect, *, pr) -> dict:
         "pr": pr,
         "introduced": defect["introduced"],
         "paths": sorted({place["path"] for place in defect["location"]}),
+        "summary": defect["summary"],
+        "round": found["round"],
+        "finding": found["finding"],
         "found": FOUND[found["source"]],
         "merged": found["merged"],
         "fix": found["fix"],
@@ -1084,24 +1394,26 @@ def lineage_statement(key: str, defect, *, pr) -> dict:
 
 
 def check_defects(corpus) -> None:
-    """Registrations one lineage record would serve are one defect.
+    """Registrations of one defect id along one lineage are one defect.
 
-    A lineage record serves every registration its binding names: one defect
-    id of one PR, with one introduction, set of paths, way of being found,
-    merge and fix. One defect may be registered so at several heads of its PR,
-    and its record then serves each of them. Any two such registrations must
-    be one defect: of one severity and class, with one summary, found by one
-    round's finding (or none) by one day. Only their lines (each head's own),
-    their discovery source (``same_review`` or ``later_review`` by each head's
-    round) and their labels may differ. Another defect under the same id, a
-    different finding at a different span, say, would be served by the same
-    record, so it is refused.
+    A lineage record names a defect id of one PR, with one introduction, set
+    of paths, way of being found, merge and fix, and the summary, round and
+    finding that tell that defect from another. One defect may be registered
+    so at several heads of its PR, and its record then serves each of them.
+    Any two registrations of one id along one lineage must be one defect: of
+    one severity and class, with one summary, found by one round's finding
+    (or none) by one day. Only their lines (each head's own), their discovery
+    source (``same_review`` or ``later_review`` by each head's round) and
+    their labels may differ. Another defect under the same id, a different
+    finding at a different span, say, is refused even with a record of its
+    own.
     """
     seen: dict[bytes, tuple] = {}
     for _, case in sorted(corpus["cases"].items()):
         for key, defect in sorted(case["defects"].items()):
             found = defect["discovery"]
-            served = canonical(lineage_statement(key, defect, pr=case["provenance"]["pr"]))
+            stated = lineage_statement(key, defect, pr=case["provenance"]["pr"])
+            served = canonical({name: stated[name] for name in stated if name not in DESCRIBED})
             identity = (
                 defect["severity"],
                 defect["class"],
@@ -1139,6 +1451,58 @@ def check_records(corpus) -> None:
                 sources.setdefault(record["source"], by_source) == by_source
                 and digests.setdefault(record["sha256"], by_digest) == by_digest,
                 "a retained record evidences one case or defect",
+            )
+
+
+def check_later_records(corpus, cases: dict) -> None:
+    """No case's reviewer is given a record retained for another case of the
+    corpus that is demonstrably later than its own cutoff.
+
+    A record cannot exist before what it records: a review record before its
+    round read its input (its case's cutoff), a merge record before its merge
+    (a squash case's cutoff, the squash's committer time), a lineage record
+    before its fix, which every case registering the defect withholds as
+    committed after its cutoff, nor before the round that found the defect,
+    whose review of the PR starts no earlier than the cutoff of any case of
+    that round. Nor can a record exist before a commit its binding names, so
+    one naming a commit a case withholds, which ``verify`` holds to after that
+    case's cutoff, is later than the cutoff too. A record no earlier than a
+    case's cutoff by either was never part of what that case's reviewer read,
+    and is held to ``exposes`` against the case's input as the case's own
+    records are. Any other may have been: a later round's reviewer can have
+    read an earlier round's review, which is never refused here.
+    """
+    rounds: dict[tuple[int, int], list[datetime]] = {}
+    for case_id, case in corpus["cases"].items():
+        origin = case["provenance"]
+        if origin["pr"] is not None and origin["round"] is not None:
+            rounds.setdefault((origin["pr"], origin["round"]), []).append(cases[case_id].cutoff)
+    later = []  # (owner, the earliest it can exist, form, record, binding line)
+    for case_id, case in sorted(corpus["cases"].items()):
+        cutoff, pr = cases[case_id].cutoff, case["provenance"]["pr"]
+        bounds = [cutoff]
+        for _, defect in sorted(case["defects"].items()):
+            found = defect["discovery"]["round"]
+            bounds.append(max([cutoff, *rounds.get((pr, found), [])]))
+        for (form, record), bound in zip(retained_records(case), bounds, strict=True):
+            if record["status"] == "captured":
+                line, _ = record_binding(record["text"], form)
+                later.append((case_id, bound, form, record, line))
+    for case_id, case in sorted(corpus["cases"].items()):
+        cutoff = cases[case_id].cutoff
+        held = [
+            entry
+            for entry in later
+            if entry[0] != case_id
+            and (entry[1] >= cutoff or names_commit(entry[4], case["withheld"]))
+        ]
+        if not held:
+            continue
+        visible = Visible.of(list(reviewer_text(case)))
+        for _, _, form, record, line in held:
+            require(
+                not exposes(visible, record, line),
+                f"a later case's {form.kind} record is not the reviewer's context",
             )
 
 
@@ -1199,6 +1563,7 @@ def check_corpus(corpus) -> Corpus:
         require(case["review"]["base_ref"] in refs, "a case's base ref is frozen")
     check_defects(corpus)
     check_records(corpus)
+    check_later_records(corpus, cases)
     check_clusters(corpus, cases)
     inputs = [case.input for case in cases.values()]
     require(len(set(inputs)) == len(inputs), "two cases with one review input")
@@ -1588,6 +1953,10 @@ def verify_case(git: Git, case, repository) -> list[str]:
         fix, merged = defect["discovery"]["fix"], defect["discovery"]["merged"]
         if fix is not None and merged is None:
             check(git.is_ancestor(introduced, fix), f"defect {key} fix follows its introduction")
+            if source == "squash":
+                # The candidate is what landed, so a fix or revert of what it
+                # merged descends from it, as the merge record evidences it.
+                check(git.is_ancestor(head, fix), f"defect {key} fix follows its merge")
         elif fix is not None:
             # Squashed: the merged revision, which the lineage record states,
             # is consistent with git when it is one commit of the base line
@@ -1766,12 +2135,15 @@ def check_run(run, *, corpus: Corpus, pins: dict, plan, frozen: date, barred) ->
         ids.add(finding["id"])
         require(finding["classification"] in CLASSIFICATIONS, "finding classification")
         require(nonempty(finding["title"]) and nonempty(finding["location"]), "finding text")
+        # A verdict on a finding of a run of the candidate cannot precede the
+        # candidate as it was reviewed, any more than a verdict on its defects.
         check_labels(
             finding["labels"],
             MATCH_VERDICTS,
             frozen=frozen,
             barred=barred | case.actors,
             match=case.defects,
+            since=case.cutoff.date(),
         )
         findings.append(finding_verdict(finding, case))
     return Run(run["variant"], case, run["seed"], status, run["cost_microusd"], tuple(findings))

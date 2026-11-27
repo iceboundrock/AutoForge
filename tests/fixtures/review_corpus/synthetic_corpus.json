@@ -129,8 +129,8 @@
             "lineage": {
               "status": "captured",
               "source": "document/synthetic/lineage/alpha-defect-d1.md",
-              "text": "lineage-record: {\"defect\": \"d1\", \"pr\": null, \"introduced\": \"5a73afb9449777adb9bece8d94ec4639cffddaca\", \"paths\": [\"src/alpha.py\"], \"found\": \"review\", \"merged\": null, \"fix\": \"cef08c729419cecdc8385d9c3f8f542c2a924d4e\"}\nSynthetic lineage of alpha-defect/d1: its fix, retained apart from the corpus.",
-              "sha256": "818c00b4913b78c1d3fd9a9cbb226e7b4ca885169f57c5e8e01a313e531d4444"
+              "text": "lineage-record: {\"defect\": \"d1\", \"pr\": null, \"introduced\": \"5a73afb9449777adb9bece8d94ec4639cffddaca\", \"paths\": [\"src/alpha.py\"], \"summary\": \"The writer keeps a stale lock after a crash.\", \"round\": 1, \"finding\": \"R1-F1\", \"found\": \"review\", \"merged\": null, \"fix\": \"cef08c729419cecdc8385d9c3f8f542c2a924d4e\"}\nSynthetic lineage of alpha-defect/d1: its fix, retained apart from the corpus.",
+              "sha256": "79244afdadfffddb08082262a6e626b1a2bce2fd8f245a9b186b6c5108d09333"
             }
           },
           "labels": [
@@ -174,8 +174,8 @@
             "lineage": {
               "status": "captured",
               "source": "document/synthetic/lineage/alpha-defect-d2.md",
-              "text": "lineage-record: {\"defect\": \"d2\", \"pr\": null, \"introduced\": \"5a73afb9449777adb9bece8d94ec4639cffddaca\", \"paths\": [\"src/alpha.py\"], \"found\": \"review\", \"merged\": null, \"fix\": \"f6717d15bff3e9275193a5903e2302d08f0239c7\"}\nSynthetic lineage of alpha-defect/d2: its fix, retained apart from the corpus.",
-              "sha256": "d6f9e1436482f204702aecd95a7728276339376dd5f459bc1a9e609294cc1439"
+              "text": "lineage-record: {\"defect\": \"d2\", \"pr\": null, \"introduced\": \"5a73afb9449777adb9bece8d94ec4639cffddaca\", \"paths\": [\"src/alpha.py\"], \"summary\": \"Two writers can hold the lock at once.\", \"round\": 2, \"finding\": \"R2-F1\", \"found\": \"review\", \"merged\": null, \"fix\": \"f6717d15bff3e9275193a5903e2302d08f0239c7\"}\nSynthetic lineage of alpha-defect/d2: its fix, retained apart from the corpus.",
+              "sha256": "922ceb0d12d4f5c8ff7dabac501143a4dd36c2447e78b775f5e5320bb3e148e6"
             }
           },
           "labels": [
@@ -427,8 +427,8 @@
             "lineage": {
               "status": "captured",
               "source": "document/synthetic/lineage/beta-escape-d1.md",
-              "text": "lineage-record: {\"defect\": \"d1\", \"pr\": null, \"introduced\": \"dfc15e8fbd6ff870fe37c7311acab43e4d31d7fb\", \"paths\": [\"src/beta.py\"], \"found\": \"post_merge\", \"merged\": null, \"fix\": \"5a68eb368c71f2d19379dff55a5c403824a54612\"}\nSynthetic lineage of beta-escape/d1: its fix, retained apart from the corpus.",
-              "sha256": "92498ef0172e7e85977c0e16dc4298a61a6ab7361d38f8c1491c5333e83d97d9"
+              "text": "lineage-record: {\"defect\": \"d1\", \"pr\": null, \"introduced\": \"dfc15e8fbd6ff870fe37c7311acab43e4d31d7fb\", \"paths\": [\"src/beta.py\"], \"summary\": \"A certificate of another head authorizes the merge.\", \"round\": null, \"finding\": null, \"found\": \"post_merge\", \"merged\": null, \"fix\": \"5a68eb368c71f2d19379dff55a5c403824a54612\"}\nSynthetic lineage of beta-escape/d1: its fix, retained apart from the corpus.",
+              "sha256": "08a37eb8e0fdfab5d86a1c3e1d0e2760a220f34bdda5d461530ff2536edf6158"
             }
           },
           "labels": [
@@ -674,8 +674,8 @@
             "lineage": {
               "status": "captured",
               "source": "document/synthetic/lineage/gamma-revert-d1.md",
-              "text": "lineage-record: {\"defect\": \"d1\", \"pr\": null, \"introduced\": \"8c3fb2c2584573e3f2cc47bb68fb5af847a482de\", \"paths\": [\"src/gamma.py\"], \"found\": \"revert\", \"merged\": null, \"fix\": \"7eb7352db2d1fbe9b37f4ee26611d8af50256d63\"}\nSynthetic lineage of gamma-revert/d1: its fix, retained apart from the corpus.",
-              "sha256": "3bb856bbc8922ef03877292ed008b03955f3743881f1b7b54f7b82493f9bf6e4"
+              "text": "lineage-record: {\"defect\": \"d1\", \"pr\": null, \"introduced\": \"8c3fb2c2584573e3f2cc47bb68fb5af847a482de\", \"paths\": [\"src/gamma.py\"], \"summary\": \"The last page is dropped.\", \"round\": null, \"finding\": null, \"found\": \"revert\", \"merged\": null, \"fix\": \"7eb7352db2d1fbe9b37f4ee26611d8af50256d63\"}\nSynthetic lineage of gamma-revert/d1: its fix, retained apart from the corpus.",
+              "sha256": "2637a64e999ce710142d24d27b7f649ad4983af73783bc21e009c759647036f5"
             }
           },
           "labels": [

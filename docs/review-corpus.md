@@ -52,17 +52,19 @@ repository's objects can rebuild exactly what the reviewer was given:
   case's own PR, or a document), held as its text and SHA-256 or as `not_captured`, and never part
   of the reviewer's input (section 2): a `pr_branch` case's **review record** of its historical
   round; a `squash` case's **merge record**, naming the commit its PR merged as; and, in each
-  defect's discovery that names a fix or revert, its **lineage record**, naming the defect, how it
-  was found, that fix and the squash the defect escaped through, if any. Each record is one case's
-  or one defect's: no source holds two records, no record is held under two sources, and no review
-  or merge record serves two cases, nor a lineage record two defects.
+  defect's discovery that names a fix or revert, its **lineage record**, naming the defect (its
+  id, and the summary, round and finding that tell it from another), how it was found, that fix
+  and the squash the defect escaped through, if any. Each record is one case's or one defect's: no
+  source holds two records, no record is held under two sources, and no review or merge record
+  serves two cases, nor a lineage record two defects.
 - **Defects** of a defect case, each located in at least one file, by its lines or as the whole
   file, or the **negative** record of a negative case (sections 3 and 4). A defect's id is its
   identity across the corpus: one defect may be registered at several heads of its PR under one
   id (its lines and its `same_review` or `later_review` source being each head's own), and
-  registrations one lineage record would serve (one id, PR, introduction, set of paths, way of
-  being found, merge and fix) must be one defect, of one severity, class and summary, found by one
-  round's finding on one day. Another defect under that id is refused.
+  registrations of one id along one lineage (one PR, introduction, set of paths, way of being
+  found, merge and fix) must be one defect, of one severity, class and summary, found by one
+  round's finding on one day. Another defect under that id is refused, with a lineage record of its
+  own or without one.
 - **Withheld commits:** commits that would reveal an answer (the fixes, later rounds, the later
   merge). They are never part of the reviewer's input.
 - **Actors:** who produced, reviewed, fixed or merged the candidate. None may adjudicate it.
@@ -115,9 +117,12 @@ from what was learned afterwards. These rules hold that line; each is enforced w
   In a historical corpus every defect found after its merge (`post_merge` or `revert`) must also
   name the commit that fixed or reverted it and hold that commit's lineage record: a review's
   defect is found by a round, but an escape or a revert has no round to evidence it, only that
-  commit, and its lineage record states how the defect was found. So a case claiming a revert, or
-  an escape, without one stays representable and unplanned, and adds nothing to revert or escape
-  recall. Reviewing
+  commit, and its lineage record states how the defect was found. It must also have escaped
+  through a revision that landed: the candidate itself when it is a `squash` case (its merge
+  record evidences that it landed), otherwise the merged revision its lineage record binds. A
+  revert of a branch commit before its PR merged reverts nothing that landed, however truly its
+  record states it. So a case claiming a revert, or an escape, without all of this stays
+  representable and unplanned, and adds nothing to revert or escape recall. Reviewing
   a case without its issue or with part of its discussion would be a different task, and scoring
   one whose boundary, base, PR or lineage only git's timestamps and subjects suggest would rest its
   labels on a guess, so the scorer refuses a plan naming any other case.
@@ -144,7 +149,8 @@ from what was learned afterwards. These rules hold that line; each is enforced w
   the merge base. Which later commit fixed or reverted it, and, when it escaped a PR branch through
   a squash, which revision **merged** it, is what its lineage record states. `verify` checks that
   lineage against git for consistency, never as proof: the fix descends from the introducing
-  commit, or from the merged revision, and **addresses** the defect: the fix commit itself changes a
+  commit, or from the merged revision, and in a `squash` case from the squash itself, and
+  **addresses** the defect: the fix commit itself changes a
   file the defect is located in, and for a place located by its lines, changes one of those lines
   or inserts among or beside them, as they stand, exactly once, at the fix's parent. A descendant
   that changed something else fixes nothing, however late. The merged revision is one commit (one
@@ -211,19 +217,24 @@ The other two records follow the same rules, each with its own binding statement
 
 ```text
 merge-record: {"pr": 540, "issue": 329, "base_ref": "main", "merged": "<40 hex>"}
-lineage-record: {"defect": "r1-f1-reply-text", "pr": 539, "introduced": "<40 hex>", "paths": ["src/autoforge/doctor.py"], "found": "review", "merged": null, "fix": "<40 hex>"}
+lineage-record: {"defect": "r1-f1-reply-text", "pr": 539, "introduced": "<40 hex>", "paths": ["src/autoforge/doctor.py"], "summary": "<the defect's summary>", "round": 1, "finding": "R1-F1", "found": "review", "merged": null, "fix": "<40 hex>"}
 ```
 
 A `squash` case's merge record names its PR, its issue (`null` when its provenance names none, so
 the absence is stated, not assumed), its base ref and its head as the commit the PR merged as, and
 states no start (`started` is `null`). A defect's lineage record names the defect's id, the case's
 PR (`null` when its provenance names none), the defect's introducing commit, the paths it is
-located in, sorted and each once, how it was found (`review` for a `same_review` or `later_review`
+located in, sorted and each once, the defect's summary, the round and finding that reported it
+(each `null` when none did), how it was found (`review` for a `same_review` or `later_review`
 discovery, else `post_merge` or `revert`), its merged revision or `null`, and its fix or revert; a
 defect that names no fix holds none. The id is what tells apart defects that share a PR, an
 introduction, a file and a fix (round 1's R1-F2, R1-F3 and R1-F4 of #459's branch in the seed, say),
-which would otherwise share one binding, while one defect registered at several heads of its PR
-holds the same record at each. A record of either kind that names anything else is refused.
+which would otherwise share one binding. The finding and the summary are what the record says the
+defect is, so no other finding or defect can take a registration's place under its id and
+unchanged record (round 1's R1-F2, its summary and span, in R1-F1's place, say); two defects of one
+finding (#539's round 2 R2-F1 in the seed) are told apart by their ids and summaries. Lines are not
+bound, so one defect registered at several heads of its PR, its lines each head's own, holds the
+same record at each. A record of either kind that names anything else is refused.
 
 No retained record is ever part of the reviewer's input, since each holds what the reviewer must
 not be given: the round's own result, the merge, the fix. Not under its own source, and not in any
@@ -231,10 +242,29 @@ value the reviewer is given (each context item's id, kind, source, reference and
 environment's paths and validation commands, and the base ref): none of them may be the record (its
 digest), carry its binding statement, or hold, between them, every other line of its text,
 wherever each line stands. Each is compared by its letters and digits alone, without case, after
-decoding HTML entities and compatibility forms, so a copy that only presents the record otherwise
-(each line as a Markdown block quote, a list item or a table cell, emphasised or in a code span,
-reflowed or joined into one line, its spacing or punctuation changed) is refused as the record
-itself. A paraphrase or a part of a record cannot be told offline. What the format cannot check offline either is that a record is what its
+decoding HTML entities and compatibility forms, both as written and as a Markdown renderer shows
+it. The rendered form drops what adds letters no reader of it sees: a link's or image's
+destination and title, a defined reference's label and its definition, a defined footnote's
+marker, raw HTML tags and comments, and a code fence's info string, while code spans and fenced
+code read as written and a definition never interrupts a paragraph, as in CommonMark. So a copy
+that only presents the record otherwise (each line as a Markdown block quote, a list item or a
+table cell, emphasised, linked or in a code span, reflowed or joined into one line, its spacing or
+punctuation changed) is refused as the record itself. The rendered form is a model of CommonMark,
+not a renderer: markup it does not model reads as written, and a value whose link destinations
+would have it read more than four times the value's length (plus 4096 characters) is refused
+rather than read on.
+
+The same holds across cases for every record that is demonstrably later than a case's cutoff,
+whichever case retains it. A record cannot exist before what it records: a review record before
+its round read its input, a merge record before its merge, a lineage record before the round that
+found its defect (no earlier than the cutoff of any case of that round of the PR) or before its
+fix, which each case registering the defect withholds, and no record before a commit its binding
+names. A record of another case whose own cutoff, or whose finding round's, is no earlier than a
+case's cutoff, or whose binding names a commit the case withholds (which `verify` holds to after
+the cutoff), was never what that case's reviewer read, and the case's input may not hold it. An
+earlier record may have been: a later round's reviewer can read an earlier round's review, which
+stays admitted. A paraphrase, a look-alike character from another script or a part of a record
+cannot be told offline. What the format cannot check offline either is that a record is what its
 source holds; capturing records is #592's.
 
 What a future runner must still provide, and nothing here implements: a disposable repository whose
@@ -254,8 +284,9 @@ once, no actor of the case may label it, and no label is decided after the corpu
 reviewer variant may label any record of the corpus, in any role: the corpus is checked before
 its variants are known, so the scorer refuses submissions with a variant whose identity labeled a
 defect or a negative of any case, planned or not. An identity is a string, not an authentication,
-as in REV-R0. No label of a case's defect or negative is decided before the day of the case's
-cutoff: a verdict on a candidate cannot precede the candidate as it was reviewed.
+as in REV-R0. No label of a case's defect or negative, and no label matching a finding of a run
+of it, is decided before the day of the case's cutoff: a verdict on a candidate, or on a finding
+about it, cannot precede the candidate as it was reviewed.
 
 A finding is matched against the case's registered defects by adjudicators who are neither a
 reviewer variant nor an actor of the case: `match` to one defect, `false`, or `unknown`, two
@@ -503,21 +534,39 @@ cap and the plan within its limits, computing each run's observations once and i
 once.
 They refuse a review record's answer, without its binding, in one reference as a Markdown block
 quote, nested in a quote, as an emphasised list, as a table row, reflowed into one line or broken
-elsewhere, in code spans with its punctuation changed, and escaped as HTML entities or in
-full-width forms, and a line of it quoted in each of two references. They refuse a round or a
+elsewhere, in code spans with its punctuation changed, escaped as HTML entities or in full-width
+forms, and with its file made a Markdown link (inline, titled, in angle brackets, with nested
+parentheses, an image, a reference link and its definition), an HTML link, a tag whose attribute
+holds a `>`, a footnote's marker or an HTML comment inside the line, and a line of it quoted in
+each of two references; each in a reference as a document's text alike. They check what the
+rendered form drops and keeps on CommonMark's own cases (code spans and fences as written, no link
+inside a link, an undefined reference and a definition inside a paragraph as text), admit a PR
+body that links its file and holds no record, and refuse a value whose link destinations would be
+read past the bound. They admit round 2's input holding round 1's review, published before round 2
+read it, and refuse round 1's input holding round 2's review record, whole as a document or its
+answer alone in a reference, and round 2's holding the answer of round 1's lineage record, whose
+fix round 2 withholds. They refuse a round or a
 squash given issue 99's context, issue item and inventory entry under its unchanged review or merge
 record, and a squash of no issue under a record naming one, or the reverse. They refuse a second
 finding of a round, at another span of the same file with the same introduction and fix, under the
 first finding's lineage record or under its source, and score it, the confirmed weight going from
-one to two, only with a record of its own; let one defect registered at two heads of its PR share
-one lineage record, its lines differing, and refuse another finding, summary, severity or discovery
-day under its id; and show that the seed's three defects of #459's one FIX are bound apart only by
-their ids. They count a revert of the squash on main for revert recall only under the revert's own
-lineage record, leave unplanned a revert claimed without any revert or without its record and an
-escape without its fix's record, and refuse a review's FIX claimed as a revert under its own
-record. They refuse a clean pass dated five days before the squash it judges, under a window long
-enough to settle it, which settles once dated on the squash's day, and a defect label dated before
-its case's cutoff. They refuse an existing, unrelated file declared as the whole environment and
+one to two, only with a record of its own; refuse round 1's R1-F2, its summary and its span in
+the same file, in R1-F1's place under R1-F1's unchanged record, as they refuse either the finding
+or the summary alone replaced, while R1-F1's lines moved within its file still score under it;
+let one defect registered at two heads of its PR share one lineage record, its lines differing,
+and refuse another finding, summary, severity or discovery day under its id, with a record of its
+own or without; and show that the seed's three defects of #459's one FIX share everything a
+lineage binds but their ids, findings and summaries, and #539's two defects of round 2's R2-F1
+are told apart by their ids and summaries. They count a revert of the squash on main for revert
+recall only under the revert's own lineage record, leave unplanned a revert claimed without any
+revert or without its record, a revert made on the branch before its squash landed, under a record
+that states it truly, and an escape without its fix's record, count a squash candidate's own
+revert on main, and refuse the branch's earlier revert named as the squash's, which follows neither
+the squash nor its cutoff, and a review's FIX claimed as a revert under its own record. They
+refuse a clean pass dated five days before the squash it judges, under a window long enough to
+settle it, which settles once dated on the squash's day, a defect label dated before its case's
+cutoff, and a finding judged false five days before the squash its run reviewed, which once dated
+on the squash's day is the settled negative's false alarm. They refuse an existing, unrelated file declared as the whole environment and
 pinned truly at every head, the real environment files present but unpinned, as well as the
 registered files validated otherwise or one of them left out, and the seed declaring another
 environment; a repository nobody registered runs nothing, and a registered file absent at every
@@ -546,5 +595,5 @@ either was merged; no run preceded any amendment.
 Fixture SHA-256:
 
 - `autoforge_seed.json`: `47ae2f21d33a42f6d0cb7bdea8e6823ca638695d66714edf16d7d0fbfcbac4d0`
-- `synthetic_corpus.json`: `227a64b15790899a5535e3c87a73c3c617674bc2e5fd29e02dc11bf9bc976e0c`
-- `synthetic_submissions.json`: `69c776b0fa7c6110c3c3825f1bccdd470288bd0772249a8cfbd9e0c5e5b08f3b`
+- `synthetic_corpus.json`: `dae6af40dfbf04060fd0300be5ea540eb2963b2e1d2f69aa5d429964d95ebe64`
+- `synthetic_submissions.json`: `5cc7bdfbf7d293d982b8e0e4a1c57a5446bccb1dc430d3c206a751f6b937ce30`
