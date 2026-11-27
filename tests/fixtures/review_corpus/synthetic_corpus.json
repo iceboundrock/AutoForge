@@ -10,7 +10,11 @@
     "root": "3615886fe2041359f9b62b592b3fce6ed505327b",
     "refs": {
       "main": "31284817382850100a0450693dc8b05357641cd2"
-    }
+    },
+    "environment": [
+      "pyproject.toml",
+      "uv.lock"
+    ]
   },
   "cases": {
     "alpha-defect": {

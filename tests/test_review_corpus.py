@@ -14,6 +14,10 @@ import pytest
 from autoforge.git_transport import NO_AUTO_MAINTENANCE
 from tests.review_corpus import (
     BOOTSTRAP_DRAWS,
+    BOOTSTRAP_TABLES,
+    MAX_FILE_BYTES,
+    MAX_PLANNED_PAIRS,
+    MAX_VARIANTS,
     SEED,
     SYNTHETIC_CORPUS,
     SYNTHETIC_SUBMISSIONS,
@@ -25,6 +29,7 @@ from tests.review_corpus import (
     input_digest,
     main,
     multiplicities,
+    pins_digest,
     read_json,
     score,
     verify,
@@ -43,12 +48,19 @@ def subs():
     return json.loads(SYNTHETIC_SUBMISSIONS.read_bytes())
 
 
+def repin(subs):
+    """Record every run as launched under its variant's pins as they now stand."""
+    for run in subs["runs"]:
+        run["pins_sha256"] = pins_digest(subs["variants"][run["variant"]])
+    return subs
+
+
 def rebind(corpus, subs):
-    """Point the submissions at the corpus as mutated, inputs included."""
+    """Point the submissions at the corpus as mutated, inputs and pins included."""
     subs["corpus"] = corpus_digest(corpus)
     for run in subs["runs"]:
         run["input"] = input_digest(corpus["cases"][run["case"]])
-    return subs
+    return repin(subs)
 
 
 def scored(corpus, subs):
@@ -702,6 +714,7 @@ def test_a_seed_inventory_declared_complete_runs_nothing_uncaptured():
         (lambda c: c["defects"]["d2"]["discovery"].update(round=1), "discovery round"),
         (lambda c: c["defects"]["d1"]["location"][0].update(path="../x"), "repository path"),
         (lambda c: c["defects"]["d1"]["location"][0].update(lines=[3, 2]), "defect lines"),
+        (lambda c: c["defects"]["d1"].update(location=[]), "defect location"),
         (lambda c: c["review"].update(cutoff="2026-05-01 12:00:00"), "instant shape"),
         (lambda c: c.update(stratum="escape"), "a defect of the case's stratum"),
         (lambda c: c.update(defects={}), "a defect case registers its defects"),
@@ -725,6 +738,61 @@ def test_a_run_must_review_the_frozen_input(corpus, subs):
         score(corpus, subs)
 
 
+@pytest.mark.parametrize(
+    ("change", "rule"),
+    [
+        # A pin left out, every pin left out, or a file the repository does
+        # not declare.
+        (
+            lambda r, c: c["environment"]["files"].pop("uv.lock"),
+            "a case pins each of the repository's environment files",
+        ),
+        (
+            lambda r, c: c["environment"].update(files={}),
+            "a case pins each of the repository's environment files",
+        ),
+        (
+            lambda r, c: c["environment"]["files"].update({"Makefile": "1" * 40}),
+            "a case pins each of the repository's environment files",
+        ),
+        (lambda r, c: c["environment"]["files"].update({"uv.lock": "soon"}), "object id shape"),
+        # No command to validate with.
+        (lambda r, c: c["environment"].update(validation=[]), "environment validation"),
+        (lambda r, c: c["environment"].update(validation=[" "]), "environment validation"),
+        # The repository's declaration itself.
+        (lambda r, c: r.update(environment=[]), "repository environment"),
+        (
+            lambda r, c: r.update(environment=["uv.lock", "uv.lock"]),
+            "repository environment file repeated",
+        ),
+        (lambda r, c: r.update(environment=["../uv.lock"]), "repository path"),
+        (lambda r, c: r.pop("environment"), "fields: slug root refs environment"),
+    ],
+)
+def test_a_case_pins_its_test_environment(corpus, change, rule):
+    change(corpus["repository"], corpus["cases"]["alpha-defect"])
+    with pytest.raises(CorpusError, match=rule):
+        check_corpus(corpus)
+
+
+def test_a_run_is_credited_only_to_the_pins_it_was_launched_with(corpus, subs):
+    variant = subs["variants"]["variant-a"]
+    variant["model"] = "synthetic-model-c"
+    variant["prompt"]["sha256"] = "0" * 64
+    # Every run left as recorded, under the earlier model and prompt.
+    with pytest.raises(CorpusError, match="a run was launched with its variant's pins"):
+        score(corpus, subs)
+    # Recorded under the new pins they score, and the card names those pins.
+    report = score(corpus, repin(subs))
+    assert report["variants"]["variant-a"]["pins_sha256"] == pins_digest(variant)
+    # A run of one variant never carries another's pins.
+    run_of(subs, "variant-a", "alpha-defect")["pins_sha256"] = pins_digest(
+        subs["variants"]["baseline"]
+    )
+    with pytest.raises(CorpusError, match="a run was launched with its variant's pins"):
+        score(corpus, subs)
+
+
 def test_the_input_holds_no_answer(corpus):
     case = corpus["cases"]["alpha-defect"]
     before = input_digest(case)
@@ -736,7 +804,7 @@ def test_the_input_holds_no_answer(corpus):
 
 def exposed(corpus, subs, knowledge_cutoff):
     subs["variants"]["baseline"]["knowledge_cutoff"] = knowledge_cutoff
-    exposure = score(corpus, subs)["variants"]["baseline"]["training_exposure"]
+    exposure = score(corpus, repin(subs))["variants"]["baseline"]["training_exposure"]
     return exposure["none"], exposure["possible"], exposure["unknown"]
 
 
@@ -887,6 +955,49 @@ def test_submissions_are_refused(corpus, subs, change, rule):
         score(corpus, subs)
 
 
+def test_planned_work_beyond_its_limits_is_refused_before_it_expands(
+    corpus, subs, tmp_path, monkeypatch
+):
+    checked = check_corpus(corpus)
+    base = deepcopy(subs)
+    # Six cases and a million seeds, no runs: under the file-size cap, and six
+    # million planned pairs if expanded.
+    subs["plan"]["seeds"] = list(range(1, 1_000_001))
+    subs["runs"] = []
+    body = json.dumps(subs, separators=(",", ":"))
+    assert len(body.encode()) < MAX_FILE_BYTES
+    path = tmp_path / "subs.json"
+    path.write_text(body)
+    with pytest.raises(SystemExit, match="2"):
+        main(["score", str(SYNTHETIC_CORPUS), str(path)])
+    with pytest.raises(CorpusError, match="the planned work is within its limits"):
+        check_submissions(checked, subs)
+    # The pair limit is the product of cases and seeds.
+    subs["plan"]["seeds"] = list(range(1, MAX_PLANNED_PAIRS // 6 + 1))
+    check_submissions(checked, subs)
+    subs["plan"]["seeds"].append(MAX_PLANNED_PAIRS)
+    with pytest.raises(CorpusError, match="the planned work is within its limits"):
+        check_submissions(checked, subs)
+    # Every variant is scored over the whole plan.
+    subs = deepcopy(base)
+    for n in range(MAX_VARIANTS - 2):
+        subs["variants"][f"extra-{n}"] = dict(
+            deepcopy(subs["variants"]["variant-a"]), identity=f"reviewer-extra-{n}"
+        )
+    check_submissions(checked, subs)
+    subs["variants"]["one-more"] = dict(
+        deepcopy(subs["variants"]["variant-a"]), identity="reviewer-one-more"
+    )
+    with pytest.raises(CorpusError, match="the planned work is within its limits"):
+        check_submissions(checked, subs)
+    # The bootstrap's tables grow with the planned clusters, and so many of
+    # them are kept at once.
+    assert multiplicities.cache_info().maxsize == BOOTSTRAP_TABLES
+    monkeypatch.setattr("tests.review_corpus.MAX_PLANNED_CLUSTERS", 2)
+    with pytest.raises(CorpusError, match="the planned work is within its limits"):
+        check_submissions(checked, deepcopy(base))
+
+
 def test_the_corpus_digest_ignores_layout_but_not_content(corpus):
     assert corpus_digest(json.loads(json.dumps(corpus, indent=None))) == corpus_digest(corpus)
     corpus["frozen"] = "2026-06-29"
@@ -1022,14 +1133,16 @@ class Repo:
         )
         return done.stdout.decode().strip()
 
-    def commit(self, files: dict[str, bytes], parents: list[str], when: str) -> str:
+    def commit(
+        self, files: dict[str, bytes], parents: list[str], when: str, message: str = "commit"
+    ) -> str:
         self.git("read-tree", "--empty")
         for path, body in files.items():
             blob = self.git("hash-object", "-w", "--stdin", input=body)
             self.git("update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
         tree = self.git("write-tree")
         parent_args = [arg for parent in parents for arg in ("-p", parent)]
-        return self.git("commit-tree", tree, *parent_args, "-m", "commit", when=when)
+        return self.git("commit-tree", tree, *parent_args, "-m", message, when=when)
 
 
 def unrecorded():
@@ -1047,7 +1160,9 @@ def history(tmp_path):
     fixed = repo.commit({**env, "src/a.py": code + b"fixed\n"}, [head], "2026-01-05T00:00:00Z")
     # main: root, base, the branch's squash, then a fix of the squash; off it,
     # a commit on base that the squash never reached.
-    squash = repo.commit({**env, "src/a.py": code + b"fixed\n"}, [base], "2026-01-06T00:00:00Z")
+    squash = repo.commit(
+        {**env, "src/a.py": code + b"fixed\n"}, [base], "2026-01-06T00:00:00Z", "Add a.py (#2)"
+    )
     after = repo.commit(
         {**env, "src/a.py": b"LINE 1\n" + code[7:]}, [squash], "2026-01-07T00:00:00Z"
     )
@@ -1139,7 +1254,12 @@ def historical(repo: Repo, ids) -> dict:
         "name": "test",
         "release": 1,
         "frozen": "2026-02-01",
-        "repository": {"slug": "example/test", "root": ids["root"], "refs": {"main": ids["after"]}},
+        "repository": {
+            "slug": "example/test",
+            "root": ids["root"],
+            "refs": {"main": ids["after"]},
+            "environment": ["pyproject.toml", "uv.lock"],
+        },
         "cases": {
             "round1": case(
                 "reviewed_defect",
@@ -1234,6 +1354,42 @@ def test_verify_refuses_an_ancestor_that_is_not_the_merge_base(history):
     assert failed == ["the merge base is the base revision's and head's"]
 
 
+def test_two_base_revisions_cannot_both_verify_on_a_line_out_of_date_order(tmp_path):
+    repo = Repo(tmp_path / "repo")
+    env = {"pyproject.toml": b"[project]\n", "uv.lock": b"version = 1\n"}
+    code = b"".join(b"line %d\n" % n for n in range(1, 6))
+    root = repo.commit({"README.md": b"root\n"}, [], "2026-01-01T00:00:00Z")
+    early = repo.commit({**env, "README.md": b"early\n"}, [root], "2026-01-02T00:00:00Z")
+    late = repo.commit({**env, "README.md": b"late\n"}, [early], "2026-01-05T00:00:00Z")
+    # Committed on top of ``late`` and dated before it, as a rebase or a skewed
+    # clock can: by committer time ``early`` and ``back`` were each the tip at
+    # the cutoff, the commit after each dated after it.
+    back = repo.commit({**env, "README.md": b"back\n"}, [late], "2026-01-02T12:00:00Z")
+    tip = repo.commit({**env, "README.md": b"tip\n"}, [back], "2026-01-06T00:00:00Z")
+    head = repo.commit(
+        {**env, "README.md": b"back\n", "src/a.py": code}, [back], "2026-01-03T00:00:00Z"
+    )
+    fixed = repo.commit(
+        {**env, "README.md": b"back\n", "src/a.py": code + b"fixed\n"},
+        [head],
+        "2026-01-05T00:00:00Z",
+    )
+    ids = {"root": root, "head": head, "fix": fixed, "squash": tip, "after": tip, "other": tip}
+    failed = {}
+    for base in (early, back):
+        corpus = historical(repo, ids | {"base": base})
+        del corpus["cases"]["merged"]
+        check_corpus(corpus)
+        failed[base] = verify(corpus, repo.path)["cases"]["round1"]["failed"]
+    # Two bindings of one head and cutoff, two merge bases and so two diffs:
+    # git cannot tell which the review read, so neither verifies.
+    assert repo.git("merge-base", early, head) != repo.git("merge-base", back, head)
+    assert failed == {
+        early: ["the base ref's line splits at the cutoff"],
+        back: ["the base ref's line splits at the cutoff"],
+    }
+
+
 def test_verify_refuses_a_cutoff_after_the_head_and_the_context_it_admits(history):
     repo, ids = history
     corpus = historical(repo, ids)
@@ -1268,24 +1424,78 @@ def test_verify_holds_a_squash_case_to_its_merge_time(history):
     assert failed == ["the cutoff is the head's committer time"]
 
 
+def test_verify_holds_each_environment_pin_to_the_head(history, subs):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    # A declared file the head does not have is pinned as absent, not left out.
+    corpus["repository"]["environment"].append("requirements.txt")
+    for case in corpus["cases"].values():
+        case["environment"]["files"]["requirements.txt"] = None
+    assert verify(corpus, repo.path)["ok"]
+    assert score(corpus, recorded(corpus, subs, ["round1"]), repo.path)["verified"]["ok"]
+    # A file the head has, pinned as absent, verifies nothing and scores nothing.
+    files = corpus["cases"]["round1"]["environment"]["files"]
+    lock = files["uv.lock"]
+    files["uv.lock"] = None
+    failed = verify(corpus, repo.path)["cases"]["round1"]["failed"]
+    assert failed == ["environment file 2 is absent at the head"]
+    with pytest.raises(CorpusError, match="a recorded score verifies its corpus"):
+        score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+    # Nor does a file it has not, pinned as a blob.
+    files.update({"uv.lock": lock, "requirements.txt": lock})
+    assert verify(corpus, repo.path)["cases"]["round1"]["failed"] == ["environment file 1"]
+    # Every pin removed: the corpus check refuses it before git is read.
+    corpus["cases"]["round1"]["environment"] = {"files": {}, "validation": []}
+    with pytest.raises(CorpusError, match="environment validation"):
+        score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+    corpus["cases"]["round1"]["environment"]["validation"] = ["make check"]
+    with pytest.raises(CorpusError, match="a case pins each of the repository's environment"):
+        score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+
+
+def test_a_recorded_run_is_bound_to_its_variants_pins(history, subs):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    recorded(corpus, subs, ["round1"])
+    assert score(corpus, subs, repo.path)["verified"]["ok"]
+    # The baseline relabeled as another model at another effort, its runs
+    # left as they were recorded: they are stale evidence for it.
+    subs["variants"]["baseline"].update(model="another-model", effort="low")
+    with pytest.raises(CorpusError, match="a run was launched with its variant's pins"):
+        score(corpus, subs, repo.path)
+
+
 # -- the review-time boundary of a review round --------------------------------
 
 
-def record(case, started, text=None):
-    """The round's review record, retained apart from the corpus, as the cutoff."""
+def binding(case, started, **change):
+    """The binding statement of ``case``'s review record, as one line of its text."""
     review = case["review"]
+    statement = {
+        "pr": case["provenance"]["pr"],
+        "round": case["provenance"]["round"],
+        "base_ref": review["base_ref"],
+        "head": review["head"],
+        "merge_base": review["merge_base"],
+        "input_read": started,
+    } | change
+    return "review-record: " + json.dumps(statement)
+
+
+def record(case, started, text=None, source="pr/2/comment/review-1"):
+    """The round's review record, retained apart from the corpus, as the cutoff."""
     text = text or (
-        f"Reviewed HEAD {review['head']} against main (merge base {review['merge_base']});"
-        f" input read at {started}.\nR1-F1: src/a.py lines 2 to 5 are never fixed."
+        f"{binding(case, started)}\n# Review, round 1\n"
+        "R1-F1: src/a.py lines 2 to 5 are never fixed."
     )
     case["record"] = {
         "status": "captured",
-        "source": "pr/2/comment/review-1",
+        "source": source,
         "started": started,
         "text": text,
         "sha256": sha256(text.encode()).hexdigest(),
     }
-    review["cutoff"] = started
+    case["review"]["cutoff"] = started
 
 
 def reviewed(repo, ids, started="2026-01-03T02:00:00Z"):
@@ -1352,11 +1562,11 @@ def test_a_review_record_admits_a_pr_body_opened_after_the_head(history):
                 c["record"].update(started="2026-01-03T03:00:00Z"),
                 c["review"].update(cutoff="2026-01-03T03:00:00Z"),
             ),
-            "the review record states its head, merge base and start",
+            "the review record's binding states its start",
         ),
         (
             lambda c: record(c, "2026-01-03T03:00:00Z", text="A review of some other head."),
-            "the review record states its head, merge base and start",
+            "a review record states one binding",
         ),
         (lambda c: c["record"].update(sha256="0" * 64), "review record digest"),
         (lambda c: c["record"].update(source=None), "a review record names its source"),
@@ -1415,6 +1625,7 @@ def recorded(corpus, subs, cases):
             "case": case,
             "seed": 1,
             "input": input_digest(corpus["cases"][case]),
+            "pins_sha256": pins_digest(subs["variants"][variant]),
             "status": "completed",
             "exclusion": None,
             "cost_microusd": 0,
@@ -1480,6 +1691,167 @@ def test_the_command_line_scores_a_historical_corpus_only_with_its_repository(
     assert json.loads(capsys.readouterr().out)["verified"]["ok"] is True
 
 
+# -- what a review record binds -------------------------------------------------
+
+
+def rebound(case, **change):
+    """``case``'s review record again, its binding statement changed."""
+    started = case["record"]["started"]
+    text = f"{binding(case, started, **change)}\nR1-F1: src/a.py lines 2 to 5 are never fixed."
+    record(case, started, text=text, source=case["record"]["source"])
+
+
+def test_a_review_record_binds_its_input_read_not_its_publication(history, subs):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    case = corpus["cases"]["round1"]
+    # The review read its input at 01:30 and was published at 02:00, which the
+    # cutoff claims; a comment between the two would reach the reviewer.
+    text = (
+        f"{binding(case, '2026-01-03T01:30:00Z')}\n"
+        "Published 2026-01-03T02:00:00Z.\nR1-F1: src/a.py lines 2 to 5 are never fixed."
+    )
+    record(case, "2026-01-03T02:00:00Z", text=text)
+    items(case).append(
+        captured(
+            "between",
+            "pr_comment",
+            "a comment after the review read its input",
+            "2026-01-03T01:45:00Z",
+            "Is line 2 really fine?",
+            "pr/2/comment/5",
+        )
+    )
+    complete(case, "2026-01-10T00:00:00Z")
+    with pytest.raises(CorpusError, match="the review record's binding states its start"):
+        check_corpus(corpus)
+    with pytest.raises(CorpusError, match="the review record's binding states its start"):
+        score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+    # Prose is never read as a binding, whatever instant it names, and a
+    # record states one binding only.
+    prose = (
+        f"Reviewed HEAD {ids['head']} (merge base {ids['base']}); input read at"
+        " 2026-01-03T02:00:00Z.\nR1-F1: src/a.py lines 2 to 5 are never fixed."
+    )
+    twice = f"{binding(case, '2026-01-03T02:00:00Z')}\n{binding(case, '2026-01-03T01:30:00Z')}"
+    for text in (prose, twice):
+        record(case, "2026-01-03T02:00:00Z", text=text)
+        with pytest.raises(CorpusError, match="a review record states one binding"):
+            check_corpus(corpus)
+    # A binding that states 02:00 evidences it, and admits the comment before it.
+    record(case, "2026-01-03T02:00:00Z")
+    complete(case, "2026-01-10T00:00:00Z")
+    report = score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+    assert report["verified"]["ok"]
+
+
+@pytest.mark.parametrize(
+    ("change", "rule"),
+    [
+        # A comment on another PR, a comment on the issue, or the PR body.
+        (
+            lambda c: c["record"].update(source="pr/3/comment/review-1"),
+            "a review record is a comment on the case's PR or a document",
+        ),
+        (
+            lambda c: c["record"].update(source="issue/1/comment/review-1"),
+            "a review record is a comment on the case's PR or a document",
+        ),
+        (
+            lambda c: c["record"].update(source="pr/2"),
+            "a review record is a comment on the case's PR or a document",
+        ),
+        # A binding of another PR or round.
+        (lambda c: rebound(c, pr=3), "the review record's binding names the case's PR and round"),
+        (lambda c: rebound(c, pr=None), "binding names the case's PR and round"),
+        (lambda c: rebound(c, pr="2"), "binding names the case's PR and round"),
+        (lambda c: rebound(c, round=2), "binding names the case's PR and round"),
+        (lambda c: rebound(c, round=True), "binding names the case's PR and round"),
+        # ...of another review of the round's head.
+        (
+            lambda c: rebound(c, base_ref="next"),
+            "the review record's binding names the case's review",
+        ),
+        (
+            lambda c: rebound(c, head=c["review"]["merge_base"]),
+            "the review record's binding names the case's review",
+        ),
+        (
+            lambda c: rebound(c, merge_base=c["review"]["head"]),
+            "the review record's binding names the case's review",
+        ),
+        (lambda c: rebound(c, input_read="2026-01-03T01:00:00Z"), "binding states its start"),
+        # A binding that is none.
+        (lambda c: rebound(c, extra=1), "fields: pr round"),
+        (
+            lambda c: record(
+                c, "2026-01-03T02:00:00Z", text=binding(c, "2026-01-03T02:00:00Z")[:-1]
+            ),
+            "review record binding",
+        ),
+        (
+            lambda c: record(
+                c, "2026-01-03T02:00:00Z", text="> " + binding(c, "2026-01-03T02:00:00Z")
+            ),
+            "a review record states one binding",
+        ),
+    ],
+)
+def test_a_review_record_is_bound_to_its_case(history, change, rule):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    change(corpus["cases"]["round1"])
+    with pytest.raises(CorpusError, match=rule):
+        check_corpus(corpus)
+
+
+def test_a_review_record_may_be_a_document_kept_apart(history):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    case = corpus["cases"]["round1"]
+    # A record the controller kept of the launch, say, rather than a comment.
+    record(case, "2026-01-03T02:00:00Z", source="document/reviews/pr-2-round-1.json")
+    assert describe(corpus)["runnable"] == ["round1"]
+    assert verify(corpus, repo.path)["ok"]
+
+
+@pytest.mark.parametrize(
+    "copy",
+    [
+        # The record itself, its digest correct, as a document.
+        lambda text: text,
+        # Inside a longer document, indented and upper-cased.
+        lambda text: "Notes:\n" + "\n".join(f"    {row.upper()}" for row in text.splitlines()),
+        # Without its binding statement.
+        lambda text: "\n".join(text.splitlines()[1:]),
+        # Its binding statement alone, quoted.
+        lambda text: "> " + text.splitlines()[0],
+    ],
+)
+def test_the_review_record_never_reaches_its_reviewer_under_another_source(history, subs, copy):
+    repo, ids = history
+    corpus = reviewed(repo, ids)
+    case = corpus["cases"]["round1"]
+    items(case).append(
+        captured(
+            "notes",
+            "document",
+            "review notes",
+            "2026-01-03T02:00:00Z",
+            copy(case["record"]["text"]),
+            "document/notes/review.md",
+        )
+    )
+    complete(case, "2026-01-10T00:00:00Z")
+    rule = "the review record is not the reviewer's context"
+    with pytest.raises(CorpusError, match=rule):
+        describe(corpus)
+    with pytest.raises(CorpusError, match=rule):
+        verify(corpus, repo.path)
+    with pytest.raises(CorpusError, match=rule):
+        score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+
+
 # -- a defect that escaped through a squash ------------------------------------
 
 
@@ -1509,12 +1881,20 @@ def escaped(ids, **discovery):
     [
         # The squash is not in the branch commit's history, nor the fix.
         ({"merged": None}, ["defect e1 fix follows its introduction"]),
-        # A fix off the line the squash merged into is unrelated.
-        ({"fix": "other"}, ["defect e1 fix follows its merge"]),
-        # A merged revision off the base line.
+        # A fix off the line the squash merged into is unrelated, and changes
+        # another file.
+        (
+            {"fix": "other"},
+            ["defect e1 fix follows its merge", "defect e1 fix changes what it is located in"],
+        ),
+        # A merged revision off the base line, which names no PR.
         (
             {"merged": "fix"},
-            ["defect e1 merged on its base ref's line", "defect e1 fix follows its merge"],
+            [
+                "defect e1 merged on its base ref's line",
+                "defect e1 merge is its PR's squash",
+                "defect e1 fix follows its merge",
+            ],
         ),
     ],
 )
@@ -1538,9 +1918,13 @@ def test_a_squash_lineage_needs_the_merge_to_carry_the_defect(history):
     case = corpus["cases"]["round1"]
     case["withheld"] += [ids["after"]]
     case["defects"]["e1"] = escaped(ids)
-    # The squash never changed the file this defect is located in.
+    # The squash never changed the file this defect is located in, nor did
+    # the fix.
     case["defects"]["e1"]["location"] = [{"path": "pyproject.toml", "lines": [1, 1]}]
-    assert verify(corpus, repo.path)["cases"]["round1"]["failed"] == ["defect e1 merge carries it"]
+    assert verify(corpus, repo.path)["cases"]["round1"]["failed"] == [
+        "defect e1 merge carries it",
+        "defect e1 fix changes what it is located in",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1560,6 +1944,108 @@ def test_a_merged_revision_is_refused(history, change, rule):
     change(case["defects"]["e1"]["discovery"], ids)
     with pytest.raises(CorpusError, match=rule):
         check_corpus(corpus)
+
+
+@pytest.mark.parametrize(
+    ("change", "rule"),
+    [
+        # Nothing to bind a fix or a merge to.
+        (lambda c: c["defects"]["e1"].update(location=[]), "defect location"),
+        # A squash is checked by the lines it carried.
+        (
+            lambda c: c["defects"]["e1"]["location"][0].update(lines=None),
+            "a merged defect is located by its lines",
+        ),
+        # A squash is of a PR.
+        (
+            lambda c: (c["provenance"].update(pr=None), items(c)[1].update(source=None)),
+            "a merged revision follows a review round of a PR",
+        ),
+    ],
+)
+def test_a_squash_lineage_is_refused_without_what_binds_it(history, change, rule):
+    repo, ids = history
+    corpus = historical(repo, ids)
+    case = corpus["cases"]["round1"]
+    case["withheld"] += [ids["after"]]
+    case["defects"]["e1"] = escaped(ids)
+    change(case)
+    with pytest.raises(CorpusError, match=rule):
+        check_corpus(corpus)
+
+
+def test_a_same_file_rewrite_and_a_later_descendant_are_no_squash_lineage(history, subs):
+    repo, ids = history
+    env = {"pyproject.toml": b"[project]\n", "uv.lock": b"version = 1\n"}
+    # Later on main: a commit that rewrote src/a.py on its own, its subject
+    # even naming the PR, and a documentation-only commit after it.
+    rewrite = repo.commit(
+        {**env, "src/a.py": b"rewritten\n"}, [ids["after"]], "2026-01-09T00:00:00Z", "Redo (#2)"
+    )
+    docs = repo.commit(
+        {**env, "src/a.py": b"rewritten\n", "README.md": b"docs\n"},
+        [rewrite],
+        "2026-01-10T00:00:00Z",
+    )
+    corpus = reviewed(repo, ids)
+    corpus["repository"]["refs"]["main"] = docs
+    case = corpus["cases"]["round1"]
+    case["stratum"] = "escape"
+    case["withheld"] += [ids["after"], rewrite, docs]
+    # The squash that carried the defect and the commit that fixed it verify.
+    case["defects"] = {"e1": escaped(ids)}
+    assert verify(corpus, repo.path)["ok"]
+    assert score(corpus, recorded(corpus, subs, ["round1"]), repo.path)["verified"]["ok"]
+    # The rewrite and its descendant named in their place do not: the
+    # defect's line is not in the rewrite, and the descendant changed no file
+    # the defect is in.
+    case["defects"] = {"e1": escaped(ids, merged=rewrite, fix=docs)}
+    check_corpus(corpus)
+    assert verify(corpus, repo.path)["cases"]["round1"]["failed"] == [
+        "defect e1 survives its merge",
+        "defect e1 fix changes what it is located in",
+    ]
+    with pytest.raises(CorpusError, match="a recorded score verifies its corpus"):
+        score(corpus, recorded(corpus, subs, ["round1"]), repo.path)
+
+
+def test_a_fix_changes_what_its_defect_is_located_in(history):
+    repo, ids = history
+    env = {"pyproject.toml": b"[project]\n", "uv.lock": b"version = 1\n"}
+    code = b"".join(b"line %d\n" % n for n in range(1, 6))
+    # Two later commits on the head: one changes only another file, the other
+    # only line 5 of src/a.py.
+    docs = repo.commit(
+        {**env, "src/a.py": code, "README.md": b"docs\n"}, [ids["head"]], "2026-01-05T00:00:00Z"
+    )
+    line5 = repo.commit(
+        {**env, "src/a.py": code.replace(b"line 5", b"LINE 5")},
+        [ids["head"]],
+        "2026-01-05T00:00:00Z",
+    )
+    corpus = historical(repo, ids)
+    case = corpus["cases"]["round1"]
+    case["withheld"] += [docs, line5]
+    defect = case["defects"]["d1"]
+    place = defect["location"][0]
+
+    def failed(fix, lines):
+        defect["discovery"]["fix"] = fix
+        place["lines"] = lines
+        return verify(corpus, repo.path)["cases"]["round1"]["failed"]
+
+    unaddressed = ["defect d1 fix changes what it is located in"]
+    # Lines 2 to 5: the round's fix appends beside line 5, the other changes it.
+    assert failed(ids["fix"], [2, 5]) == []
+    assert failed(line5, [2, 5]) == []
+    # A descendant that changed another file fixes nothing, however located.
+    assert failed(docs, [2, 5]) == unaddressed
+    assert failed(docs, None) == unaddressed
+    # Lines 2 and 3: neither changes them, nor inserts among or beside them.
+    assert failed(line5, [2, 3]) == unaddressed
+    assert failed(ids["fix"], [2, 3]) == unaddressed
+    # The whole file: any change to it.
+    assert failed(line5, None) == []
 
 
 def test_verify_holds_exposure_evidence_to_the_commits(history):

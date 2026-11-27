@@ -637,10 +637,12 @@ the evaluation protocol (#318)        test_evaluation.py (the pins, what arms ho
 the review corpus (REV-R1, #356)      test_review_corpus.py (the synthetic scorecards by hand,
                                       label settlement, censoring, cutoff and leakage
                                       refusals, context bound to its listed sources, exposure
-                                      evidence, cluster integrity, the seed's unadjudicated
-                                      state, verify on a throwaway repository: the review
-                                      record's boundary, the merge base, squash lineage, and
-                                      recorded scoring bound to it)
+                                      evidence, cluster integrity, run pins and work limits,
+                                      the seed's unadjudicated state, verify on a throwaway
+                                      repository: the review record's binding and its absence
+                                      from context, the base line and merge base, environment
+                                      pins, fix and squash lineage, and recorded scoring
+                                      bound to it)
 troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
                                       a test that exists; the guide's links and the links
                                       into it resolve)

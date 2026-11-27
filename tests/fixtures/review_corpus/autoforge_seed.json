@@ -10,7 +10,11 @@
     "root": "e5d562e85f2d6eb5c10a1bfe02707f1e554ecb2d",
     "refs": {
       "main": "e3443d308c72b5afd873cfdcfc50d947ab5c55ff"
-    }
+    },
+    "environment": [
+      "pyproject.toml",
+      "uv.lock"
+    ]
   },
   "cases": {
     "issue262-round1": {
