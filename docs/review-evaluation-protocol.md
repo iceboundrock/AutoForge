@@ -29,10 +29,12 @@ findings forward and does not authorize FIX. A completed needs-fix round can ent
 trigger replan. A completed FIX, including one with no new commit, goes to REVIEW; a published
 partial FIX blocks first and re-enters REVIEW on recovery, not another FIX of the old round.
 That `BLOCKED` stop waits for an explicit unblock, so it ends the first-stop slice replayed here.
-A completed clean round issues its certificate and enters `READY_FOR_MERGE`, or `BLOCKED` in
-the same write when the validation configuration in force no longer yields the presented set
-and policy (ADR 0006 D12.6); either ends the slice, and drift while the review ran makes the
-round stale instead.
+A completed non-stale clean round has three outcomes: it issues its certificate and enters
+`READY_FOR_MERGE`; it issues its certificate and enters `BLOCKED` in the same write when the
+validation configuration in force no longer yields the presented set and policy (ADR 0006 D12.6);
+or it enters `BLOCKED` without issuing a new certificate when issuance inputs are missing or
+inconsistent or the certificate would not apply. Each ends the slice, and drift while the review
+ran makes the round stale instead.
 A held FIX can block without publication. Deferral, follow-up creation, and no change with
 rationale are dispositions, not proof that a defect was repaired. Failed producer validation
 does not publish a candidate; a clean reply over failed presented validation is refused
@@ -186,7 +188,10 @@ missing seed; duplicate assignments are refused.
   completion), an ordinal above that round. `issued` requires a terminal clean review at
   that ordinal with matching comment and exact presented validation, and a separate
   certificate receipt reference. The certificate's comment and receipt identities are
-  nonempty strings, refused when malformed even where the review it names is missing; a
+  nonempty strings, refused when malformed even where the review it names is missing; each
+  completed review round within a PR requires a distinct normalized (whitespace-trimmed) comment
+  identity, and an issued certificate may not reuse another completed round's comment identity
+  even when its named review is missing or undecided; a
   well-formed comment is compared with that review's whenever both are retained. It is
   written when that round completes, so the ordinal is the stop's watermark. A
   presented receipt whose scope, set and policy match but whose result is unknown leaves
@@ -425,7 +430,10 @@ complete payload for precision and duplicates, while recall and the sample floor
 need an accepted starting review, and a missing or incomplete payload of that round still
 suppresses both contrasts. The all-run safety tally keeps a proven treatment escape when
 only its producer slot is missing or the pair is excluded, while the matched subtotal
-holds no such run and neither enters an ordinary score.
+holds no such run and neither enters an ordinary score. Tests also pin refusal of
+review-comment identity reuse across completed rounds within a PR (including normalized
+duplicates and certificates whose named review is missing) while keeping distinct-comment
+fixtures valid.
 Existing
 controller tests (`test_routing.py`, `test_loop_guard.py`, `test_validation_gates.py`,
 `test_review_certificate.py`, `test_merge_certificate.py`, `test_partial_fix.py`,

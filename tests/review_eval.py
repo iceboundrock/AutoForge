@@ -425,6 +425,7 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
     known_ms = 0
     time_complete = True
     costs, tokens = [], []
+    seen_comments: set[str] = set()
     terminal = None
     for ordinal, row in enumerate(slots, 1):
         # Even a reserved ordinal with no record contradicts a retained first
@@ -491,6 +492,9 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
                 )
             else:
                 require(nonempty(row["comment"]), "completed review comment identity")
+                comment_id = row["comment"].strip()
+                require(comment_id not in seen_comments, "reused review comment identity")
+                seen_comments.add(comment_id)
                 items = findings(case, run, row)
             require(
                 row["transition"] in (None, "drift")
@@ -658,6 +662,7 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
             # The certificate's own identities are checked on their own, whether
             # or not the review it names is retained to compare them with.
             require(nonempty(proof["comment"]), "certificate comment identity")
+            proof_comment = proof["comment"].strip()
             # The certificate presents the run's one validation set and policy,
             # which every retained receipt fixes, whichever review it names.
             certified_policy = validation(proof["validation"])
@@ -707,10 +712,10 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
                     "certificate needs presented passing or empty FULL validation",
                 )
             if issued:
-                require(
-                    named["comment"] is None or proof["comment"] == named["comment"],
-                    "certificate comment binding",
-                )
+                if named["comment"] is not None:
+                    require(
+                        proof_comment == named["comment"].strip(), "certificate comment binding"
+                    )
                 presented = named["validation"]
                 # Known fields must agree. An unknown presented result leaves the
                 # certificate unproven; it never borrows the certificate's result.
@@ -735,6 +740,8 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
                     and presented is not None
                     and presented["result"] is not None
                 )
+        if issued and (named is None or named["comment"] is None):
+            require(proof_comment not in seen_comments, "reused review comment identity")
         # Every other retained launch is checked against the stop the same way.
         check_stop_against_launches(slots, stop)
         if terminal is not None:

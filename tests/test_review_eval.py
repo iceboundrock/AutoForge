@@ -1787,6 +1787,49 @@ def test_a_well_formed_certificate_without_its_named_review_stays_unresolved(pac
     assert report["unresolved_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
 
 
+@pytest.mark.parametrize("padded", [False, True])
+def test_completed_rounds_cannot_reuse_a_review_comment(packet, padded):
+    recorded(packet, "wrong-boundary")
+    expected = score(deepcopy(packet))
+    assert expected["new_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
+    treatment = packet["runs"][1]
+    reused = treatment["launches"][1]["comment"]
+    comment = f" {reused} " if padded else reused
+    treatment["launches"][3]["comment"] = comment
+    treatment["stop"]["proof"]["comment"] = comment
+    with pytest.raises(EvidenceError, match="reused review comment identity"):
+        score(packet)
+
+
+@pytest.mark.parametrize("order", ["stale-reuses-earlier", "later-reuses-stale"])
+def test_stale_completed_round_cannot_share_a_review_comment(packet, order):
+    stale, clean = add_stale_round(packet, 0)
+    if order == "stale-reuses-earlier":
+        stale["comment"] = packet["runs"][0]["launches"][1]["comment"]
+    else:
+        clean["comment"] = stale["comment"]
+        packet["runs"][0]["stop"]["proof"]["comment"] = stale["comment"]
+    with pytest.raises(EvidenceError, match="reused review comment identity"):
+        score(packet)
+
+
+@pytest.mark.parametrize("named_state", ["missing", "undecided"])
+def test_issued_certificate_with_missing_or_undecided_review_cannot_reuse_earlier_comment(
+    packet, named_state
+):
+    recorded(packet, "wrong-boundary")
+    treatment = packet["runs"][1]
+    if named_state == "missing":
+        treatment["launches"][3] = None
+    else:
+        treatment["launches"][3].update(outcome=None, comment=None, findings=None)
+    distinct = deepcopy(packet)
+    assert score(distinct)["pairs"][0]["status"] == "incomplete_ledger"
+    treatment["stop"]["proof"]["comment"] = treatment["launches"][1]["comment"]
+    with pytest.raises(EvidenceError, match="reused review comment identity"):
+        score(packet)
+
+
 def test_label_cutoff_and_agent_independence(packet):
     row = packet["runs"][3]["launches"][1]
     label = row["findings"]["items"][0]["label"]
