@@ -616,6 +616,7 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
 
     stop = run["stop"]
     reconciled, bound, certified = False, False, None
+    proven = False
     if stop is not None:
         object_fields(stop, f"{BINDING} through phase round review issuance proof wall_ms source")
         require(
@@ -718,6 +719,19 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
                     ),
                     "certificate validation binding",
                 )
+                # The certificate presented exactly the stop's candidate when the
+                # exact terminal clean review it names is retained at the
+                # watermark with its disposition and a known presented result;
+                # its comment, revision and known receipt fields were checked
+                # above. These records need no other ordinal and no transition
+                # between them, so they hold across a gap elsewhere: there they
+                # establish a critical escape for the safety report alone (see
+                # below), while issuance as the terminal outcome stays unproven.
+                proven = (
+                    named["outcome"] == "clean"
+                    and presented is not None
+                    and presented["result"] is not None
+                )
         # Every other retained launch is checked against the stop the same way.
         check_stop_against_launches(slots, stop)
         if terminal is not None:
@@ -746,9 +760,9 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
                 "certificate does not belong to the terminal clean review",
             )
             if issued:
-                # The named review is the terminal clean one, cross-checked above.
-                presented = named["validation"]
-                bound = presented is not None and presented["result"] is not None
+                # The named review is the terminal clean one, cross-checked above,
+                # so the reconciled ledger binds the certificate it proves.
+                bound = proven
                 certified = bound or None
             elif stop["issuance"] == "not_issued":
                 bound, certified = True, False
@@ -772,14 +786,7 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
     # retained. A gap leaves the run unresolved, contributing to no metric and
     # reporting no finding, false alarm or harmful FIX, even where part of the
     # evidence for one is retained: the replay does not reason across a gap.
-    window = stop["through"] if stop is not None else len(slots)
-    missing = [
-        position
-        for position in range(1, window + 1)
-        if position > len(slots)
-        or slots[position - 1] is None
-        or slots[position - 1]["outcome"] is None
-    ]
+    missing = missing_ranges(slots, stop["through"] if stop is not None else len(slots))
     resolved = stop is not None and not missing
     # Finding coverage needs the stop's launch window reconciled with the
     # ledger and every accepted payload complete; proof of issuance is a
@@ -791,11 +798,22 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
         key for key, defect in case["defects"].items() if source(defect["source"], case, run)
     }
     critical = sorted(key for key in eligible if case["defects"][key]["severity"] == "critical")
+    # Critical escapes read the cutoff-eligible inventory of the candidate a
+    # proven certificate presented. In a complete ledger that certificate is the
+    # bound terminal outcome. Across a gap, the safety report's one exception,
+    # the same retained records still show a listed defect escaped without
+    # reconstructing any missing transition; the gap only keeps a defect's
+    # absence from proving a non-escape, as it keeps the run out of every rate,
+    # FIX attribution and validated success.
+    certified_snap = case["snapshots"][stop["head"]] if proven else None
+    inventory = certified_snap is not None and source(certified_snap["source"], case, run)
     escapes = {
         key: False
         if certified is False
-        else key in snap["present"]
-        if certified and final_inventory
+        else True
+        if inventory and key in certified_snap["present"]
+        else False
+        if inventory and resolved
         else None
         for key in critical
     }
@@ -885,7 +903,8 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
     }
     if not resolved:
         # An unresolved run is scored nowhere: only the safety report reads it,
-        # through its critical escapes, which a gap leaves unknown, not removed.
+        # through its critical escapes, which a gap leaves unknown, not removed,
+        # unless the retained certificate evidence proves one escaped.
         report.update(
             fix_regressions=None,
             known_findings=None,
@@ -894,6 +913,31 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
             counts=dict.fromkeys(report["counts"]),
         )
     return report
+
+
+def missing_ranges(slots, through) -> list:
+    """Inclusive ``[first, last]`` runs of ordinals up to ``through`` without a disposition.
+
+    An ordinal is missing when it has no retained launch record (a ``null``
+    slot, or one the watermark reserves past the last slot) or no known
+    disposition. The reserved tail is one run, so work and output are bounded
+    by the retained slots, never by the watermark's magnitude, which the
+    packet's byte cap does not limit.
+    """
+    ranges = []
+
+    def add(first, last):
+        if ranges and ranges[-1][1] == first - 1:
+            ranges[-1][1] = last
+        else:
+            ranges.append([first, last])
+
+    for position, row in enumerate(slots, 1):
+        if row is None or row["outcome"] is None:
+            add(position, position)
+    if through > len(slots):
+        add(len(slots) + 1, through)
+    return ranges
 
 
 def total_usage(values, complete, synthetic):
@@ -1029,9 +1073,13 @@ def score(packet) -> dict:
             for key, escaped in t["critical_escapes"].items():
                 fix_introduced = key in (t["fix_regressions"] or ())
                 shared = key in starting_inventory(cases[case_id])
+                # The counterpart is evidence only from a complete ledger: an
+                # escape it proves across a gap stays listed in its own run but
+                # never clears or confirms the treatment's.
                 comparable_baseline = (
                     b
                     and not b["exclusion"]
+                    and b["ledger"] == "complete"
                     and shared
                     and b["starting_validation"] is not None
                     and b["starting_validation"] == t["starting_validation"]

@@ -1,5 +1,6 @@
 import json
 import sys
+import tracemalloc
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
@@ -218,7 +219,7 @@ def test_gap_does_not_fill_rounds_or_allow_a_replacement_reset(packet, gap, erro
         return
     got = result(packet, "wrong-boundary", "baseline")
     assert got["ledger"] == "unresolved: incomplete ledger"
-    assert got["missing_ordinals"] == list(range(4, 4 + gap))
+    assert got["missing_ordinals"] == [[4, 3 + gap]]
     assert not got["launch_window_complete"]
     assert not got["review_record_complete"]
     assert got["validated_success"] is None and got["completed_rounds"] is None
@@ -364,7 +365,7 @@ def test_missing_review_disposition_is_not_a_report_of_no_findings(packet):
     run = packet["runs"][3]
     run["launches"][1].update(outcome=None, comment=None, findings=None)
     got = result(packet, "clean-boundary", "treatment")
-    assert got["launch_window_complete"] and got["missing_ordinals"] == [2]
+    assert got["launch_window_complete"] and got["missing_ordinals"] == [[2, 2]]
     assert got["ledger"] == "unresolved: incomplete ledger"
     assert not got["review_record_complete"] and got["clean_negative_false_alarm"] is None
     assert got["validated_success"] is None
@@ -706,7 +707,7 @@ def test_partial_fix_is_a_first_stop_across_a_gap_before_it(packet):
     pair = report["pairs"][0]
     got = pair["runs"]["treatment"]
     # The gap leaves the run unresolved: its terminal outcome unproven, never contradicted ...
-    assert pair["status"] == "incomplete_ledger" and got["missing_ordinals"] == [1]
+    assert pair["status"] == "incomplete_ledger" and got["missing_ordinals"] == [[1, 1]]
     assert got["stop"] == "BLOCKED" and not got["terminal_bound"]
     assert got["certificate_issued"] is None and got["validated_success"] is None
     # ... and no harm reported, though the publication and its source review are retained.
@@ -738,7 +739,7 @@ def test_a_gap_leaves_a_published_fix_regression_unresolved(packet, missing):
     report = score(packet)
     got = report["pairs"][0]["runs"]["treatment"]
     assert got["ledger"] == "unresolved: incomplete ledger"
-    assert got["missing_ordinals"] == ([1] if missing == "producer" else [2])
+    assert got["missing_ordinals"] == ([[1, 1]] if missing == "producer" else [[2, 2]])
     assert got["certificate_issued"] is None
     # The replay does not reason across the gap: even with the publication, its
     # source review, its range and the endpoint's inventory retained, no harm
@@ -746,27 +747,169 @@ def test_a_gap_leaves_a_published_fix_regression_unresolved(packet, missing):
     assert got["fix_regressions"] is None and got["known_harmful_fixes"] is None
     assert report["pair_status"] == {"incomplete_ledger": 1}
     assert report["rates"]["harmful_fix_rate"]["treatment"]["point"] is None
-    # The safety report still lists the critical defect, as unresolved.
-    assert got["critical_escapes"] == {"lost-data": None}
+    # The retained terminal review and its certificate still prove the defect
+    # escaped at the certified endpoint, yet the issuance stays unproven as the
+    # terminal outcome, and with no FIX provenance and no starting counterpart
+    # the escape is listed as unresolved, not as new treatment harm.
+    assert got["critical_escapes"] == {"lost-data": True}
+    assert not got["terminal_bound"] and got["validated_success"] is None
     assert report["new_critical_escapes"] == []
     assert report["unresolved_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
+    assert report["decision"] == "INCONCLUSIVE"
+
+
+def certify_a_shared_critical_defect(packet):
+    """Treatment certifies the starting candidate with a critical defect baseline repairs.
+
+    Round 1 confirms the starting `off-by-one`, now critical; the FIX publishes
+    no change and round 2 certifies the unchanged start. `lost-data` is
+    downgraded, so no other critical defect is registered.
+    """
+    recorded(packet, "wrong-boundary")
+    defects = packet["cases"]["wrong-boundary"]["defects"]
+    defects["off-by-one"]["severity"] = "critical"
+    defects["lost-data"]["severity"] = "high"
+    treatment = packet["runs"][1]
+    review, fix, clean = treatment["launches"][1:]
+    fix.update(outcome="no_change", published=None, judgment=None)
+    clean.update(head=review["head"], tree=review["tree"])
+    treatment["stop"].update(head=review["head"], tree=review["tree"])
+    return treatment
+
+
+@pytest.mark.parametrize("gap", [False, True])
+def test_a_gap_keeps_a_proven_shared_critical_escape(packet, gap):
+    treatment = certify_a_shared_critical_defect(packet)
+    complete = deepcopy(packet)
+    if gap:
+        treatment["launches"][0] = None  # Only the producer's slot is missing.
+    report = score(packet)
+    pair = report["pairs"][0]
+    got, baseline = pair["runs"]["treatment"], pair["runs"]["baseline"]
+    # The exact terminal review, its matching certificate and the starting
+    # candidate's cutoff-eligible inventory are retained either way: the defect
+    # escaped where baseline, with equal starting validation, repaired it.
+    assert got["starting_validation"] == baseline["starting_validation"] is not None
+    assert got["critical_escapes"] == {"off-by-one": True}
+    assert baseline["critical_escapes"] == {"off-by-one": False}
+    assert report["new_critical_escapes"] == [["wrong-boundary", 0, "off-by-one"]]
+    assert report["unresolved_critical_escapes"] == []
+    assert report["decision"] == "NO_GO"
+    if not gap:
+        assert pair["status"] == "matched" and got["certificate_issued"] is True
+        return
+    # The exception is the safety report's alone. The run stays unresolved:
+    # issuance as its terminal outcome, FIX harm and validated success are not
+    # inferred, and nothing in it is reported as a finding or scored ...
+    assert pair["status"] == "incomplete_ledger" and got["missing_ordinals"] == [[1, 1]]
+    assert got["certificate_issued"] is None and not got["terminal_bound"]
+    assert got["validated_success"] is None and got["certificate_applicable"] is None
+    assert got["fix_regressions"] is None and got["known_harmful_fixes"] is None
+    assert got["known_findings"] is None and set(got["counts"].values()) == {None}
+    assert report["matched_pairs"] == 0 and report["sample"] == {"defect": 0, "negative": 0}
+    # ... and beside the complete scenario, a gapped copy changes no rate,
+    # bootstrap draw, cost or sample floor, only adding its own proven escape.
+    expected = score(deepcopy(complete))
+    copy_case(complete, "wrong-boundary", "gapped")
+    complete["runs"][-1]["launches"][0] = None
+    combined = score(complete)
+    assert combined["pair_status"] == {"matched": 1, "incomplete_ledger": 1}
+    for key in (
+        "rates",
+        "cost_usd_per_validated_success",
+        "sample",
+        "matched_pairs",
+        "critical_escape_totals",
+        "rate_harm",
+    ):
+        assert combined[key] == expected[key], key
+    assert sorted(combined["new_critical_escapes"]) == sorted(
+        [*expected["new_critical_escapes"], ["gapped", 0, "off-by-one"]]
+    )
+    # A critical defect absent from the certified inventory is no proven
+    # non-escape across the gap: it stays unresolved.
+    packet["cases"]["wrong-boundary"]["defects"]["lost-data"]["severity"] = "critical"
+    report = score(packet)
+    got = report["pairs"][0]["runs"]["treatment"]
+    assert got["critical_escapes"] == {"lost-data": None, "off-by-one": True}
+    assert report["new_critical_escapes"] == [["wrong-boundary", 0, "off-by-one"]]
+    assert report["unresolved_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
+    assert report["decision"] == "NO_GO"
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["terminal review", "terminal disposition", "presented result", "issuance", "inventory"],
+)
+@pytest.mark.parametrize("gap", [False, True])
+def test_a_critical_escape_without_its_exact_evidence_stays_unresolved(packet, missing, gap):
+    treatment = certify_a_shared_critical_defect(packet)
+    case = packet["cases"]["wrong-boundary"]
+    clean = treatment["launches"][3]
+    if gap:
+        treatment["launches"][0] = None  # The producer's slot is missing too.
+    if missing == "terminal review":
+        treatment["launches"][3] = None
+    elif missing == "terminal disposition":
+        clean.update(outcome=None, comment=None, findings=None)
+    elif missing == "presented result":
+        clean["validation"]["result"] = None
+    elif missing == "issuance":
+        treatment["stop"].update(issuance=None, proof=None)
+    else:
+        # The certified candidate's inventory was evidenced after the cutoff.
+        case["snapshots"][case["start"]]["source"]["discovered"] = "2026-11-21"
+    report = score(packet)
+    got = report["pairs"][0]["runs"]["treatment"]
+    # Round 1's retained receipt keeps starting validation comparable ...
+    assert got["starting_validation"] is not None
+    # ... but without the exact escape evidence nothing proves the escape, gap or not,
+    # even where a complete ledger still proves the certificate itself.
+    assert got["critical_escapes"] == {"off-by-one": None}
+    assert got["certificate_issued"] is (True if missing == "inventory" and not gap else None)
+    assert report["new_critical_escapes"] == []
+    assert report["unresolved_critical_escapes"] == [["wrong-boundary", 0, "off-by-one"]]
+    assert report["decision"] == "INCONCLUSIVE"
+
+
+@pytest.mark.parametrize("gap", [False, True])
+def test_a_gapped_baseline_escape_is_no_comparison_evidence(packet, gap):
+    certify_a_shared_critical_defect(packet)
+    baseline = packet["runs"][0]
+    review, fix, clean = baseline["launches"][1:]
+    # Baseline also defers the finding and certifies the unchanged start.
+    fix.update(outcome="no_change", published=None, judgment=None)
+    clean.update(head=review["head"], tree=review["tree"])
+    baseline["stop"].update(head=review["head"], tree=review["tree"])
+    if gap:
+        baseline["launches"][0] = None  # Only the baseline producer's slot is missing.
+    report = score(packet)
+    pair = report["pairs"][0]
+    # Both arms' certificates prove the escape, and each run lists its own ...
+    assert pair["runs"]["baseline"]["critical_escapes"] == {"off-by-one": True}
+    assert pair["runs"]["treatment"]["critical_escapes"] == {"off-by-one": True}
+    assert report["new_critical_escapes"] == []
+    # ... but only a complete counterpart shows the treatment's escape is not new.
+    expected = [["wrong-boundary", 0, "off-by-one"]] if gap else []
+    assert report["unresolved_critical_escapes"] == expected
+    assert report["decision"] == "INCONCLUSIVE"
 
 
 def remove_from_ledger(run, gap):
-    """Remove one piece of a valid run's ledger; return the ordinals it leaves missing."""
+    """Remove one piece of a valid run's ledger; return the ordinal ranges it leaves missing."""
     launches = run["launches"]
     if gap == "producer":
         launches[0] = None
-        return [1]
+        return [[1, 1]]
     if gap == "review":
         launches[1] = None
-        return [2]
+        return [[2, 2]]
     if gap == "disposition":
         launches[1].update(outcome=None, comment=None, findings=None)
-        return [2]
+        return [[2, 2]]
     if gap == "tail":
         launches.pop()  # The stop's watermark still reserves its ordinal.
-        return [run["stop"]["through"]]
+        return [[run["stop"]["through"]] * 2]
     run["stop"] = None
     return []
 
@@ -815,6 +958,40 @@ def test_an_incomplete_ledger_is_unresolved_and_contributes_nothing(packet, case
     )
 
 
+def test_an_oversized_watermark_reports_missing_ordinals_as_bounded_ranges(packet):
+    run = packet["runs"][0]
+    run["launches"].pop()  # The run stops BLOCKED after its published FIX.
+    fix = run["launches"][-1]
+    run["launches"][0] = None
+    endpoint = packet["cases"]["wrong-boundary"]["snapshots"][fix["published"]]
+    at = {"head": fix["published"], "tree": endpoint["tree"]}
+    # The packet's byte cap does not bound the watermark's magnitude.
+    no_certificate(run, through=10**5, round_=1, review=2, at=at)
+    score(deepcopy(packet))  # Warm the bootstrap cache outside the measurement.
+    tracemalloc.start()
+    try:
+        got = result(packet, "wrong-boundary", "baseline")
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    # Missing ordinals are inclusive ranges and the reserved tail is one of
+    # them, so neither work nor output grows with the watermark.
+    assert got["ledger"] == "unresolved: incomplete ledger"
+    assert got["missing_ordinals"] == [[1, 1], [4, 10**5]]
+    assert peak < 1_000_000
+    run["stop"]["through"] = 10**18
+    assert result(packet, "wrong-boundary", "baseline")["missing_ordinals"] == [
+        [1, 1],
+        [4, 10**18],
+    ]
+    # A missing disposition next to the reserved tail joins its range.
+    fix.update(outcome=None, published=None, judgment=None)
+    assert result(packet, "wrong-boundary", "baseline")["missing_ordinals"] == [
+        [1, 1],
+        [3, 10**18],
+    ]
+
+
 def test_a_gap_reports_no_false_alarm_though_its_label_is_retained(packet):
     expected = result(deepcopy(packet), "clean-boundary", "treatment")
     assert expected["known_findings"] == {"R1-F1": "false"}
@@ -826,7 +1003,7 @@ def test_a_gap_reports_no_false_alarm_though_its_label_is_retained(packet):
     # The accepted review and its independent label are retained, but a complete
     # ledger is a precondition for scoring: no known finding and no false alarm,
     # and the pair enters no rate, so the pooled FPR has no observation.
-    assert pair["status"] == "incomplete_ledger" and got["missing_ordinals"] == [1]
+    assert pair["status"] == "incomplete_ledger" and got["missing_ordinals"] == [[1, 1]]
     assert got["known_findings"] is None and got["clean_negative_false_alarm"] is None
     assert got["counts"]["false_positive_rate"] is None
     fpr = report["rates"]["false_positive_rate"]
@@ -856,7 +1033,8 @@ def test_a_superseded_review_is_no_fix_source_even_across_a_gap(packet, gap):
     got = result(packet, "wrong-boundary", "treatment")
     if gap:
         # A complete ledger is a precondition for crediting the FIX's harm ...
-        assert got["ledger"] == "unresolved: incomplete ledger" and got["missing_ordinals"] == [1]
+        assert got["ledger"] == "unresolved: incomplete ledger"
+        assert got["missing_ordinals"] == [[1, 1]]
         assert got["fix_regressions"] is None and got["known_harmful_fixes"] is None
     else:
         assert got["ledger"] == "complete" and got["completed_rounds"] == 3
@@ -908,7 +1086,8 @@ def test_a_record_its_ordinals_or_publication_cannot_hold_is_refused(packet, rec
         return
     got = result(packet, "wrong-boundary", "baseline")
     assert got["ledger"] == "unresolved: incomplete ledger"
-    assert got["missing_ordinals"] == [4 if record == "stop round fits" else 2]
+    at = 4 if record == "stop round fits" else 2
+    assert got["missing_ordinals"] == [[at, at]]
 
 
 @pytest.mark.parametrize("missing", ["receipt", "receipt and a launch", "named review"])

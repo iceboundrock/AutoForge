@@ -188,7 +188,8 @@ treatment harm. Do not replace a failed or missing seed; duplicate assignments a
   review's own receipt is missing. When the stop names a retained REVIEW,
   its round, and for `issued` its outcome, revision, comment and known validation fields,
   are cross-checked even across a gap elsewhere; a consistent gapped record leaves the run
-  unresolved, a contradicting field is refused. Every other retained launch is checked against
+  unresolved (though it can still prove a critical escape, see *Incomplete ledgers*), a
+  contradicting field is refused. Every other retained launch is checked against
   the stop the same way: no review completes after the named one, a REVIEW launch before it
   is of at most its round and one after it of the next, a FIX follows the named round or
   precedes it as a FIX of an earlier one, and the launch at the watermark, retained with a
@@ -217,16 +218,36 @@ gap. A run has a gap when any ordinal up to and including its stop's watermark h
 retained launch record and disposition (a `null` slot, `outcome: null`, or an ordinal the
 watermark reserves past the last slot), or when its stop is absent. Such a run is reported
 with `ledger: "unresolved: incomplete ledger"` and its `missing_ordinals`, and its pair as
-`incomplete_ledger`. It contributes to no metric (recall, precision, clean-negative FPR,
-harmful-FIX rate, duplicate ratio or cost per validated success), no bootstrap draw and no
-sample floor, and nothing in it is reported as a known finding, a false alarm or a harmful
-FIX (each is `null`), even when part of the evidence for one is retained. Like a missing
-or incomparable pair, it keeps the decision from relying on complete coverage. The one
-exception is the safety report, which reads every planned run: an unresolved run's
-critical defects stay listed, as unresolved escapes, and an escape its complete
-counterpart evidences still counts, as exclusions remove pairs from rates but not
-evidenced critical escapes. Wall time, launch counts and known launch time remain
-descriptive observations of the run.
+`incomplete_ledger`. `missing_ordinals` lists inclusive `[first, last]` ranges; the
+ordinals a watermark reserves past the last slot are one range, so the report and the work
+to build it are bounded by the retained slots, never by the watermark, whose magnitude the
+packet's byte cap does not limit. The run contributes to no metric (recall, precision,
+clean-negative FPR, harmful-FIX rate, duplicate ratio or cost per validated success), no
+bootstrap draw and no sample floor, and nothing in it is reported as a known finding, a
+false alarm or a harmful FIX (each is `null`), even when part of the evidence for one is
+retained. Like a missing or incomparable pair, it keeps the decision from relying on
+complete coverage. Wall time, launch counts and known launch time remain descriptive
+observations of the run.
+
+The one exception is the safety report, which reads every planned run, as exclusions remove
+pairs from rates but not evidenced critical escapes. A critical escape needs no complete
+ledger when retained records establish it without any missing transition: the stop's
+`issued` certificate, the exact terminal clean review it names, retained at the watermark
+with its disposition, comment and a known presented result matching the certificate, and
+the cutoff-eligible independent inventory of that candidate listing the defect. Such an
+escape is `true` and enters the decision like any other: where a non-excluded baseline with
+equal starting validation evidences that the same starting defect did not escape, it is
+`NO_GO`. An incomplete counterpart is no comparison evidence either way: a baseline escape
+proven across a gap stays listed in its own run but leaves a treatment escape of the same
+defect unresolved. Nothing else follows from those records across a gap. Issuance as the
+run's terminal outcome stays unproven (`certificate_issued: null`,
+`terminal_bound: false`), validated success is `null`, no FIX is credited with the escape,
+so one a FIX introduced is listed but not as new treatment harm, and a critical defect
+absent from that inventory is not thereby shown not to have escaped. Without each of those
+records (a missing or undecided terminal review, an unknown presented result or issuance,
+or an inventory evidenced after the cutoff) an unresolved run's critical defects stay
+listed as unresolved escapes, and an escape its complete counterpart evidences still
+counts.
 
 Structural refusal does not change. A malformed record, an ordinal out of order or one its
 round cannot fit, and any contradiction within a complete ledger are refused. Across a gap
@@ -281,7 +302,7 @@ contrast; a case outside it affects neither the pool nor its draws.
 | Weighted recall | Weight of distinct confirmed starting defects / eligible starting defect weight. Lower bound is the confirmed share; the upper adds the heaviest undetected eligible start defects, at most one per unknown finding. This is an outer bound, not an attribution. |
 | Precision | Confirmed / (confirmed + false). Bounds assign unknown findings first to false, then to confirmed. |
 | Clean-negative FPR | Negative runs with at least one false finding / label-settled negative runs. In a complete ledger an evidenced false finding survives missing finding details. Absence is settled only with a complete accepted review record and no unknown findings. Bounds assign unresolved negatives first to no alarm, then to false alarm. Incomplete review coverage of a matched case in a finding metric's population prevents a usable pooled rate for that metric. |
-| Critical escapes | Independently evidenced eligible critical defects still present at a bound certified stop, even with an empty validation set. A bound non-issuance means no certified escapes; unresolved endings are counted separately. |
+| Critical escapes | Independently evidenced eligible critical defects still present at a bound certified stop, even with an empty validation set. A bound non-issuance means no certified escapes; unresolved endings are counted separately. In an incomplete ledger only the stop's retained exact terminal review and matching certificate bind the candidate, for the safety report alone, and only a present defect is known there. |
 | Harmful FIX rate | Harmful published FIX endpoints / adjudicated published FIX endpoints. Bounds divide by all such publications, assigning unknowns first to safe, then harmful. Held and no-change attempts do not enter this denominator. |
 | Duplicate ratio | Confirmed findings after the first confirmation of their defect in the run / all confirmed findings. Bounds add all unknown labels to the denominator, first as nonduplicates and then as duplicates; conservative even if individual assignments would be impossible. |
 | Total cost per validated success | Sum USD across **all** launches in matched runs, including retries and unsuccessful runs / count of validated successes. Success requires the current certificate, nonempty passed FULL validation, a passing independent oracle and no eligible high or critical defect remaining. Missing charges or unresolved success make the ratio unknown. |
@@ -312,11 +333,12 @@ powered sample-size claim.
   10 paired negatives with accepted starting reviews and the cutoff-eligible starting
   evidence their recall or FPR observations need; exclude at most 10% of planned pairs.
 - **Safety first:** recorded new critical treatment escapes are `NO_GO` even from excluded
-  runs. A proven FIX-introduced treatment escape needs no counterpart. For a shared
+  runs or incomplete ledgers (see *Incomplete ledgers*). A proven FIX-introduced treatment
+  escape needs no counterpart; only a complete ledger proves that provenance. For a shared
   starting defect require a non-excluded baseline, equal starting validation, and evidence
-  that it did not escape;
-  absent or unresolved baseline evidence is not that evidence. A later defect without
-  attributed FIX provenance is reported but not automatically new treatment harm.
+  that it did not escape; absent or unresolved baseline evidence is not that evidence. A
+  later defect without attributed FIX provenance is reported but not automatically new
+  treatment harm.
 - **Other harm:** an entire usable envelope beyond a non-inferiority margin is `NO_GO`
   when there are no missing, incomparable or incomplete-ledger planned pairs. An upper
   recall envelope below +0.10 is `NO_GO` only at the sample floor and exclusion budget. A
@@ -362,7 +384,13 @@ changes no rate, draw, cost or sample floor and reports no finding, false alarm 
 FIX, while the safety report keeps its critical defect; a retained false alarm and a FIX
 regression are among what a gap leaves unreported. A superseded FIX source, a round its
 ordinal cannot hold, a pre-PR stop after a publication and a certificate off the fixed
-validation policy are refused, gapped or complete.
+validation policy are refused, gapped or complete. A critical starting defect that the
+treatment certifies and the baseline repairs stays a `NO_GO` escape when only the
+treatment's producer slot is missing, entering no rate, draw, cost or sample floor and
+crediting no FIX harm or validated success; without its exact terminal review, its
+disposition, a known presented result, the issuance or a cutoff-eligible inventory it stays
+unresolved, gapped or complete. A watermark of any magnitude reports its missing ordinals
+as bounded ranges.
 Existing
 controller tests (`test_routing.py`, `test_loop_guard.py`, `test_validation_gates.py`,
 `test_review_certificate.py`, `test_merge_certificate.py`, `test_partial_fix.py`,
