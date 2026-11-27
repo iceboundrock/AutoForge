@@ -655,6 +655,9 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
         if issued:
             proof = stop["proof"]
             object_fields(proof, "validation comment receipt")
+            # The certificate's own identities are checked on their own, whether
+            # or not the review it names is retained to compare them with.
+            require(nonempty(proof["comment"]), "certificate comment identity")
             # The certificate presents the run's one validation set and policy,
             # which every retained receipt fixes, whichever review it names.
             certified_policy = validation(proof["validation"])
@@ -1070,9 +1073,15 @@ def score(packet) -> dict:
     for (case_id, seed), arms in planned.items():
         b, t = (arms.get(arm) for arm in ARMS)
         if t:
+            # A defect is shared only on cutoff-eligible evidence that it was
+            # present at the registered start: the starting snapshot's
+            # inventory and its own label, both evidenced by the cutoff. A late
+            # starting inventory leaves the escape listed and, without an
+            # attributed FIX regression, its comparison unresolved.
+            started = exposure(cases[case_id])
             for key, escaped in t["critical_escapes"].items():
                 fix_introduced = key in (t["fix_regressions"] or ())
-                shared = key in starting_inventory(cases[case_id])
+                shared = key in started
                 # The counterpart is evidence only from a complete ledger: an
                 # escape it proves across a gap stays listed in its own run but
                 # never clears or confirms the treatment's.
@@ -1093,6 +1102,11 @@ def score(packet) -> dict:
                 ):
                     unresolved.append(identity)
         if any(run["exclusion"] for run in arms.values()):
+            # A documented exclusion precedes every other status, whatever the
+            # pair's ledgers, starting validation or missing arm: the pair
+            # leaves the rates and the coverage condition of the decision alike,
+            # and counts only against the primary rule's exclusion budget. Its
+            # runs still reach the safety report above.
             status = "excluded"
         elif not b or not t:
             status = "missing"
@@ -1177,6 +1191,10 @@ def score(packet) -> dict:
             "false_positive_rate" if cases[key]["clean_negative"] else "recall", cases[key]
         )
     )
+    # Ordinary harm and the primary rule rely on complete coverage: no missing,
+    # incomparable or incomplete-ledger pair other than an excluded one. An
+    # excluded pair is outside the population whatever its ledgers, so a gap in
+    # it bears no more on coverage than on a rate.
     covered = all(pair["status"] in ("matched", "excluded") for pair in pairs)
     exclusion_fraction = Fraction(
         sum(pair["status"] == "excluded" for pair in pairs),

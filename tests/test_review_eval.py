@@ -895,6 +895,66 @@ def test_a_gapped_baseline_escape_is_no_comparison_evidence(packet, gap):
     assert report["decision"] == "INCONCLUSIVE"
 
 
+@pytest.mark.parametrize("gap", [False, True])
+@pytest.mark.parametrize(("discovered", "eligible"), [("2026-11-20", True), ("2026-11-21", False)])
+def test_a_shared_escape_needs_cutoff_eligible_starting_evidence(packet, gap, discovered, eligible):
+    """Treatment certifies a distinct successor that still holds a critical starting defect.
+
+    `off-by-one`, now critical, survives treatment's published FIX and baseline
+    repairs it; `lost-data` is removed. Only the starting inventory's discovery
+    date moves, to the cutoff or past it.
+    """
+    recorded(packet, "wrong-boundary")
+    case = packet["cases"]["wrong-boundary"]
+    case["defects"]["off-by-one"]["severity"] = "critical"
+    del case["defects"]["lost-data"]
+    treatment = packet["runs"][1]
+    successor = treatment["stop"]["head"]
+    assert successor != case["start"]
+    case["snapshots"][successor]["present"] = ["off-by-one"]
+    case["snapshots"][case["start"]]["source"]["discovered"] = discovered
+    if gap:
+        treatment["launches"][0] = None  # Only the producer's slot is missing.
+    report = score(packet)
+    pair = report["pairs"][0]
+    got, baseline = pair["runs"]["treatment"], pair["runs"]["baseline"]
+    assert pair["status"] == ("incomplete_ledger" if gap else "matched")
+    # The successor's certificate, its exact terminal review and its own
+    # cutoff-eligible inventory prove the escape either way, and baseline, with
+    # equal starting validation, repaired the defect ...
+    assert got["critical_escapes"] == {"off-by-one": True}
+    assert baseline["critical_escapes"] == {"off-by-one": False}
+    assert got["starting_validation"] == baseline["starting_validation"] is not None
+    # ... while no FIX introduced it and no rate shows harm.
+    assert got["fix_regressions"] == (None if gap else [])
+    assert report["rate_harm"] == []
+    escape = [["wrong-boundary", 0, "off-by-one"]]
+    if eligible:
+        # A starting inventory evidenced by the cutoff shows the defect shared
+        # at the registered start: a new treatment escape.
+        assert report["new_critical_escapes"] == escape
+        assert report["unresolved_critical_escapes"] == []
+        assert report["decision"] == "NO_GO"
+        return
+    # The only evidence that it was shared at the start is late: the escape
+    # stays listed and its comparison unresolved, not new treatment harm.
+    assert report["new_critical_escapes"] == []
+    assert report["unresolved_critical_escapes"] == escape
+    assert report["decision"] == "INCONCLUSIVE"
+
+
+def test_an_attributed_fix_regression_needs_no_starting_evidence(packet):
+    recorded(packet, "wrong-boundary")
+    case = packet["cases"]["wrong-boundary"]
+    case["snapshots"][case["start"]]["source"]["discovered"] = "2026-11-21"
+    report = score(packet)
+    # Treatment's FIX introduced `lost-data` at its cutoff-eligible endpoint,
+    # which is independent of the late starting inventory.
+    assert result(packet, "wrong-boundary", "treatment")["fix_regressions"] == ["lost-data"]
+    assert report["new_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
+    assert report["decision"] == "NO_GO"
+
+
 def remove_from_ledger(run, gap):
     """Remove one piece of a valid run's ledger; return the ordinal ranges it leaves missing."""
     launches = run["launches"]
@@ -1347,6 +1407,62 @@ def test_excluded_failed_first_review_needs_no_completed_reply(packet):
     assert report["decision"] == "INCONCLUSIVE"
 
 
+def test_an_exclusion_precedes_a_gap_in_the_coverage_of_ordinary_harm(packet):
+    """A matched clean-negative pair shows FPR harm beside a pair missing a producer slot."""
+    copy_case(packet, "clean-boundary", "gapped")
+    del packet["cases"]["wrong-boundary"]
+    packet["runs"] = [run for run in packet["runs"] if run["case"] != "wrong-boundary"]
+    recorded(packet)
+    gapped = packet["runs"][-1]
+    assert (gapped["case"], gapped["arm"]) == ("gapped", "treatment")
+    complete = score(deepcopy(packet))
+    assert complete["pair_status"] == {"matched": 2}
+    assert complete["rate_harm"] == ["false_positive_rate"]
+    assert complete["decision"] == "NO_GO"
+    producer = gapped["launches"][0]
+    gapped["launches"][0] = None  # Only the copy's treatment producer slot is missing.
+    report = score(packet)
+    # Ordinary harm is observed in the matched pair, but a planned pair that is
+    # neither matched nor excluded has an incomplete ledger: no NO_GO from it.
+    assert report["pair_status"] == {"matched": 1, "incomplete_ledger": 1}
+    assert report["rate_harm"] == ["false_positive_rate"]
+    assert report["decision"] == "INCONCLUSIVE"
+    rates = report["rates"]
+    # A documented exclusion precedes every other pair status, so the gapped pair
+    # leaves the coverage condition as it leaves the rates: the decision is the
+    # one an excluded complete pair gives, and the run itself stays unresolved.
+    gapped["exclusion"] = "infrastructure"
+    for ledger in ("gapped", "complete"):
+        if ledger == "complete":
+            gapped["launches"][0] = producer
+        report = score(packet)
+        pair = report["pairs"][1]
+        row = pair["runs"]["treatment"]
+        assert (pair["case"], pair["status"]) == ("gapped", "excluded")
+        assert report["pair_status"] == {"matched": 1, "excluded": 1}
+        assert report["exclusion_fraction"] == "1/2"
+        assert report["rates"] == rates and report["rate_harm"] == ["false_positive_rate"]
+        assert report["decision"] == "NO_GO"
+        if ledger == "gapped":
+            assert row["ledger"] == "unresolved: incomplete ledger"
+            assert row["missing_ordinals"] == [[1, 1]]
+        else:
+            assert row["ledger"] == "complete" and row["missing_ordinals"] == []
+
+
+def test_an_excluded_gapped_treatment_keeps_its_proven_critical_escape(packet):
+    treatment = certify_a_shared_critical_defect(packet)
+    treatment["launches"][0] = None  # Only the producer's slot is missing.
+    treatment["exclusion"] = "infrastructure"
+    report = score(packet)
+    # The exclusion removes the pair from rates and coverage, not the escape its
+    # retained certificate proves from the safety report.
+    assert report["pair_status"] == {"excluded": 1} and report["matched_pairs"] == 0
+    assert report["pairs"][0]["runs"]["treatment"]["critical_escapes"] == {"off-by-one": True}
+    assert report["new_critical_escapes"] == [["wrong-boundary", 0, "off-by-one"]]
+    assert report["decision"] == "NO_GO"
+
+
 @pytest.mark.parametrize(
     ("change", "status"),
     [
@@ -1520,6 +1636,36 @@ def test_terminal_certificate_binds_every_input(packet, change):
         stop["round"] = 1
     with pytest.raises(EvidenceError):
         score(packet)
+
+
+@pytest.mark.parametrize("comment", [["fixture/comment/4"], {}, 4, None, "", "  "])
+@pytest.mark.parametrize("named", ["retained", "missing"])
+def test_an_issued_certificate_needs_a_well_formed_comment_identity(packet, comment, named):
+    recorded(packet, "wrong-boundary")
+    treatment = packet["runs"][1]
+    if named == "missing":
+        treatment["launches"][3] = None  # The terminal review the stop names is missing.
+    treatment["stop"]["proof"]["comment"] = comment
+    # A malformed identity is refused on its own, with or without the review to
+    # compare it with.
+    with pytest.raises(EvidenceError, match="certificate comment identity"):
+        score(packet)
+
+
+@pytest.mark.parametrize("comment", ["fixture/comment/4", "fixture/comment/other"])
+def test_a_well_formed_certificate_without_its_named_review_stays_unresolved(packet, comment):
+    recorded(packet, "wrong-boundary")
+    treatment = packet["runs"][1]
+    treatment["launches"][3] = None  # The terminal review the stop names is missing.
+    treatment["stop"]["proof"]["comment"] = comment
+    report = score(packet)
+    pair = report["pairs"][0]
+    got = pair["runs"]["treatment"]
+    # Nothing retained contradicts the certificate, and nothing proves it.
+    assert pair["status"] == "incomplete_ledger" and got["missing_ordinals"] == [[4, 4]]
+    assert got["certificate_issued"] is None and not got["terminal_bound"]
+    assert got["critical_escapes"] == {"lost-data": None}
+    assert report["unresolved_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
 
 
 def test_label_cutoff_and_agent_independence(packet):

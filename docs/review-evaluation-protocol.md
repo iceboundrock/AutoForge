@@ -127,9 +127,13 @@ unavailable service, or a documented pre-launch skip; stop/validation failures a
 exclusions. A `skipped` run is documented by a pre-PR stop at watermark zero; any launch
 slot, retained or reserved, or a later watermark contradicts it and the packet is refused.
 Keep both arms and report missing, incomparable, incomplete-ledger and excluded assignments
-separately.
-Exclusions remove pairs from rates, cost and bootstrap, not independently evidenced
-treatment harm. Do not replace a failed or missing seed; duplicate assignments are refused.
+separately. A documented exclusion of either arm precedes every other status: the pair is
+`excluded` whatever its ledgers, starting validation or missing arm.
+Exclusions remove pairs from rates, cost, bootstrap and the sample floor, and from the
+coverage condition of the decision (a gap in an excluded pair no more bears on coverage than
+on a rate), counting only against the primary rule's exclusion budget. They do not remove
+independently evidenced treatment harm from the safety report. Do not replace a failed or
+missing seed; duplicate assignments are refused.
 
 ### Packet and replay
 
@@ -179,8 +183,10 @@ treatment harm. Do not replace a failed or missing seed; duplicate assignments a
   current revision, last completed round and its review ordinal (or zero/null before any
   completion), an ordinal above that round. `issued` requires a terminal clean review at
   that ordinal with matching comment and exact presented validation, and a separate
-  certificate receipt reference. It is written when that round completes, so the ordinal
-  is the stop's watermark. A
+  certificate receipt reference. The certificate's comment and receipt identities are
+  nonempty strings, refused when malformed even where the review it names is missing; a
+  well-formed comment is compared with that review's whenever both are retained. It is
+  written when that round completes, so the ordinal is the stop's watermark. A
   presented receipt whose scope, set and policy match but whose result is unknown leaves
   issuance unproven (never filled from the certificate) while still stating starting
   validation; a conflicting known field is refused. The certificate presents the run's fixed
@@ -235,12 +241,14 @@ ledger when retained records establish it without any missing transition: the st
 `issued` certificate, the exact terminal clean review it names, retained at the watermark
 with its disposition, comment and a known presented result matching the certificate, and
 the cutoff-eligible independent inventory of that candidate listing the defect. Such an
-escape is `true` and enters the decision like any other: where a non-excluded baseline with
-equal starting validation evidences that the same starting defect did not escape, it is
-`NO_GO`. An incomplete counterpart is no comparison evidence either way: a baseline escape
-proven across a gap stays listed in its own run but leaves a treatment escape of the same
-defect unresolved. Nothing else follows from those records across a gap. Issuance as the
-run's terminal outcome stays unproven (`certificate_issued: null`,
+escape is `true` and enters the decision like any other: where cutoff-eligible starting
+evidence shows the defect shared at the registered start and a non-excluded baseline with
+equal starting validation evidences that it did not escape, it is `NO_GO`. A starting
+inventory evidenced after the cutoff is not that evidence: the escape stays listed, and
+its comparison unresolved. An incomplete counterpart is no comparison evidence either way:
+a baseline escape proven across a gap stays listed in its own run but leaves a treatment
+escape of the same defect unresolved. Nothing else follows from those records across a
+gap. Issuance as the run's terminal outcome stays unproven (`certificate_issued: null`,
 `terminal_bound: false`), validated success is `null`, no FIX is credited with the escape,
 so one a FIX introduced is listed but not as new treatment harm, and a critical defect
 absent from that inventory is not thereby shown not to have escaped. Without each of those
@@ -334,16 +342,21 @@ powered sample-size claim.
   evidence their recall or FPR observations need; exclude at most 10% of planned pairs.
 - **Safety first:** recorded new critical treatment escapes are `NO_GO` even from excluded
   runs or incomplete ledgers (see *Incomplete ledgers*). A proven FIX-introduced treatment
-  escape needs no counterpart; only a complete ledger proves that provenance. For a shared
-  starting defect require a non-excluded baseline, equal starting validation, and evidence
-  that it did not escape; absent or unresolved baseline evidence is not that evidence. A
-  later defect without attributed FIX provenance is reported but not automatically new
-  treatment harm.
+  escape needs no counterpart; only a complete ledger proves that provenance. A defect is a
+  shared starting defect only on cutoff-eligible evidence that it was present at the
+  registered start: the starting snapshot's inventory and the defect's own label, both
+  evidenced by the cutoff. For one require that evidence, a non-excluded baseline, equal
+  starting validation, and evidence that it did not escape; absent or unresolved baseline
+  evidence is not that evidence. A defect whose starting inventory was evidenced after the
+  cutoff, like a later defect without attributed FIX provenance, is reported, its comparison
+  unresolved, but not automatically new treatment harm.
 - **Other harm:** an entire usable envelope beyond a non-inferiority margin is `NO_GO`
-  when there are no missing, incomparable or incomplete-ledger planned pairs. An upper
-  recall envelope below +0.10 is `NO_GO` only at the sample floor and exclusion budget. A
-  measured cost above margin would also be `NO_GO`, but this version cannot measure
-  recorded cost.
+  when no planned pair is missing, incomparable or incomplete-ledger. An excluded pair is
+  none of these, whatever its ledgers: exclusion precedes every other status (see
+  *Registered comparison*), so a documented exclusion exempts its gap from this condition
+  as it does from the rates, and the safety report still reads its runs. An upper recall
+  envelope below +0.10 is `NO_GO` only at the sample floor and exclusion budget. A measured
+  cost above margin would also be `NO_GO`, but this version cannot measure recorded cost.
 - **Otherwise:** synthetic data and a missing arm without measured safety harm are
   `NOT_EVALUATED`. Any remaining recorded result is `INCONCLUSIVE` in this version.
   A later `GO` requires the registered primary and all non-inferiority limits established,
@@ -390,7 +403,16 @@ treatment's producer slot is missing, entering no rate, draw, cost or sample flo
 crediting no FIX harm or validated success; without its exact terminal review, its
 disposition, a known presented result, the issuance or a cutoff-eligible inventory it stays
 unresolved, gapped or complete. A watermark of any magnitude reports its missing ordinals
-as bounded ranges.
+as bounded ranges. A critical starting defect that survives at the treatment's distinct
+certified successor is a `NO_GO` escape when the starting inventory was evidenced by the
+cutoff and an unresolved comparison when only a later one shows it shared, gapped or
+complete, while a FIX regression gates without starting evidence. Beside a matched pair
+with FPR harm, a pair missing its treatment producer slot keeps the decision
+`INCONCLUSIVE` until a documented exclusion removes it, after which the decision is the
+`NO_GO` an excluded complete pair gives, and an excluded gapped treatment's proven critical
+escape stays `NO_GO`. A certificate whose comment identity is malformed is refused whether
+or not the review it names is retained; a well-formed one whose review is missing stays
+unresolved.
 Existing
 controller tests (`test_routing.py`, `test_loop_guard.py`, `test_validation_gates.py`,
 `test_review_certificate.py`, `test_merge_certificate.py`, `test_partial_fix.py`,
