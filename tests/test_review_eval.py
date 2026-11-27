@@ -1,6 +1,7 @@
 import json
 import sys
 import tracemalloc
+from collections import Counter
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
@@ -118,7 +119,12 @@ def test_fixture_replays_and_reports_hand_computed_results(packet, monkeypatch, 
     assert report["decision"] == "NOT_EVALUATED"
     assert report["matched_pairs"] == 2
     assert report["new_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
-    assert report["critical_escape_totals"]["treatment"] == {"known": 1, "unresolved": 0}
+    for population in ("all_runs", "matched_pairs"):
+        totals = report["critical_escape_totals"][population]
+        assert totals == {
+            "baseline": {"known": 0, "unresolved": 0},
+            "treatment": {"known": 1, "unresolved": 0},
+        }
     assert {key: value["difference"] for key, value in report["rates"].items()} == {
         "recall": "0",
         "precision": "-1/2",
@@ -324,6 +330,61 @@ def test_first_review_of_a_moved_head_needs_an_explicit_drift(packet, transition
     # are not starting evidence.
     assert not got["starting_review_accepted"] and got["starting_validation"] is None
     assert got["counts"]["recall"] is None and pair["status"] == "validation_unknown"
+
+
+def drift_before_round_one(packet):
+    """Baseline retries at the start with a receipt, then reviews a drifted descendant.
+
+    The descendant still carries the starting `off-by-one`, which round 1
+    confirms there twice; its FIX publishes the repaired revision on top of it.
+    """
+    case = packet["cases"]["wrong-boundary"]
+    run = packet["runs"][0]
+    first, fix, clean = run["launches"][1:]
+    moved, tree = "6" * 40, "7" * 40
+    case["snapshots"][moved] = dict(
+        deepcopy(case["snapshots"][case["start"]]), parents=[case["start"]], tree=tree
+    )
+    case["snapshots"][fix["published"]]["parents"] = [moved]
+    drifted = dict(first, head=moved, tree=tree, transition="drift")
+    run["launches"][1:] = [
+        retry_review(first),  # Its receipt states the starting validation.
+        drifted,
+        dict(fix, head=moved, tree=tree, source=3),
+        clean,
+    ]
+    run["stop"].update(through=5, review=5, wall_ms=None)
+    return drifted
+
+
+def test_a_round_accepted_after_drift_scores_precision_and_duplicates(packet):
+    expected = score(deepcopy(packet))
+    drifted = drift_before_round_one(packet)
+    report = score(packet)
+    pair = next(row for row in report["pairs"] if row["case"] == "wrong-boundary")
+    got = pair["runs"]["baseline"]
+    # The retry's receipt keeps the pair matched, and the accepted round 1 of
+    # the moved revision is complete with its confirmed findings retained ...
+    assert pair["status"] == "matched" and got["starting_validation"] is not None
+    assert got["review_record_complete"] and not got["starting_review_accepted"]
+    assert got["known_findings"] == {"R1-F1": "confirmed", "R1-F2": "confirmed"}
+    # ... so precision and duplicates score its payload as they would at the start.
+    for metric in ("precision", "duplicate_ratio"):
+        assert got["counts"][metric] == expected["pairs"][1]["runs"]["baseline"]["counts"][metric]
+        assert report["rates"][metric] == expected["rates"][metric], metric
+        assert report["rates"][metric]["difference"] == "-1/2"
+    # Recall, over the population registered at the start, and the sample
+    # floor still need an accepted review of the start itself.
+    assert got["counts"]["recall"] is None and report["rates"]["recall"]["difference"] is None
+    assert report["sample"] == {"defect": 0, "negative": 1}
+    # A genuinely missing or incomplete accepted payload still suppresses both contrasts.
+    for payload in (None, dict(drifted["findings"], complete=False)):
+        drifted["findings"] = payload
+        report = score(packet)
+        assert report["pairs"][1]["status"] == "matched"
+        for metric in ("precision", "duplicate_ratio"):
+            rates = report["rates"][metric]
+            assert rates["difference"] is None and not rates["usable"], metric
 
 
 def test_missing_stale_payload_keeps_accepted_finding_coverage(packet):
@@ -819,13 +880,17 @@ def test_a_gap_keeps_a_proven_shared_critical_escape(packet, gap):
         "cost_usd_per_validated_success",
         "sample",
         "matched_pairs",
-        "critical_escape_totals",
         "rate_harm",
     ):
         assert combined[key] == expected[key], key
     assert sorted(combined["new_critical_escapes"]) == sorted(
         [*expected["new_critical_escapes"], ["gapped", 0, "off-by-one"]]
     )
+    # The matched subtotal is unchanged; the all-run safety tally adds the copy's escape.
+    totals, before = combined["critical_escape_totals"], expected["critical_escape_totals"]
+    assert totals["matched_pairs"] == before["matched_pairs"]
+    assert totals["all_runs"]["baseline"] == before["all_runs"]["baseline"]
+    assert totals["all_runs"]["treatment"] == {"known": 2, "unresolved": 0}
     # A critical defect absent from the certified inventory is no proven
     # non-escape across the gap: it stays unresolved.
     packet["cases"]["wrong-boundary"]["defects"]["lost-data"]["severity"] = "critical"
@@ -1002,11 +1067,28 @@ def test_an_incomplete_ledger_is_unresolved_and_contributes_nothing(packet, case
         "cost_usd_per_validated_success",
         "sample",
         "matched_pairs",
-        "critical_escape_totals",
         "rate_harm",
         "decision",
     ):
         assert report[key] == expected[key], key
+    # The matched subtotal is unchanged, while the all-run safety tally reads
+    # both of the copy's runs: a gapped treatment's certificate still proves
+    # `lost-data` escaped while its exact terminal review is retained, and a
+    # gap leaves every other ending unresolved, never a proven non-escape.
+    totals, before = report["critical_escape_totals"], expected["critical_escape_totals"]
+    assert totals["matched_pairs"] == before["matched_pairs"]
+    added = {side: Counter() for side in ("baseline", "treatment")}
+    if case_id == "wrong-boundary":
+        if arm == "treatment":
+            proven = gap in ("producer", "review", "disposition")
+            added["treatment"]["known" if proven else "unresolved"] += 1
+        else:
+            added["baseline"]["unresolved"] += 1
+            added["treatment"]["known"] += 1  # The copy's complete treatment.
+    assert totals["all_runs"] == {
+        side: {key: count + added[side][key] for key, count in before["all_runs"][side].items()}
+        for side in ("baseline", "treatment")
+    }
     # The safety report still lists the copy's critical defect: unresolved where
     # the treatment is gapped, and established by the complete treatment's own
     # FIX regression where only the baseline is.
@@ -1461,6 +1543,43 @@ def test_an_excluded_gapped_treatment_keeps_its_proven_critical_escape(packet):
     assert report["pairs"][0]["runs"]["treatment"]["critical_escapes"] == {"off-by-one": True}
     assert report["new_critical_escapes"] == [["wrong-boundary", 0, "off-by-one"]]
     assert report["decision"] == "NO_GO"
+
+
+@pytest.mark.parametrize(
+    ("gap", "exclusion"), [(True, None), (True, "infrastructure"), (False, "infrastructure")]
+)
+def test_the_safety_tally_counts_every_run_apart_from_the_matched_subtotal(packet, gap, exclusion):
+    treatment = certify_a_shared_critical_defect(packet)
+    known = {"baseline": {"known": 0, "unresolved": 0}, "treatment": {"known": 1, "unresolved": 0}}
+    complete = score(deepcopy(packet))
+    assert complete["critical_escape_totals"] == {"all_runs": known, "matched_pairs": known}
+    if gap:
+        treatment["launches"][0] = None  # Only the treatment producer's slot is missing.
+    treatment["exclusion"] = exclusion
+    report = score(packet)
+    pair = report["pairs"][0]
+    got = pair["runs"]["treatment"]
+    assert pair["status"] == ("excluded" if exclusion else "incomplete_ledger")
+    # The proven escape stays in the safety report and in its all-run tally,
+    # while the matched subtotal, the rates' population, holds no run ...
+    assert got["critical_escapes"] == {"off-by-one": True}
+    assert report["new_critical_escapes"] == [["wrong-boundary", 0, "off-by-one"]]
+    assert report["decision"] == "NO_GO"
+    none = {"known": 0, "unresolved": 0}
+    assert report["critical_escape_totals"] == {
+        "all_runs": known,
+        "matched_pairs": {"baseline": none, "treatment": none},
+    }
+    # ... and the run enters no ordinary score.
+    assert report["matched_pairs"] == 0 and report["sample"] == {"defect": 0, "negative": 0}
+    assert all(rate["difference"] is None for rate in report["rates"].values())
+    assert report["cost_usd_per_validated_success"] == {"baseline": None, "treatment": None}
+    if gap:
+        # Nothing across the gap is inferred: no finding, terminal outcome,
+        # FIX attribution or validated success.
+        assert set(got["counts"].values()) == {None} and got["known_findings"] is None
+        assert got["certificate_issued"] is None and not got["terminal_bound"]
+        assert got["fix_regressions"] is None and got["validated_success"] is None
 
 
 @pytest.mark.parametrize(

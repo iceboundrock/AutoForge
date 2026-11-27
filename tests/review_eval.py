@@ -849,8 +849,13 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
     exposed = exposure(case)
     weight = sum(WEIGHT[case["defects"][key]["severity"]] for key in exposed)
     detected_weight = sum(WEIGHT[case["defects"][key]["severity"]] for key in exposed & detected)
-    # Ignoring candidate-specific eligibility only widens this outer bound.
+    # Recall and the clean-negative alarm observe the population registered at
+    # the start, which a drifted revision may no longer hold, so they also need
+    # an accepted review of the start. Precision and duplicates observe the
+    # findings of each complete accepted payload, each labeled against its own
+    # candidate, so a round accepted only after an explicit drift still counts.
     detail = complete and starting_accepted
+    # Ignoring candidate-specific eligibility only widens this outer bound.
     unknown = counts["unknown"]
     remaining_weights = sorted(
         (WEIGHT[case["defects"][key]["severity"]] for key in exposed - detected), reverse=True
@@ -890,7 +895,7 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
             "recall": (detected_weight, sum(remaining_weights[:unknown]), weight)
             if detail or not weight
             else None,
-            "precision": (counts["confirmed"], unknown, len(observations)) if detail else None,
+            "precision": (counts["confirmed"], unknown, len(observations)) if complete else None,
             "false_positive_rate": (int(alarm is True), int(alarm is None), 1)
             if negative
             else (0, 0, 0),
@@ -900,7 +905,7 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
                 unknown,
                 counts["confirmed"] + unknown,
             )
-            if detail
+            if complete
             else None,
         },
     }
@@ -953,6 +958,8 @@ def total_usage(values, complete, synthetic):
 
 METRICS = ("recall", "precision", "false_positive_rate", "harmful_fix_rate", "duplicate_ratio")
 FINDING_METRICS = set(METRICS) - {"harmful_fix_rate"}
+# Finding metrics whose population is registered at the starting candidate.
+STARTING_METRICS = {"recall", "false_positive_rate"}
 MARGINS = {
     "recall": Fraction(1, 10),
     "precision": Fraction(-1, 20),
@@ -1033,6 +1040,27 @@ def observes(metric, case) -> bool:
     if metric == "false_positive_rate":
         return case["clean_negative"] and start_evidenced(case)
     return True
+
+
+def covers(metric, run) -> bool:
+    """Whether a matched run's accepted payloads cover a finding metric.
+
+    Every finding metric needs each accepted payload complete. Recall and FPR
+    observe the registered start, so they also need an accepted review of it;
+    precision and duplicates score whatever candidate an accepted review saw.
+    """
+    return run["review_record_complete"] and (
+        metric not in STARTING_METRICS or run["starting_review_accepted"]
+    )
+
+
+def escape_tally(runs) -> dict:
+    """Known (``true``) and unresolved (``null``) critical escapes over some runs."""
+    values = [value for run in runs for value in run["critical_escapes"].values()]
+    return {
+        "known": sum(value is True for value in values),
+        "unresolved": sum(value is None for value in values),
+    }
 
 
 def pool(parts):
@@ -1131,7 +1159,7 @@ def score(packet) -> dict:
         # an observation of this metric neither enters its pool nor, through
         # its own coverage, suppresses the contrast of the cases that do.
         finding_gap = metric in FINDING_METRICS and any(
-            not (row["review_record_complete"] and row["starting_review_accepted"])
+            not covers(metric, row)
             for case_id, seeds in by_case.items()
             if observes(metric, cases[case_id])
             for pair in seeds
@@ -1229,20 +1257,16 @@ def score(packet) -> dict:
         "pairs": pairs,
         "new_critical_escapes": gate,
         "unresolved_critical_escapes": unresolved,
+        # The safety tally reads every run in the packet, as the safety report
+        # does, so an excluded or incomplete-ledger run keeps the escape its
+        # retained records prove (and its unresolved ones) without entering a
+        # rate. The matched subtotal is the rates' population, kept apart.
         "critical_escape_totals": {
-            arm: {
-                "known": sum(
-                    value is True
-                    for pair in matched
-                    for value in pair[arm]["critical_escapes"].values()
-                ),
-                "unresolved": sum(
-                    value is None
-                    for pair in matched
-                    for value in pair[arm]["critical_escapes"].values()
-                ),
-            }
-            for arm in ARMS
+            "all_runs": {
+                arm: escape_tally(arms[arm] for arms in planned.values() if arm in arms)
+                for arm in ARMS
+            },
+            "matched_pairs": {arm: escape_tally(pair[arm] for pair in matched) for arm in ARMS},
         },
         "rates": paired_rates,
         "cost_usd_per_validated_success": {arm: encoded(value) for arm, value in arm_cost.items()},

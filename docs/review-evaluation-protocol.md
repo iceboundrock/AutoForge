@@ -178,7 +178,9 @@ missing seed; duplicate assignments are refused.
   before a first stop leaves the run unresolved. Same-scope head drift
   is represented by a completed stale review with `next_head`, or an explicit `drift` at the
   next REVIEW before it begins, the first REVIEW included; a review of a moved revision is
-  never starting evidence, and one without an explicit drift is refused.
+  never starting evidence, and one without an explicit drift is refused. It states no
+  starting validation and is no accepted starting review, though a complete accepted payload
+  of it still enters precision and duplicates (see *Metrics, uncertainty and decision*).
 - The separately captured `stop` states the launch high-water mark (`through`), phase,
   current revision, last completed round and its review ordinal (or zero/null before any
   completion), an ordinal above that round. `issued` requires a terminal clean review at
@@ -302,15 +304,20 @@ that of accepted payloads only: a retained stale payload is still
 checked, but a missing one does not suppress a rate. A metric's population is fixed before
 coverage is checked: recall observes cases with eligible starting defects and FPR evidenced
 clean negatives, both known at registration, while precision and duplicates observe every
-matched case. Incomplete coverage in a case of the population suppresses that metric's
-contrast; a case outside it affects neither the pool nor its draws.
+matched case. Coverage follows the population. Precision and duplicates count the findings
+of every complete accepted payload, each labeled against its own candidate, so a round
+accepted only after an explicit drift from the start still counts. Recall and FPR are
+defined over what the registered start holds, which a drifted revision need not, so they
+also need an accepted review of the start, as the sample floor does. Incomplete coverage in
+a case of the population suppresses that metric's contrast; a case outside it affects
+neither the pool nor its draws.
 
 | Metric | Formula |
 |---|---|
 | Weighted recall | Weight of distinct confirmed starting defects / eligible starting defect weight. Lower bound is the confirmed share; the upper adds the heaviest undetected eligible start defects, at most one per unknown finding. This is an outer bound, not an attribution. |
 | Precision | Confirmed / (confirmed + false). Bounds assign unknown findings first to false, then to confirmed. |
 | Clean-negative FPR | Negative runs with at least one false finding / label-settled negative runs. In a complete ledger an evidenced false finding survives missing finding details. Absence is settled only with a complete accepted review record and no unknown findings. Bounds assign unresolved negatives first to no alarm, then to false alarm. Incomplete review coverage of a matched case in a finding metric's population prevents a usable pooled rate for that metric. |
-| Critical escapes | Independently evidenced eligible critical defects still present at a bound certified stop, even with an empty validation set. A bound non-issuance means no certified escapes; unresolved endings are counted separately. In an incomplete ledger only the stop's retained exact terminal review and matching certificate bind the candidate, for the safety report alone, and only a present defect is known there. |
+| Critical escapes | Independently evidenced eligible critical defects still present at a bound certified stop, even with an empty validation set. A bound non-issuance means no certified escapes; unresolved endings are counted separately. In an incomplete ledger only the stop's retained exact terminal review and matching certificate bind the candidate, for the safety report alone, and only a present defect is known there. `critical_escape_totals` tallies known (`true`) and unresolved (`null`) escapes by arm twice: `all_runs` over every run in the packet, excluded and incomplete-ledger runs included, as the safety report reads them, and `matched_pairs` over the matched population of the rates alone. |
 | Harmful FIX rate | Harmful published FIX endpoints / adjudicated published FIX endpoints. Bounds divide by all such publications, assigning unknowns first to safe, then harmful. Held and no-change attempts do not enter this denominator. |
 | Duplicate ratio | Confirmed findings after the first confirmation of their defect in the run / all confirmed findings. Bounds add all unknown labels to the denominator, first as nonduplicates and then as duplicates; conservative even if individual assignments would be impossible. |
 | Total cost per validated success | Sum USD across **all** launches in matched runs, including retries and unsuccessful runs / count of validated successes. Success requires the current certificate, nonempty passed FULL validation, a passing independent oracle and no eligible high or critical defect remaining. Missing charges or unresolved success make the ratio unknown. |
@@ -412,7 +419,13 @@ with FPR harm, a pair missing its treatment producer slot keeps the decision
 `NO_GO` an excluded complete pair gives, and an excluded gapped treatment's proven critical
 escape stays `NO_GO`. A certificate whose comment identity is malformed is refused whether
 or not the review it names is retained; a well-formed one whose review is missing stays
-unresolved.
+unresolved. A round 1 accepted after a starting receipt on a retry and an explicit drift
+to a descendant still carrying the starting defect keeps the pair matched and scores its
+complete payload for precision and duplicates, while recall and the sample floor still
+need an accepted starting review, and a missing or incomplete payload of that round still
+suppresses both contrasts. The all-run safety tally keeps a proven treatment escape when
+only its producer slot is missing or the pair is excluded, while the matched subtotal
+holds no such run and neither enters an ordinary score.
 Existing
 controller tests (`test_routing.py`, `test_loop_guard.py`, `test_validation_gates.py`,
 `test_review_certificate.py`, `test_merge_certificate.py`, `test_partial_fix.py`,
