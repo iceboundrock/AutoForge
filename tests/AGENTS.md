@@ -296,6 +296,15 @@ read it before adding tests for a listed area.
   holds one. `tests/test_evaluation.py` uses synthetic records and
   `tests/test_evaluation_fixture.py` the fixtures. A change to a pinned file moves
   a digest the protocol registers; see its section 11.
+- `tests/review_corpus.py` is no test either: REV-R1's corpus tool
+  (`docs/review-corpus.md`, #356), which checks a review corpus, verifies a
+  historical corpus's pins against a git object store read only, and scores
+  reviewer submissions offline, launching no reviewer and calling no model.
+  `tests/test_review_corpus.py` runs it on the synthetic fixture and on
+  throwaway repositories with fixed commit dates, never on this repository's
+  own history, which CI's shallow checkout does not hold: verifying the seed
+  is a maintainer's command. A change to a fixture moves a digest the document
+  registers.
 - `watched_fifo(path)` makes a FIFO and yields the list of times
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the
@@ -624,6 +633,10 @@ the evaluation protocol (#318)        test_evaluation.py (the pins, what arms ho
                                       runs in CI; the protocol held to its files),
                                       test_evaluation_fixture.py (the baseline on the real engine,
                                       its reproducibility, the negative fixtures, the oracle)
+the review corpus (REV-R1, #356)      test_review_corpus.py (the synthetic scorecards by hand,
+                                      label settlement, censoring, cutoff and leakage
+                                      refusals, the seed's unadjudicated state, verify on a
+                                      throwaway repository)
 troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
                                       a test that exists; the guide's links and the links
                                       into it resolve)

@@ -1,0 +1,1179 @@
+"""REV-R1: a historical review corpus and an offline reviewer benchmark (#356).
+
+``check`` holds a corpus to its closed version 1 format, its cutoff and leakage
+rules and its label rules; ``verify`` re-derives a historical corpus's pins from a
+local git object store, read only; ``score`` scores recorded reviewer submissions
+against the corpus's settled labels. Nothing here launches a reviewer, calls a
+model, reaches a network or writes to GitHub. See ``docs/review-corpus.md``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import stat
+import subprocess
+from collections import Counter
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
+from fractions import Fraction
+from functools import lru_cache
+from hashlib import sha256
+from pathlib import Path, PurePosixPath
+from random import Random
+
+from tests.review_eval import CLASSES, EXCLUSIONS, WEIGHT, rate
+
+FIXTURES = Path(__file__).parent / "fixtures" / "review_corpus"
+SEED = FIXTURES / "autoforge_seed.json"
+SYNTHETIC_CORPUS = FIXTURES / "synthetic_corpus.json"
+SYNTHETIC_SUBMISSIONS = FIXTURES / "synthetic_submissions.json"
+CORPUS_FORMAT = "autoforge-review-corpus"
+SUBMISSIONS_FORMAT = "autoforge-review-submissions"
+INPUT_FORMAT = "autoforge-review-input"
+VERSION = 1
+MAX_FILE_BYTES = 8 * 1024 * 1024
+SEVERITIES = tuple(WEIGHT)
+# Each curation stratum and whether its cases register defects.
+STRATA = {
+    "reviewed_defect": True,
+    "escape": True,
+    "revert": True,
+    "hard_negative": False,
+    "clean": False,
+}
+SOURCES = {"synthetic": ("synthetic",), "historical": ("pr_branch", "squash")}
+SUBMISSION_MODES = {"synthetic": "synthetic", "historical": "recorded"}
+# Who first reported a defect, relative to the case's own historical review.
+# A defect the case's own reviewer reported favours reviewers like it.
+DISCOVERY = ("same_review", "later_review", "post_merge", "revert")
+# A defect case holds at least one defect its stratum is named for.
+STRATUM_SOURCES = {
+    "reviewed_defect": {"same_review", "later_review"},
+    "escape": {"post_merge"},
+    "revert": {"revert"},
+}
+RISKS = ("routine", "elevated", "critical")
+CONTEXT_KINDS = {"issue", "issue_comment", "pr_body", "document"}
+ROLES = {"curator", "adjudicator", "arbiter"}
+DEFECT_VERDICTS = {"confirmed", "rejected", "unknown"}
+NEGATIVE_VERDICTS = {"clean", "defective", "unknown"}
+MATCH_VERDICTS = {"match", "false", "unknown"}
+CLASSIFICATIONS = ("blocked", "non-blocked", "nit")
+# A negative is settled only after this many days without a registered defect,
+# counted from its review cutoff to the end of its observation. Preregistered,
+# not measured: see the protocol's "Censoring".
+MIN_NEGATIVE_WINDOW_DAYS = 30
+BOOTSTRAP_DRAWS = 10_000
+BOOTSTRAP_SEED = 356
+LABEL_BAND = Fraction(1, 10)
+# One cluster resamples to itself: its interval is the point, not an uncertainty.
+MIN_CLUSTERS = 2
+CLAIM = "scorecards only: no benchmark decision, gate or rollout follows from this report"
+IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+OBJECT_ID = re.compile(r"[0-9a-f]{40}")
+DIGEST = re.compile(r"[0-9a-f]{64}")
+DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
+INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+HEX_RUN = re.compile(r"[0-9a-fA-F]{7,}")
+
+
+class CorpusError(ValueError):
+    """A corpus or a submission is malformed or contradicts itself."""
+
+
+def require(condition: object, rule: str) -> None:
+    if not condition:
+        raise CorpusError(rule)
+
+
+def closed(value, names: str) -> None:
+    require(isinstance(value, dict) and value.keys() == set(names.split()), f"fields: {names}")
+
+
+def nonempty(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def integer(value, minimum: int = 0) -> bool:
+    return type(value) is int and value >= minimum
+
+
+def object_id(value) -> str:
+    require(isinstance(value, str) and OBJECT_ID.fullmatch(value), "object id shape")
+    return value
+
+
+def day(value) -> date:
+    require(isinstance(value, str) and DAY.fullmatch(value), "date shape")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise CorpusError("date shape") from exc
+
+
+def instant(value) -> datetime:
+    require(isinstance(value, str) and INSTANT.fullmatch(value), "instant shape")
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError as exc:
+        raise CorpusError("instant shape") from exc
+
+
+def relative_path(value) -> str:
+    require(isinstance(value, str) and value and "\\" not in value, "repository path")
+    parts = PurePosixPath(value).parts
+    require(
+        not value.startswith("/") and ".." not in parts and "." not in value.split("/"),
+        "repository path",
+    )
+    require(str(PurePosixPath(value)) == value, "repository path")
+    return value
+
+
+def canonical(value) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def corpus_digest(corpus) -> str:
+    """The corpus's identity: its canonical JSON, whatever the file's layout."""
+    return sha256(canonical(corpus)).hexdigest()
+
+
+def input_digest(case) -> str:
+    """Everything a reviewer of the case is given, and nothing about its answer."""
+    return sha256(
+        canonical(
+            {
+                "format": INPUT_FORMAT,
+                "version": VERSION,
+                "review": case["review"],
+                "environment": case["environment"],
+                "context": [
+                    {key: item[key] for key in ("id", "kind", "ref", "sha256")}
+                    for item in case["context"]
+                ],
+            }
+        )
+    ).hexdigest()
+
+
+def names_commit(text: str, commits: Iterable[str]) -> bool:
+    """Whether ``text`` names a commit, abbreviated to seven digits or more."""
+    runs = [run.lower() for run in HEX_RUN.findall(text)]
+    return any(commit.startswith(run) or commit in run for commit in commits for run in runs)
+
+
+# -- labels -------------------------------------------------------------------
+
+LABEL_FIELDS = "by role verdict decided artifact"
+
+
+def check_labels(labels, verdicts, *, frozen: date, barred: frozenset, match=None) -> None:
+    """One label per identity, decided by the freeze, never by a barred identity.
+
+    ``barred`` holds the identities that acted on what is labeled: the case's
+    historical producer, reviewer and fixer, and for a finding the reviewer
+    variants. A curator proposes; only adjudicators and arbiters decide.
+    """
+    require(isinstance(labels, list), "labels")
+    seen = set()
+    for label in labels:
+        closed(label, LABEL_FIELDS + (" defect" if match is not None else ""))
+        require(nonempty(label["by"]) and nonempty(label["artifact"]), "label provenance")
+        require(label["role"] in ROLES and label["verdict"] in verdicts, "label verdict")
+        require(day(label["decided"]) <= frozen, "label decided after the freeze")
+        require(label["by"].strip() not in barred, "an actor cannot adjudicate")
+        require(label["by"].strip() not in seen, "one label per identity")
+        seen.add(label["by"].strip())
+        if match is not None:
+            if label["verdict"] == "match":
+                require(label["defect"] in match, "match names a registered defect")
+            else:
+                require(label["defect"] is None, "only a match names a defect")
+    votes = {verdict_of(label) for label in labels if counted(label, "adjudicator")}
+    if any(counted(label, "arbiter") for label in labels):
+        require(len(votes) > 1, "an arbiter settles a disagreement only")
+
+
+def counted(label, role: str) -> bool:
+    return label["role"] == role and label["verdict"] != "unknown"
+
+
+def verdict_of(label):
+    return (label["verdict"], label["defect"]) if "defect" in label else label["verdict"]
+
+
+def settle(labels, need: Callable[[object], int] = lambda _: 1):
+    """The settled verdict, or ``None`` when the labels leave it unknown.
+
+    A curator's proposal never settles anything. Adjudicators must agree, at
+    least ``need(verdict)`` of them (two for a critical defect); a disagreement
+    stays unknown unless arbiters, all of one verdict, settle it.
+    """
+    arbiters = {verdict_of(label) for label in labels if counted(label, "arbiter")}
+    if arbiters:
+        return next(iter(arbiters)) if len(arbiters) == 1 else None
+    votes = [verdict_of(label) for label in labels if counted(label, "adjudicator")]
+    if len(set(votes)) != 1:
+        return None
+    return votes[0] if len(votes) >= need(votes[0]) else None
+
+
+def critical_needs_two(severity: str) -> Callable[[object], int]:
+    """A critical defect is settled either way by two adjudicators, any other by one."""
+    return lambda _: 2 if severity == "critical" else 1
+
+
+# -- the corpus ---------------------------------------------------------------
+
+CORPUS_FIELDS = "format version mode name release frozen repository cases"
+CASE_FIELDS = (
+    "stratum cluster provenance review environment context actors risk defects negative withheld"
+)
+DEFECT_FIELDS = "severity class introduced summary location discovery labels"
+
+
+@dataclass(frozen=True)
+class Defect:
+    severity: str
+    cls: str
+    source: str
+    discovered: date
+    status: str  # confirmed, rejected or unknown
+
+
+@dataclass(frozen=True)
+class Case:
+    id: str
+    cluster: str
+    stratum: str
+    risk: str
+    cutoff: datetime
+    actors: frozenset
+    defects: dict
+    negative: str | None  # settled, censored, unlabeled, refuted; None for a defect case
+    runnable: bool
+    input: str
+
+    @property
+    def confirmed(self) -> dict:
+        return {key: d for key, d in self.defects.items() if d.status == "confirmed"}
+
+    @property
+    def earliest_discovery(self) -> date | None:
+        return min((d.discovered for d in self.defects.values()), default=None)
+
+
+@dataclass(frozen=True)
+class Corpus:
+    name: str
+    release: int
+    mode: str
+    frozen: date
+    digest: str
+    cases: dict = field(default_factory=dict)
+
+
+def check_context(items, *, cutoff: datetime, forbidden: set) -> bool:
+    """Admit only what existed by the cutoff and names no withheld commit."""
+    require(isinstance(items, list), "context")
+    ids = set()
+    captured = True
+    for item in items:
+        closed(item, "id kind ref observed_at status text sha256")
+        require(isinstance(item["id"], str) and IDENTIFIER.fullmatch(item["id"]), "context id")
+        require(item["id"] not in ids, "context id repeated")
+        ids.add(item["id"])
+        require(item["kind"] in CONTEXT_KINDS and nonempty(item["ref"]), "context kind")
+        if item["status"] == "not_captured":
+            require(
+                item["observed_at"] is None and item["text"] is None and item["sha256"] is None,
+                "an uncaptured context holds nothing",
+            )
+            captured = False
+            continue
+        require(item["status"] == "captured", "context status")
+        require(instant(item["observed_at"]) <= cutoff, "context observed after the cutoff")
+        require(nonempty(item["text"]), "captured context text")
+        require(item["sha256"] == sha256(item["text"].encode()).hexdigest(), "context digest")
+        require(not names_commit(item["text"], forbidden), "context names a withheld commit")
+    return captured
+
+
+def check_defect(key, defect, *, case, cutoff: datetime, frozen: date, withheld, barred) -> Defect:
+    require(isinstance(key, str) and IDENTIFIER.fullmatch(key), "defect id")
+    closed(defect, DEFECT_FIELDS)
+    require(defect["severity"] in WEIGHT and defect["class"] in CLASSES, "defect rubric")
+    review = case["review"]
+    introduced = object_id(defect["introduced"])
+    require(introduced != review["merge_base"], "a defect is introduced above the merge base")
+    require(introduced not in withheld, "a withheld commit cannot introduce a present defect")
+    require(nonempty(defect["summary"]), "defect summary")
+    require(isinstance(defect["location"], list), "defect location")
+    for place in defect["location"]:
+        closed(place, "path lines")
+        relative_path(place["path"])
+        lines = place["lines"]
+        require(
+            lines is None
+            or (
+                isinstance(lines, list)
+                and len(lines) == 2
+                and all(integer(n, 1) for n in lines)
+                and lines[0] <= lines[1]
+            ),
+            "defect lines",
+        )
+    found = defect["discovery"]
+    closed(found, "source round finding discovered fix")
+    require(found["source"] in DISCOVERY, "discovery source")
+    discovered = day(found["discovered"])
+    require(cutoff.date() <= discovered <= frozen, "discovered between cutoff and freeze")
+    require(found["finding"] is None or nonempty(found["finding"]), "discovery finding")
+    reviewed = case["provenance"]["round"]
+    if found["source"] in ("same_review", "later_review"):
+        require(integer(found["round"], 1), "a review's discovery names its round")
+        if reviewed is not None:
+            same = found["round"] == reviewed
+            require(same == (found["source"] == "same_review"), "discovery round")
+            require(found["round"] >= reviewed, "discovery round")
+    else:
+        require(found["round"] is None, "only a review's discovery names a round")
+    if found["fix"] is not None:
+        fix = object_id(found["fix"])
+        require(fix in withheld, "a fix is withheld from the reviewer")
+    check_labels(defect["labels"], DEFECT_VERDICTS, frozen=frozen, barred=barred)
+    status = settle(defect["labels"], critical_needs_two(defect["severity"]))
+    return Defect(
+        severity=defect["severity"],
+        cls=defect["class"],
+        source=found["source"],
+        discovered=discovered,
+        status=status if status in ("confirmed", "rejected") else "unknown",
+    )
+
+
+def check_case(case_id, case, *, mode: str, frozen: date) -> Case:
+    require(isinstance(case_id, str) and IDENTIFIER.fullmatch(case_id), "case id")
+    closed(case, CASE_FIELDS)
+    require(case["stratum"] in STRATA, "case stratum")
+    require(isinstance(case["cluster"], str) and IDENTIFIER.fullmatch(case["cluster"]), "cluster")
+    origin = case["provenance"]
+    closed(origin, "source issue pr round selection note")
+    require(origin["source"] in SOURCES[mode], "provenance source for the corpus mode")
+    for number in ("issue", "pr"):
+        require(origin[number] is None or integer(origin[number], 1), "provenance number")
+    require(nonempty(origin["selection"]) and isinstance(origin["note"], str), "provenance")
+    if origin["source"] == "pr_branch":
+        require(origin["issue"] is not None and integer(origin["round"], 1), "a branch round")
+    elif origin["source"] == "squash":
+        require(origin["round"] is None, "a squash candidate is no review round")
+    else:
+        require(origin["round"] is None or integer(origin["round"], 1), "provenance round")
+    review = case["review"]
+    closed(review, "base_ref merge_base head tree cutoff")
+    require(nonempty(review["base_ref"]), "base ref")
+    head, base = object_id(review["head"]), object_id(review["merge_base"])
+    object_id(review["tree"])
+    require(head != base, "the candidate is above its merge base")
+    cutoff = instant(review["cutoff"])
+    require(cutoff.date() <= frozen, "a candidate reviewed by the freeze")
+    environment = case["environment"]
+    closed(environment, "files validation")
+    require(isinstance(environment["files"], dict), "environment files")
+    for path, blob in environment["files"].items():
+        relative_path(path)
+        object_id(blob)
+    require(
+        isinstance(environment["validation"], list)
+        and all(nonempty(command) for command in environment["validation"]),
+        "environment validation",
+    )
+    withheld = case["withheld"]
+    require(isinstance(withheld, list), "withheld commits")
+    for commit in withheld:
+        object_id(commit)
+    require(len(set(withheld)) == len(withheld), "withheld commit repeated")
+    require(head not in withheld and base not in withheld, "the candidate is not withheld")
+    actors = case["actors"]
+    require(
+        isinstance(actors, list) and actors and all(nonempty(actor) for actor in actors),
+        "historical actors",
+    )
+    barred = frozenset(actor.strip() for actor in actors)
+    require(len(barred) == len(actors), "historical actor repeated")
+    risk = case["risk"]
+    closed(risk, "stratum rationale")
+    require(risk["stratum"] in RISKS and nonempty(risk["rationale"]), "risk stratum")
+    forbidden = set(withheld)
+    runnable = check_context(case["context"], cutoff=cutoff, forbidden=forbidden)
+    require(isinstance(case["defects"], dict), "defects")
+    if STRATA[case["stratum"]]:
+        require(case["defects"] and case["negative"] is None, "a defect case registers its defects")
+    else:
+        require(not case["defects"], "a negative case registers no defect")
+    defects = {
+        key: check_defect(
+            key, defect, case=case, cutoff=cutoff, frozen=frozen, withheld=forbidden, barred=barred
+        )
+        for key, defect in case["defects"].items()
+    }
+    negative = None
+    if STRATA[case["stratum"]]:
+        sources = {defect.source for defect in defects.values()}
+        require(sources & STRATUM_SOURCES[case["stratum"]], "a defect of the case's stratum")
+    else:
+        closed(case["negative"], "observed_through labels")
+        through = day(case["negative"]["observed_through"])
+        require(cutoff.date() <= through <= frozen, "observed between cutoff and freeze")
+        labels = case["negative"]["labels"]
+        check_labels(labels, NEGATIVE_VERDICTS, frozen=frozen, barred=barred)
+        verdict = settle(labels)
+        if verdict == "defective":
+            negative = "refuted"
+        elif verdict != "clean":
+            negative = "unlabeled"
+        elif (through - cutoff.date()).days < MIN_NEGATIVE_WINDOW_DAYS:
+            negative = "censored"
+        else:
+            negative = "settled"
+    return Case(
+        id=case_id,
+        cluster=case["cluster"],
+        stratum=case["stratum"],
+        risk=risk["stratum"],
+        cutoff=cutoff,
+        actors=barred,
+        defects=defects,
+        negative=negative,
+        runnable=runnable,
+        input=input_digest(case),
+    )
+
+
+def check_corpus(corpus) -> Corpus:
+    closed(corpus, CORPUS_FIELDS)
+    require(corpus["format"] == CORPUS_FORMAT, "corpus format")
+    require(type(corpus["version"]) is int and corpus["version"] == VERSION, "corpus version")
+    require(corpus["mode"] in SOURCES, "corpus mode")
+    require(isinstance(corpus["name"], str) and IDENTIFIER.fullmatch(corpus["name"]), "name")
+    require(integer(corpus["release"], 1), "corpus release")
+    frozen = day(corpus["frozen"])
+    closed(corpus["repository"], "slug root")
+    require(nonempty(corpus["repository"]["slug"]), "repository slug")
+    object_id(corpus["repository"]["root"])
+    require(isinstance(corpus["cases"], dict) and corpus["cases"], "registered cases")
+    cases = {
+        case_id: check_case(case_id, case, mode=corpus["mode"], frozen=frozen)
+        for case_id, case in sorted(corpus["cases"].items())
+    }
+    inputs = [case.input for case in cases.values()]
+    require(len(set(inputs)) == len(inputs), "two cases with one review input")
+    return Corpus(
+        name=corpus["name"],
+        release=corpus["release"],
+        mode=corpus["mode"],
+        frozen=frozen,
+        digest=corpus_digest(corpus),
+        cases=cases,
+    )
+
+
+def label_summary(cases: Iterable[Case]) -> dict:
+    cases = list(cases)
+    defects = [d for case in cases for d in case.defects.values()]
+
+    def statuses(selected) -> dict:
+        tally = Counter(d.status for d in selected)
+        return {status: tally[status] for status in ("confirmed", "rejected", "unknown")}
+
+    negatives = Counter(case.negative for case in cases if case.negative is not None)
+    return {
+        "defects": statuses(defects),
+        "defects_by_severity": {
+            s: statuses(d for d in defects if d.severity == s) for s in SEVERITIES
+        },
+        "defects_by_discovery": {
+            s: statuses(d for d in defects if d.source == s) for s in DISCOVERY
+        },
+        "negatives": {
+            status: negatives[status] for status in ("settled", "censored", "unlabeled", "refuted")
+        },
+    }
+
+
+def describe(corpus) -> dict:
+    """What a corpus holds and how much of it is settled, without any submission."""
+    checked = check_corpus(corpus)
+    cases = checked.cases.values()
+    return {
+        "corpus": {
+            "name": checked.name,
+            "release": checked.release,
+            "mode": checked.mode,
+            "frozen": checked.frozen.isoformat(),
+            "sha256": checked.digest,
+        },
+        "cases": len(checked.cases),
+        "clusters": len({case.cluster for case in cases}),
+        "strata": dict(sorted(Counter(case.stratum for case in cases).items())),
+        "risk": dict(sorted(Counter(case.risk for case in cases).items())),
+        "runnable": sorted(case.id for case in cases if case.runnable),
+        "labels": label_summary(cases),
+        "inputs": {case.id: case.input for case in cases},
+    }
+
+
+# -- git ----------------------------------------------------------------------
+
+# A read-only git that reads none of the operator's system or global
+# configuration or GIT_* variables, fetches nothing, and honours no replacement
+# object, hook or file-system monitor of the repository's own configuration.
+GIT_ENV_KEEP = ("PATH", "LANG", "LANGUAGE", "TMPDIR")
+GIT_ENV = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+}
+GIT_SWITCHES = (
+    "--no-replace-objects",
+    "-c",
+    "protocol.allow=never",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+)
+
+
+class Git:
+    def __init__(self, repo: Path):
+        self.repo = repo
+        self.env = {
+            key: value
+            for key, value in os.environ.items()
+            if key in GIT_ENV_KEEP or key.startswith("LC_")
+        } | GIT_ENV
+
+    def run(self, *args: str) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", *GIT_SWITCHES, "-C", str(self.repo), *args],
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+
+    def out(self, *args: str) -> str | None:
+        done = self.run(*args)
+        return done.stdout.decode().strip() if done.returncode == 0 else None
+
+    def kind(self, oid: str) -> str | None:
+        return self.out("cat-file", "-t", oid)
+
+    def resolve(self, spec: str) -> str | None:
+        return self.out("rev-parse", "--verify", "--quiet", "--end-of-options", spec)
+
+    def is_ancestor(self, older: str, newer: str) -> bool | None:
+        code = self.run("merge-base", "--is-ancestor", older, newer).returncode
+        return {0: True, 1: False}.get(code)
+
+    def committed(self, commit: str) -> int | None:
+        stamp = self.out("show", "-s", "--format=%ct", commit)
+        return int(stamp) if stamp and stamp.isdigit() else None
+
+    def line_count(self, commit: str, path: str) -> int | None:
+        done = self.run("cat-file", "blob", f"{commit}:{path}")
+        if done.returncode:
+            return None
+        body = done.stdout
+        return body.count(b"\n") + (1 if body and not body.endswith(b"\n") else 0)
+
+
+def verify_case(git: Git, case, root: str) -> list[str]:
+    """The rules a historical case's pins fail against ``git``'s object store."""
+    failed: list[str] = []
+
+    def check(ok: object, rule: str) -> None:
+        if ok is not True:
+            failed.append(rule)
+
+    review = case["review"]
+    head, base = review["head"], review["merge_base"]
+    cutoff = int(instant(review["cutoff"]).timestamp())
+    check(git.kind(head) == "commit", "head is a commit")
+    check(git.kind(base) == "commit", "merge base is a commit")
+    if failed:
+        return failed
+    check(git.resolve(f"{head}^{{tree}}") == review["tree"], "head tree")
+    check(git.is_ancestor(base, head), "merge base is an ancestor of head")
+    check(git.is_ancestor(root, head), "repository root is an ancestor of head")
+    stamp = git.committed(head)
+    check(stamp is not None and stamp <= cutoff, "head committed by the cutoff")
+    if case["provenance"]["source"] == "squash":
+        check(git.resolve(f"{head}^1") == base, "a squash candidate's parent is its merge base")
+    for index, (path, blob) in enumerate(sorted(case["environment"]["files"].items())):
+        found = git.resolve(f"{head}:{path}")
+        check(found == blob and git.kind(blob) == "blob", f"environment file {index}")
+    for commit in case["withheld"]:
+        if git.kind(commit) != "commit":
+            failed.append(f"withheld {commit[:12]} is a commit")
+            continue
+        check(git.is_ancestor(commit, head) is False, f"withheld {commit[:12]} is not in head")
+        stamp = git.committed(commit)
+        check(stamp is not None and stamp > cutoff, f"withheld {commit[:12]} follows the cutoff")
+    for key, defect in sorted(case["defects"].items()):
+        introduced = defect["introduced"]
+        if git.kind(introduced) != "commit":
+            failed.append(f"defect {key} introduced by a commit")
+            continue
+        check(git.is_ancestor(introduced, head), f"defect {key} introduced in head")
+        check(git.is_ancestor(introduced, base) is False, f"defect {key} above the merge base")
+        fix = defect["discovery"]["fix"]
+        if fix is not None:
+            check(git.is_ancestor(introduced, fix), f"defect {key} fix follows its introduction")
+        for index, place in enumerate(defect["location"]):
+            count = git.line_count(head, place["path"])
+            lines = place["lines"]
+            check(
+                count is not None and (lines is None or lines[1] <= count),
+                f"defect {key} location {index}",
+            )
+    return failed
+
+
+def verify(corpus, repo: Path) -> dict:
+    """Re-derive every pin of a historical corpus from a local object store."""
+    checked = check_corpus(corpus)
+    require(checked.mode == "historical", "only a historical corpus names real objects")
+    git = Git(repo)
+    root = corpus["repository"]["root"]
+    cases = {case_id: verify_case(git, corpus["cases"][case_id], root) for case_id in checked.cases}
+    return {
+        "corpus": checked.digest,
+        "ok": not any(cases.values()),
+        "cases": {
+            case_id: {"ok": not failed, "failed": failed} for case_id, failed in cases.items()
+        },
+    }
+
+
+# -- submissions --------------------------------------------------------------
+
+SUBMISSION_FIELDS = "format version mode corpus frozen baseline plan variants runs"
+VARIANT_FIELDS = (
+    "identity provider provider_version model effort knowledge_cutoff prompt controller sandbox"
+)
+RUN_FIELDS = "variant case seed input status exclusion cost_microusd findings"
+FINDING_FIELDS = "id classification title location labels"
+
+
+@dataclass(frozen=True)
+class Run:
+    variant: str
+    case: Case
+    seed: int
+    status: str
+    cost: int | None
+    findings: (
+        tuple  # (classification, verdict, defect) per finding; verdict confirmed/false/unknown
+    )
+
+
+def check_variant(name, variant) -> str:
+    require(isinstance(name, str) and IDENTIFIER.fullmatch(name), "variant id")
+    closed(variant, VARIANT_FIELDS)
+    for key in ("identity", "provider", "provider_version", "model", "effort", "sandbox"):
+        require(nonempty(variant[key]), f"variant {key}")
+    if variant["knowledge_cutoff"] is not None:
+        day(variant["knowledge_cutoff"])
+    closed(variant["prompt"], "template sha256")
+    relative_path(variant["prompt"]["template"])
+    require(
+        isinstance(variant["prompt"]["sha256"], str)
+        and DIGEST.fullmatch(variant["prompt"]["sha256"]),
+        "prompt digest",
+    )
+    object_id(variant["controller"])
+    return variant["identity"].strip()
+
+
+def finding_verdict(finding, case: Case) -> tuple:
+    """A finding's settled label against the case's settled defects."""
+
+    def need(verdict) -> int:
+        kind, key = verdict
+        return 2 if kind == "match" and case.defects[key].severity == "critical" else 1
+
+    settled = settle(finding["labels"], need)
+    if settled is None:
+        return finding["classification"], "unknown", None
+    if settled[0] == "false":
+        return finding["classification"], "false", None
+    status = case.defects[settled[1]].status
+    verdict = {"confirmed": "confirmed", "rejected": "false"}.get(status, "unknown")
+    return finding["classification"], verdict, settled[1] if verdict == "confirmed" else None
+
+
+def check_run(run, *, corpus: Corpus, variants: dict, plan, frozen: date, barred) -> Run:
+    closed(run, RUN_FIELDS)
+    require(run["variant"] in variants, "run of a registered variant")
+    require(run["case"] in plan["cases"] and integer(run["seed"], 1), "planned case")
+    require(run["seed"] in plan["seeds"], "planned seed")
+    case = corpus.cases[run["case"]]
+    require(run["input"] == case.input, "a run reviews the case's frozen input")
+    require(run["cost_microusd"] is None or integer(run["cost_microusd"]), "run cost")
+    status = run["status"]
+    require(status in ("completed", "failed", "excluded"), "run status")
+    if status == "excluded":
+        require(run["exclusion"] in EXCLUSIONS, "documented exclusion")
+    else:
+        require(run["exclusion"] is None, "only an excluded run names an exclusion")
+    if status != "completed":
+        require(run["findings"] is None, "only a completed run holds findings")
+        return Run(run["variant"], case, run["seed"], status, run["cost_microusd"], ())
+    require(isinstance(run["findings"], list), "a completed run holds its findings")
+    ids = set()
+    findings = []
+    for finding in run["findings"]:
+        closed(finding, FINDING_FIELDS)
+        require(nonempty(finding["id"]) and finding["id"] not in ids, "finding id")
+        ids.add(finding["id"])
+        require(finding["classification"] in CLASSIFICATIONS, "finding classification")
+        require(nonempty(finding["title"]) and nonempty(finding["location"]), "finding text")
+        check_labels(
+            finding["labels"],
+            MATCH_VERDICTS,
+            frozen=frozen,
+            barred=barred | case.actors,
+            match=case.defects,
+        )
+        findings.append(finding_verdict(finding, case))
+    return Run(run["variant"], case, run["seed"], status, run["cost_microusd"], tuple(findings))
+
+
+def check_submissions(corpus: Corpus, submissions) -> list[Run]:
+    closed(submissions, SUBMISSION_FIELDS)
+    require(submissions["format"] == SUBMISSIONS_FORMAT, "submissions format")
+    version = submissions["version"]
+    require(type(version) is int and version == VERSION, "submissions version")
+    require(submissions["mode"] == SUBMISSION_MODES[corpus.mode], "submissions mode for corpus")
+    require(submissions["corpus"] == corpus.digest, "submissions name this exact corpus")
+    frozen = day(submissions["frozen"])
+    plan = submissions["plan"]
+    closed(plan, "cases seeds")
+    require(isinstance(plan["cases"], list) and plan["cases"], "planned cases")
+    require(len(set(plan["cases"])) == len(plan["cases"]), "planned case repeated")
+    for case_id in plan["cases"]:
+        require(case_id in corpus.cases, "planned case registered")
+        require(corpus.cases[case_id].runnable, "a planned case has its context captured")
+    seeds = plan["seeds"]
+    require(isinstance(seeds, list) and seeds and all(integer(s, 1) for s in seeds), "seeds")
+    require(len(set(seeds)) == len(seeds), "planned seed repeated")
+    variants = submissions["variants"]
+    require(isinstance(variants, dict) and len(variants) >= 2, "a baseline and a variant")
+    identities = [check_variant(name, variant) for name, variant in sorted(variants.items())]
+    require(len(set(identities)) == len(identities), "variant identity repeated")
+    require(submissions["baseline"] in variants, "the baseline is a registered variant")
+    require(isinstance(submissions["runs"], list), "runs")
+    barred = frozenset(identities)
+    runs = [
+        check_run(run, corpus=corpus, variants=variants, plan=plan, frozen=frozen, barred=barred)
+        for run in submissions["runs"]
+    ]
+    keys = [(run.variant, run.case.id, run.seed) for run in runs]
+    require(len(set(keys)) == len(keys), "one run per variant, case and seed")
+    return runs
+
+
+# -- scoring ------------------------------------------------------------------
+
+Counts = tuple[int, int, int]  # (yes, unknown, total), as review_eval.rate reads them
+
+
+def run_counts(run: Run) -> dict[str, Counts]:
+    """Each metric's observations in one completed run, keyed by metric.
+
+    Recall counts the weight of the case's confirmed defects; an unknown
+    finding may at most have found the heaviest one still undetected (an outer
+    bound, not an attribution). Strata count defects, each bounded on its own.
+    """
+    case = run.case
+    confirmed = case.confirmed
+    detected = {key for _, verdict, key in run.findings if verdict == "confirmed"}
+    tally = Counter(verdict for _, verdict, _ in run.findings)
+    unknown = tally["unknown"]
+    out: dict[str, Counts] = {
+        "precision": (tally["confirmed"], unknown, len(run.findings)),
+    }
+    for classification in CLASSIFICATIONS:
+        mine = [verdict for c, verdict, _ in run.findings if c == classification]
+        if mine:
+            out[f"precision/classification/{classification}"] = (
+                mine.count("confirmed"),
+                mine.count("unknown"),
+                len(mine),
+            )
+    if confirmed:
+        missed = sorted(
+            (WEIGHT[d.severity] for k, d in confirmed.items() if k not in detected), reverse=True
+        )
+        extra = sum(missed[:unknown])
+        found = sum(WEIGHT[confirmed[key].severity] for key in detected)
+        total = sum(WEIGHT[d.severity] for d in confirmed.values())
+        out["recall"] = (found, extra, total)
+        out[f"recall/risk/{case.risk}"] = (found, extra, total)
+        for name, attribute, values in (
+            ("severity", "severity", SEVERITIES),
+            ("discovery", "source", DISCOVERY),
+        ):
+            for value in values:
+                mine_keys = [k for k, d in confirmed.items() if getattr(d, attribute) == value]
+                if mine_keys:
+                    hit = sum(key in detected for key in mine_keys)
+                    out[f"recall/{name}/{value}"] = (
+                        hit,
+                        min(unknown, len(mine_keys) - hit),
+                        len(mine_keys),
+                    )
+    if case.negative == "settled":
+        alarm = tally["false"] > 0
+        out["false_positive_rate"] = (int(alarm), int(not alarm and unknown > 0), 1)
+    return out
+
+
+def metric_keys() -> list[str]:
+    keys = ["recall", "precision", "false_positive_rate"]
+    keys += [f"recall/severity/{s}" for s in SEVERITIES]
+    keys += [f"recall/discovery/{s}" for s in DISCOVERY]
+    keys += [f"recall/risk/{r}" for r in RISKS]
+    keys += [f"precision/classification/{c}" for c in CLASSIFICATIONS]
+    return keys
+
+
+@lru_cache(maxsize=64)
+def multiplicities(clusters: int) -> tuple[tuple[int, ...], ...]:
+    """How often each cluster is drawn in each bootstrap resample.
+
+    The draws depend only on how many clusters a metric observes, so every
+    metric and both arms of a contrast over the same clusters share them.
+    """
+    rng = Random(BOOTSTRAP_SEED)
+    draws = []
+    for _ in range(BOOTSTRAP_DRAWS):
+        drawn = [0] * clusters
+        for _ in range(clusters):
+            drawn[rng.randrange(clusters)] += 1
+        draws.append(tuple(drawn))
+    return tuple(draws)
+
+
+@lru_cache(maxsize=64)
+def distinct_draws(clusters: int) -> tuple[tuple[tuple[int, ...], int], ...]:
+    """Each distinct resample of :func:`multiplicities` with how often it was drawn."""
+    return tuple(sorted(Counter(multiplicities(clusters)).items()))
+
+
+def weighted(groups: Sequence[Counts], drawn: Sequence[int]) -> Counts:
+    return (
+        sum(m * g[0] for m, g in zip(drawn, groups, strict=True)),
+        sum(m * g[1] for m, g in zip(drawn, groups, strict=True)),
+        sum(m * g[2] for m, g in zip(drawn, groups, strict=True)),
+    )
+
+
+def nearest_rank(tally: Counter, rank: int):
+    """The ``rank``/40th nearest-rank percentile of the defined values in ``tally``."""
+    values = sorted((value, n) for value, n in tally.items() if value is not None)
+    size = sum(n for _, n in values)
+    if not size:
+        return None
+    position, seen = (size * rank + 39) // 40, 0
+    for value, n in values:
+        seen += n
+        if seen >= position:
+            return value
+    raise AssertionError("unreachable")
+
+
+def interval(tally: Counter) -> list:
+    return [encoded(nearest_rank(tally, 1)), encoded(nearest_rank(tally, 39))]
+
+
+def encoded(value):
+    return str(value) if value is not None else None
+
+
+def pooled(groups: Iterable[Counts]) -> Counts:
+    yes = unknown = total = 0
+    for group in groups:
+        yes, unknown, total = yes + group[0], unknown + group[1], total + group[2]
+    return yes, unknown, total
+
+
+Observed = list[tuple[str, dict[str, Counts]]]  # (cluster, run_counts) per completed run
+
+
+def observed(runs: Iterable[Run]) -> Observed:
+    return [(run.case.cluster, run_counts(run)) for run in runs]
+
+
+def by_cluster(runs: Observed, key: str) -> dict[str, Counts]:
+    """A metric's pooled observations per cluster, for the clusters that hold any."""
+    clusters: dict[str, list[Counts]] = {}
+    for cluster, counts in runs:
+        if key in counts:
+            clusters.setdefault(cluster, []).append(counts[key])
+    return {cluster: pooled(groups) for cluster, groups in sorted(clusters.items())}
+
+
+def band_ok(bounds) -> bool:
+    return bounds[0] is not None and bounds[2] is not None and bounds[2] - bounds[1] <= LABEL_BAND
+
+
+def marginal(runs: Observed, key: str) -> dict:
+    groups = by_cluster(runs, key)
+    recall = key.startswith("recall")
+    total = pooled(groups.values())
+    point, low, high = rate([total], recall=recall) if groups else (None, None, None)
+    points, lows, highs = Counter(), Counter(), Counter()
+    values = list(groups.values())
+    for drawn, times in distinct_draws(len(values)) if values else ():
+        p, lo, hi = rate([weighted(values, drawn)], recall=recall)
+        points[p] += times
+        lows[lo] += times
+        highs[hi] += times
+    return {
+        "observations": list(total),
+        "clusters": len(groups),
+        "point": encoded(point),
+        "bounds": [encoded(low), encoded(high)],
+        "interval": interval(points),
+        "envelope": [encoded(nearest_rank(lows, 1)), encoded(nearest_rank(highs, 39))],
+        "undefined_draws": points[None] if values else None,
+    }
+
+
+def contrast(base_runs: Observed, other_runs: Observed, key: str) -> dict:
+    """Variant minus baseline over paired runs, resampling clusters together."""
+    recall = key.startswith("recall")
+    b_groups, t_groups = by_cluster(base_runs, key), by_cluster(other_runs, key)
+    clusters = sorted(set(b_groups) | set(t_groups))
+    b_values = [b_groups.get(c, (0, 0, 0)) for c in clusters]
+    t_values = [t_groups.get(c, (0, 0, 0)) for c in clusters]
+    b = rate([pooled(b_values)], recall=recall) if clusters else (None, None, None)
+    t = rate([pooled(t_values)], recall=recall) if clusters else (None, None, None)
+    points, lows, highs = Counter(), Counter(), Counter()
+    for drawn, times in distinct_draws(len(clusters)) if clusters else ():
+        bd = rate([weighted(b_values, drawn)], recall=recall)
+        td = rate([weighted(t_values, drawn)], recall=recall)
+        points[td[0] - bd[0] if None not in (td[0], bd[0]) else None] += times
+        lows[td[1] - bd[2] if None not in (td[1], bd[2]) else None] += times
+        highs[td[2] - bd[1] if None not in (td[2], bd[1]) else None] += times
+    defined = None not in (b[0], t[0])
+    undefined = (points[None], lows[None]) if clusters else (None, None)
+    return {
+        "clusters": len(clusters),
+        "baseline": encoded(b[0]),
+        "variant": encoded(t[0]),
+        "difference": encoded(t[0] - b[0]) if defined else None,
+        "bounds": [
+            encoded(t[1] - b[2]) if None not in (t[1], b[2]) else None,
+            encoded(t[2] - b[1]) if None not in (t[2], b[1]) else None,
+        ],
+        "interval": interval(points),
+        "envelope": [encoded(nearest_rank(lows, 1)), encoded(nearest_rank(highs, 39))],
+        "undefined_draws": undefined[0],
+        "undefined_envelope_draws": undefined[1],
+        "label_bands_within": band_ok(b) and band_ok(t),
+    }
+
+
+def exposure(run: Run, variant) -> str:
+    """Whether the variant's training data may postdate the case's answer."""
+    earliest = run.case.earliest_discovery
+    if earliest is None:
+        return "none"
+    cutoff = variant["knowledge_cutoff"]
+    return "none" if cutoff is not None and day(cutoff) < earliest else "possible"
+
+
+def score(corpus, submissions) -> dict:
+    """Scorecards of every variant and its contrast with the baseline."""
+    checked = check_corpus(corpus)
+    runs = check_submissions(checked, submissions)
+    plan = submissions["plan"]
+    planned = [(case_id, seed) for case_id in plan["cases"] for seed in plan["seeds"]]
+    by_variant = {
+        name: {(run.case.id, run.seed): run for run in runs if run.variant == name}
+        for name in submissions["variants"]
+    }
+    cards = {}
+    for name, variant in sorted(submissions["variants"].items()):
+        mine = by_variant[name]
+        completed = [
+            mine[key] for key in planned if key in mine and mine[key].status == "completed"
+        ]
+        statuses = Counter(mine[key].status if key in mine else "missing" for key in planned)
+        verdicts = Counter(verdict for run in completed for _, verdict, _ in run.findings)
+        duplicates = 0
+        for run in completed:
+            hits = [key for _, verdict, key in run.findings if verdict == "confirmed"]
+            duplicates += len(hits) - len(set(hits))
+        launched = [r for r in mine.values() if r.status != "excluded"]
+        costs = [r.cost for r in launched]
+        cards[name] = {
+            "pins": variant,
+            "runs": {
+                status: statuses[status]
+                for status in ("completed", "failed", "excluded", "missing")
+            },
+            "coverage_complete": statuses["failed"] + statuses["missing"] == 0,
+            "findings": {
+                "confirmed": verdicts["confirmed"],
+                "false": verdicts["false"],
+                "unknown": verdicts["unknown"],
+                "duplicates": duplicates,
+            },
+            "training_exposure": dict(
+                sorted(Counter(exposure(r, variant) for r in completed).items())
+            ),
+            "cost_microusd": sum(costs) if None not in costs else None,
+            "metrics": {key: marginal(observed(completed), key) for key in metric_keys()},
+        }
+    baseline = submissions["baseline"]
+    contrasts = {}
+    for name in sorted(submissions["variants"]):
+        if name == baseline:
+            continue
+        excluded = [
+            key
+            for key in planned
+            if any(
+                key in by_variant[arm] and by_variant[arm][key].status == "excluded"
+                for arm in (baseline, name)
+            )
+        ]
+        paired = [
+            key
+            for key in planned
+            if key not in excluded
+            and all(
+                key in by_variant[arm] and by_variant[arm][key].status == "completed"
+                for arm in (baseline, name)
+            )
+        ]
+        incomplete = [key for key in planned if key not in excluded and key not in paired]
+        base_runs = observed(by_variant[baseline][key] for key in paired)
+        other_runs = observed(by_variant[name][key] for key in paired)
+        metrics = {key: contrast(base_runs, other_runs, key) for key in metric_keys()}
+        for item in metrics.values():
+            item["usable"] = (
+                not incomplete
+                and item["clusters"] >= MIN_CLUSTERS
+                and item["difference"] is not None
+                and item["label_bands_within"]
+                and item["undefined_draws"] == 0
+                and item["undefined_envelope_draws"] == 0
+            )
+        contrasts[name] = {
+            "pairs": {
+                "paired": len(paired),
+                "excluded": len(excluded),
+                "incomplete": [list(key) for key in incomplete],
+            },
+            "metrics": metrics,
+        }
+    return {
+        "evidence": submissions["mode"],
+        "claim": CLAIM,
+        "corpus": {"name": checked.name, "release": checked.release, "sha256": checked.digest},
+        "plan": {
+            "cases": len(plan["cases"]),
+            "seeds": sorted(plan["seeds"]),
+            "clusters": len({checked.cases[c].cluster for c in plan["cases"]}),
+        },
+        "labels": label_summary(checked.cases[c] for c in plan["cases"]),
+        "baseline": baseline,
+        "variants": cards,
+        "contrasts": contrasts,
+    }
+
+
+# -- files and the command line -----------------------------------------------
+
+
+def _unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        require(key not in value, "duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _no_constant(name):
+    raise CorpusError("non-finite number")
+
+
+def read_json(path: Path):
+    """Read one regular JSON file, never through a final link or from a FIFO."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        require(stat.S_ISREG(os.fstat(fd).st_mode), "regular file")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            body = stream.read(MAX_FILE_BYTES + 1)
+    finally:
+        os.close(fd)
+    require(len(body) <= MAX_FILE_BYTES, "file size")
+    return json.loads(
+        body.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_no_constant
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m tests.review_corpus", description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    shown = commands.add_parser("describe", help="what a corpus holds and how much is settled")
+    shown.add_argument("corpus", type=Path, nargs="?", default=SEED)
+    checked = commands.add_parser("verify", help="re-derive a historical corpus's pins from git")
+    checked.add_argument("corpus", type=Path, nargs="?", default=SEED)
+    checked.add_argument("--repo", type=Path, default=Path.cwd())
+    scored = commands.add_parser("score", help="score submissions against a corpus")
+    scored.add_argument("corpus", type=Path, nargs="?", default=SYNTHETIC_CORPUS)
+    scored.add_argument("submissions", type=Path, nargs="?", default=SYNTHETIC_SUBMISSIONS)
+    args = parser.parse_args(argv)
+    try:
+        corpus = read_json(args.corpus)
+        if args.command == "describe":
+            report = describe(corpus)
+        elif args.command == "verify":
+            report = verify(corpus, args.repo)
+        else:
+            report = score(corpus, read_json(args.submissions))
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        IndexError,
+        RecursionError,
+    ):
+        # The files are evidence, never an error message to echo.
+        parser.exit(2, "Invalid review corpus or submissions.\n")
+    print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
+    return 0 if report.get("ok", True) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

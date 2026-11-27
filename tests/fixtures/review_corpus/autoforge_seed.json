@@ -1,0 +1,1176 @@
+{
+  "format": "autoforge-review-corpus",
+  "version": 1,
+  "mode": "historical",
+  "name": "autoforge-seed",
+  "release": 1,
+  "frozen": "2026-11-27",
+  "repository": {
+    "slug": "iceboundrock/AutoForge",
+    "root": "e5d562e85f2d6eb5c10a1bfe02707f1e554ecb2d"
+  },
+  "cases": {
+    "issue262-round1": {
+      "stratum": "reviewed_defect",
+      "cluster": "issue-262",
+      "provenance": {
+        "source": "pr_branch",
+        "issue": 262,
+        "pr": null,
+        "round": 1,
+        "selection": "seed rule 1: the first parent of a FIX commit whose subject names round n's findings is round n's reviewed head",
+        "note": "No commit names this branch's PR, and no commit on main names #262."
+      },
+      "review": {
+        "base_ref": "main",
+        "merge_base": "70e8bb0199b80b58199730f4546456b5377cd555",
+        "head": "fd257b2829fc69941ad7fbe0b5be1e25b4b2db7b",
+        "tree": "8926e1684367a793c7f2015e1c88cc4853c9e284",
+        "cutoff": "2026-11-22T05:00:44Z"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "851e88768fa91f55037234fdc9096b73e0799b91",
+          "uv.lock": "cfd7509d4b0d8cef54b4d7302098dd7cd85c3ba1"
+        },
+        "validation": [
+          "make check"
+        ]
+      },
+      "context": [
+        {
+          "id": "issue",
+          "kind": "issue",
+          "ref": "#262 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        },
+        {
+          "id": "pr-body",
+          "kind": "pr_body",
+          "ref": "the PR of branch autoforge/262, whose number no commit states",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        }
+      ],
+      "actors": [
+        "autoforge-producer",
+        "autoforge-reviewer",
+        "autoforge-fixer"
+      ],
+      "risk": {
+        "stratum": "routine",
+        "rationale": "the README's feature matrix (documentation)"
+      },
+      "defects": {
+        "r1-f1-relaunch-claim": {
+          "severity": "low",
+          "class": "specification",
+          "introduced": "fd257b2829fc69941ad7fbe0b5be1e25b4b2db7b",
+          "summary": "The README's durable-runs row promises a relaunch for any step whose agent went idle or died without a result; the rule relaunches at most once, for an idle-limit kill or a typed result-less exit only.",
+          "location": [
+            {
+              "path": "README.md",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 1,
+            "finding": "R1-F1",
+            "discovered": "2026-11-22",
+            "fix": "f4c836a3999276e4001f3e5d6bc2b49278c25181"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit f4c836a3999276e4001f3e5d6bc2b49278c25181 that names R1-F1: its message and its diff"
+            }
+          ]
+        }
+      },
+      "negative": null,
+      "withheld": [
+        "f4c836a3999276e4001f3e5d6bc2b49278c25181"
+      ]
+    },
+    "pr459-round1": {
+      "stratum": "reviewed_defect",
+      "cluster": "issue-414",
+      "provenance": {
+        "source": "pr_branch",
+        "issue": 414,
+        "pr": 459,
+        "round": 1,
+        "selection": "seed rule 1: the first parent of a FIX commit whose subject names round n's findings is round n's reviewed head",
+        "note": "The FIX commits name PR #459. Main merged issue #414 later as 08a2e075 (#460). PR numbers are as the commits state them, unverified against GitHub."
+      },
+      "review": {
+        "base_ref": "main",
+        "merge_base": "280702b7623e7ec29e5f2529485e4702df4ce84b",
+        "head": "0b8eeb75703e673a926ea6a85e02285faa4b29fd",
+        "tree": "cbe41c9530559d1b7df2c93e36b2f5408a569e98",
+        "cutoff": "2026-11-03T17:20:22Z"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "2c136f0895d35ee3efec959b1136c2a7a910d574",
+          "uv.lock": "cfd7509d4b0d8cef54b4d7302098dd7cd85c3ba1"
+        },
+        "validation": [
+          "make check"
+        ]
+      },
+      "context": [
+        {
+          "id": "issue",
+          "kind": "issue",
+          "ref": "#414 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        },
+        {
+          "id": "pr-body",
+          "kind": "pr_body",
+          "ref": "#459 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        }
+      ],
+      "actors": [
+        "autoforge-producer",
+        "autoforge-reviewer",
+        "autoforge-fixer"
+      ],
+      "risk": {
+        "stratum": "critical",
+        "rationale": "who may drive a PR: the ownership fence between runs (authorization)"
+      },
+      "defects": {
+        "r1-f1-owner-removed": {
+          "severity": "critical",
+          "class": "security",
+          "introduced": "0b8eeb75703e673a926ea6a85e02285faa4b29fd",
+          "summary": "A bound run tells no owner from a removed owner by the PR alone, so after a takeover, removing the owner field or the marker (or a body read as empty) lets both the taking and the displaced run drive the PR.",
+          "location": [
+            {
+              "path": "src/autoforge/engine.py",
+              "lines": null
+            },
+            {
+              "path": "src/autoforge/state.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 1,
+            "finding": "R1-F1",
+            "discovered": "2026-11-03",
+            "fix": "8df0b1e27e0b60999d11c49bb0a275fac16192f6"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit 8df0b1e27e0b60999d11c49bb0a275fac16192f6 that names R1-F1: its message and its diff"
+            }
+          ]
+        },
+        "r1-f2-replan-reread": {
+          "severity": "high",
+          "class": "security",
+          "introduced": "0b8eeb75703e673a926ea6a85e02285faa4b29fd",
+          "summary": "A replan transaction PREPARED on an earlier entry launches its agent and drives its saved push and replacement-PR plan without reading its source's owner again.",
+          "location": [
+            {
+              "path": "src/autoforge/engine.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 1,
+            "finding": "R1-F2",
+            "discovered": "2026-11-03",
+            "fix": "8df0b1e27e0b60999d11c49bb0a275fac16192f6"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit 8df0b1e27e0b60999d11c49bb0a275fac16192f6 that names R1-F2: its message and its diff"
+            }
+          ]
+        },
+        "r1-f3-legacy-reentry": {
+          "severity": "high",
+          "class": "security",
+          "introduced": "0b8eeb75703e673a926ea6a85e02285faa4b29fd",
+          "summary": "The one-shot legacy re-entry recovers an ownerless marked PR it has no record of, though every PR opened before #414 carries that marker.",
+          "location": [
+            {
+              "path": "src/autoforge/engine.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 1,
+            "finding": "R1-F3",
+            "discovered": "2026-11-03",
+            "fix": "8df0b1e27e0b60999d11c49bb0a275fac16192f6"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit 8df0b1e27e0b60999d11c49bb0a275fac16192f6 that names R1-F3: its message and its diff"
+            }
+          ]
+        },
+        "r1-f4-fix-records": {
+          "severity": "high",
+          "class": "security",
+          "introduced": "0b8eeb75703e673a926ea6a85e02285faa4b29fd",
+          "summary": "The FIX plan reads the bound PR's owner only before its first record, so a takeover between its follow-up issues, marker appends and acceptance comments does not stop the rest.",
+          "location": [
+            {
+              "path": "src/autoforge/engine.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 1,
+            "finding": "R1-F4",
+            "discovered": "2026-11-03",
+            "fix": "8df0b1e27e0b60999d11c49bb0a275fac16192f6"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit 8df0b1e27e0b60999d11c49bb0a275fac16192f6 that names R1-F4: its message and its diff"
+            }
+          ]
+        }
+      },
+      "negative": null,
+      "withheld": [
+        "8df0b1e27e0b60999d11c49bb0a275fac16192f6",
+        "e4c5c2cba0c90afaa4eee031ce26aceace7d0c5d",
+        "f1c90b9dbfa96992a2ada1be55d62a6bd2d13fa1",
+        "14c6f19f6ac39f35ccb0266821e3f9ba16919256",
+        "e570f85a27af14ee5d8685d021250baba26f43bf",
+        "39ceea4c77a91c61a38d13d4fe830a3a4eb34ed0",
+        "e3bc96a6a7f36e2c229f55878cb645becc3e3185",
+        "1594060f091cdd219a7947b286691af707a22585",
+        "316564048c33b5e59801184dfb4b44d0045102de",
+        "a7299975c25f3a3ca901351cdde44ff5e0c698fd",
+        "08a2e075b3c5383dfbae567ed943d40b662c75a9"
+      ]
+    },
+    "pr460-squash": {
+      "stratum": "hard_negative",
+      "cluster": "issue-414",
+      "provenance": {
+        "source": "squash",
+        "issue": 414,
+        "pr": 460,
+        "round": null,
+        "selection": "seed rule 2: the squash commit on main that merged the issue of a seed defect case, on the same surface",
+        "note": "Squash commit of #460: its parent is main's head when it merged, so its diff is the merged change, not necessarily what the last review read."
+      },
+      "review": {
+        "base_ref": "main",
+        "merge_base": "01c6836b833e3782a99e031440864f629420b601",
+        "head": "08a2e075b3c5383dfbae567ed943d40b662c75a9",
+        "tree": "126610b360caafd40263a17007c926e4874a5a20",
+        "cutoff": "2026-11-06T22:47:21Z"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "2c136f0895d35ee3efec959b1136c2a7a910d574",
+          "uv.lock": "cfd7509d4b0d8cef54b4d7302098dd7cd85c3ba1"
+        },
+        "validation": [
+          "make check"
+        ]
+      },
+      "context": [
+        {
+          "id": "issue",
+          "kind": "issue",
+          "ref": "#414 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        },
+        {
+          "id": "pr-body",
+          "kind": "pr_body",
+          "ref": "#460 as merged",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        }
+      ],
+      "actors": [
+        "autoforge-producer",
+        "autoforge-reviewer",
+        "autoforge-fixer",
+        "merging-maintainer"
+      ],
+      "risk": {
+        "stratum": "critical",
+        "rationale": "who may drive a PR: the ownership fence between runs (authorization)"
+      },
+      "defects": {},
+      "negative": {
+        "observed_through": "2026-11-27",
+        "labels": [
+          {
+            "by": "rev-r1-seed-curator",
+            "role": "curator",
+            "verdict": "unknown",
+            "decided": "2026-11-27",
+            "artifact": "candidate negative on the surface of pr459-round1: no defect registered, and no later commit on main through e3443d30 names #414 or #460; no independent pass yet"
+          }
+        ]
+      },
+      "withheld": []
+    },
+    "pr539-round1": {
+      "stratum": "reviewed_defect",
+      "cluster": "issue-329",
+      "provenance": {
+        "source": "pr_branch",
+        "issue": 329,
+        "pr": 539,
+        "round": 1,
+        "selection": "seed rule 1: the first parent of a FIX commit whose subject names round n's findings is round n's reviewed head",
+        "note": "The FIX commits name PR #539. Main merged issue #329 later as e86e606b (#540), a different implementation. PR numbers are as the commits state them, unverified against GitHub."
+      },
+      "review": {
+        "base_ref": "main",
+        "merge_base": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
+        "head": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+        "tree": "a6a0436effc29d77b3ee5c8281ac3bed454188f0",
+        "cutoff": "2026-11-23T19:05:15Z"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "851e88768fa91f55037234fdc9096b73e0799b91",
+          "uv.lock": "cfd7509d4b0d8cef54b4d7302098dd7cd85c3ba1"
+        },
+        "validation": [
+          "make check"
+        ]
+      },
+      "context": [
+        {
+          "id": "issue",
+          "kind": "issue",
+          "ref": "#329 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        },
+        {
+          "id": "pr-body",
+          "kind": "pr_body",
+          "ref": "#539 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        }
+      ],
+      "actors": [
+        "autoforge-producer",
+        "autoforge-reviewer",
+        "autoforge-fixer"
+      ],
+      "risk": {
+        "stratum": "critical",
+        "rationale": "GitHub read-back verification and the credential it sends (data integrity, credentials)"
+      },
+      "defects": {
+        "r1-f1-reply-text": {
+          "severity": "high",
+          "class": "security",
+          "introduced": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+          "summary": "doctor's exact-read row can show what answered: a non-JSON reply's Content-Type quoted in the exception it prints, and `gh auth token`'s stderr forwarded with only known credential shapes redacted.",
+          "location": [
+            {
+              "path": "src/autoforge/doctor.py",
+              "lines": null
+            },
+            {
+              "path": "src/autoforge/github.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 1,
+            "finding": "R1-F1",
+            "discovered": "2026-11-23",
+            "fix": "c8d96429ac1aac2023cc06c11b669e4d0fc809ce"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit c8d96429ac1aac2023cc06c11b669e4d0fc809ce that names R1-F1: its message and its diff"
+            }
+          ]
+        },
+        "r2-f1-nesting": {
+          "severity": "medium",
+          "class": "reliability",
+          "introduced": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+          "summary": "A reply under the byte cap that nests deeper than the JSON decoder follows raises RecursionError past check_exact_read and ends the whole doctor report.",
+          "location": [
+            {
+              "path": "src/autoforge/doctor.py",
+              "lines": null
+            },
+            {
+              "path": "src/autoforge/github.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "later_review",
+            "round": 2,
+            "finding": "R2-F1",
+            "discovered": "2026-11-23",
+            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit 046bbb1212cf1d517ab0d6c09661d3714561c1a7 that names R2-F1: its message and its diff"
+            }
+          ]
+        },
+        "r2-f2-caller-claims": {
+          "severity": "low",
+          "class": "specification",
+          "introduced": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+          "summary": "The guides and the GitHubCredentialError docstring say every other caller blocks on a conclusive exact-read failure; FIX's entry, REVIEW's operator evidence and status's review provenance do not.",
+          "location": [
+            {
+              "path": "src/autoforge/errors.py",
+              "lines": null
+            },
+            {
+              "path": "docs/agent-guides/github-safety.md",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "later_review",
+            "round": 2,
+            "finding": "R2-F2",
+            "discovered": "2026-11-23",
+            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit 046bbb1212cf1d517ab0d6c09661d3714561c1a7 that names R2-F2: its message and its diff"
+            }
+          ]
+        },
+        "r3-f1-certificate-remedy": {
+          "severity": "medium",
+          "class": "correctness",
+          "introduced": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+          "summary": "Every certificate that does not verify is put down to a CA missing from the trust store, a hostname mismatch included, which adding a CA would not fix.",
+          "location": [
+            {
+              "path": "src/autoforge/doctor.py",
+              "lines": null
+            },
+            {
+              "path": "src/autoforge/github.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "later_review",
+            "round": 3,
+            "finding": "R3-F1",
+            "discovered": "2026-11-23",
+            "fix": "f47a59a37b0558cd038c4e80e3262f299198a4cd"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit f47a59a37b0558cd038c4e80e3262f299198a4cd that names R3-F1: its message and its diff"
+            }
+          ]
+        },
+        "r4-f1-probe-shape": {
+          "severity": "medium",
+          "class": "correctness",
+          "introduced": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+          "summary": "doctor's exact-read probe reports OK for any JSON object, so a stand-in answering HTTP 200 with {} passes, and its 404 fails with no remedy.",
+          "location": [
+            {
+              "path": "src/autoforge/doctor.py",
+              "lines": null
+            },
+            {
+              "path": "src/autoforge/github.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "later_review",
+            "round": 4,
+            "finding": "R4-F1",
+            "discovered": "2026-11-23",
+            "fix": "b6e62d546013e76bfb72c648d69721d981f2a357"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit b6e62d546013e76bfb72c648d69721d981f2a357 that names R4-F1: its message and its diff"
+            }
+          ]
+        }
+      },
+      "negative": null,
+      "withheld": [
+        "c8d96429ac1aac2023cc06c11b669e4d0fc809ce",
+        "046bbb1212cf1d517ab0d6c09661d3714561c1a7",
+        "f47a59a37b0558cd038c4e80e3262f299198a4cd",
+        "b6e62d546013e76bfb72c648d69721d981f2a357",
+        "d8c8fcce8262148c5830976f6c4799a9c8b8c930",
+        "e86e606b0a21782d0d99308306c7d81206f27421"
+      ]
+    },
+    "pr539-round2": {
+      "stratum": "reviewed_defect",
+      "cluster": "issue-329",
+      "provenance": {
+        "source": "pr_branch",
+        "issue": 329,
+        "pr": 539,
+        "round": 2,
+        "selection": "seed rule 1: the first parent of a FIX commit whose subject names round n's findings is round n's reviewed head",
+        "note": "The FIX commits name PR #539. Main merged issue #329 later as e86e606b (#540), a different implementation. PR numbers are as the commits state them, unverified against GitHub."
+      },
+      "review": {
+        "base_ref": "main",
+        "merge_base": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
+        "head": "c8d96429ac1aac2023cc06c11b669e4d0fc809ce",
+        "tree": "c1f02ee7485b5395dabacefddbce9f1694fbfd06",
+        "cutoff": "2026-11-23T19:20:16Z"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "851e88768fa91f55037234fdc9096b73e0799b91",
+          "uv.lock": "cfd7509d4b0d8cef54b4d7302098dd7cd85c3ba1"
+        },
+        "validation": [
+          "make check"
+        ]
+      },
+      "context": [
+        {
+          "id": "issue",
+          "kind": "issue",
+          "ref": "#329 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        },
+        {
+          "id": "pr-body",
+          "kind": "pr_body",
+          "ref": "#539 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        }
+      ],
+      "actors": [
+        "autoforge-producer",
+        "autoforge-reviewer",
+        "autoforge-fixer"
+      ],
+      "risk": {
+        "stratum": "critical",
+        "rationale": "GitHub read-back verification and the credential it sends (data integrity, credentials)"
+      },
+      "defects": {
+        "r2-f1-nesting": {
+          "severity": "medium",
+          "class": "reliability",
+          "introduced": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+          "summary": "A reply under the byte cap that nests deeper than the JSON decoder follows raises RecursionError past check_exact_read and ends the whole doctor report.",
+          "location": [
+            {
+              "path": "src/autoforge/doctor.py",
+              "lines": null
+            },
+            {
+              "path": "src/autoforge/github.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 2,
+            "finding": "R2-F1",
+            "discovered": "2026-11-23",
+            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit 046bbb1212cf1d517ab0d6c09661d3714561c1a7 that names R2-F1: its message and its diff"
+            }
+          ]
+        },
+        "r2-f1-workdir": {
+          "severity": "medium",
+          "class": "reliability",
+          "introduced": "c8d96429ac1aac2023cc06c11b669e4d0fc809ce",
+          "summary": "gh_workdir's GitHubError, when no empty directory can be made for `gh auth token`, escapes check_exact_read and ends the whole doctor report; the round 1 FIX narrowed the row's handler to ExecutionError.",
+          "location": [
+            {
+              "path": "src/autoforge/doctor.py",
+              "lines": null
+            },
+            {
+              "path": "src/autoforge/github.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 2,
+            "finding": "R2-F1",
+            "discovered": "2026-11-23",
+            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit 046bbb1212cf1d517ab0d6c09661d3714561c1a7 that names R2-F1: its message and its diff"
+            }
+          ]
+        },
+        "r2-f2-caller-claims": {
+          "severity": "low",
+          "class": "specification",
+          "introduced": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+          "summary": "The guides and the GitHubCredentialError docstring say every other caller blocks on a conclusive exact-read failure; FIX's entry, REVIEW's operator evidence and status's review provenance do not.",
+          "location": [
+            {
+              "path": "src/autoforge/errors.py",
+              "lines": null
+            },
+            {
+              "path": "docs/agent-guides/github-safety.md",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 2,
+            "finding": "R2-F2",
+            "discovered": "2026-11-23",
+            "fix": "046bbb1212cf1d517ab0d6c09661d3714561c1a7"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit 046bbb1212cf1d517ab0d6c09661d3714561c1a7 that names R2-F2: its message and its diff"
+            }
+          ]
+        },
+        "r3-f1-certificate-remedy": {
+          "severity": "medium",
+          "class": "correctness",
+          "introduced": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+          "summary": "Every certificate that does not verify is put down to a CA missing from the trust store, a hostname mismatch included, which adding a CA would not fix.",
+          "location": [
+            {
+              "path": "src/autoforge/doctor.py",
+              "lines": null
+            },
+            {
+              "path": "src/autoforge/github.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "later_review",
+            "round": 3,
+            "finding": "R3-F1",
+            "discovered": "2026-11-23",
+            "fix": "f47a59a37b0558cd038c4e80e3262f299198a4cd"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit f47a59a37b0558cd038c4e80e3262f299198a4cd that names R3-F1: its message and its diff"
+            }
+          ]
+        },
+        "r4-f1-probe-shape": {
+          "severity": "medium",
+          "class": "correctness",
+          "introduced": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+          "summary": "doctor's exact-read probe reports OK for any JSON object, so a stand-in answering HTTP 200 with {} passes, and its 404 fails with no remedy.",
+          "location": [
+            {
+              "path": "src/autoforge/doctor.py",
+              "lines": null
+            },
+            {
+              "path": "src/autoforge/github.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "later_review",
+            "round": 4,
+            "finding": "R4-F1",
+            "discovered": "2026-11-23",
+            "fix": "b6e62d546013e76bfb72c648d69721d981f2a357"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit b6e62d546013e76bfb72c648d69721d981f2a357 that names R4-F1: its message and its diff"
+            }
+          ]
+        }
+      },
+      "negative": null,
+      "withheld": [
+        "046bbb1212cf1d517ab0d6c09661d3714561c1a7",
+        "f47a59a37b0558cd038c4e80e3262f299198a4cd",
+        "b6e62d546013e76bfb72c648d69721d981f2a357",
+        "d8c8fcce8262148c5830976f6c4799a9c8b8c930",
+        "e86e606b0a21782d0d99308306c7d81206f27421"
+      ]
+    },
+    "pr539-round3": {
+      "stratum": "reviewed_defect",
+      "cluster": "issue-329",
+      "provenance": {
+        "source": "pr_branch",
+        "issue": 329,
+        "pr": 539,
+        "round": 3,
+        "selection": "seed rule 1: the first parent of a FIX commit whose subject names round n's findings is round n's reviewed head",
+        "note": "The FIX commits name PR #539. Main merged issue #329 later as e86e606b (#540), a different implementation. PR numbers are as the commits state them, unverified against GitHub."
+      },
+      "review": {
+        "base_ref": "main",
+        "merge_base": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
+        "head": "046bbb1212cf1d517ab0d6c09661d3714561c1a7",
+        "tree": "b0f77971cb8d394747518fd83c14509ec8b0bfec",
+        "cutoff": "2026-11-23T19:40:26Z"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "851e88768fa91f55037234fdc9096b73e0799b91",
+          "uv.lock": "cfd7509d4b0d8cef54b4d7302098dd7cd85c3ba1"
+        },
+        "validation": [
+          "make check"
+        ]
+      },
+      "context": [
+        {
+          "id": "issue",
+          "kind": "issue",
+          "ref": "#329 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        },
+        {
+          "id": "pr-body",
+          "kind": "pr_body",
+          "ref": "#539 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        }
+      ],
+      "actors": [
+        "autoforge-producer",
+        "autoforge-reviewer",
+        "autoforge-fixer"
+      ],
+      "risk": {
+        "stratum": "critical",
+        "rationale": "GitHub read-back verification and the credential it sends (data integrity, credentials)"
+      },
+      "defects": {
+        "r3-f1-certificate-remedy": {
+          "severity": "medium",
+          "class": "correctness",
+          "introduced": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+          "summary": "Every certificate that does not verify is put down to a CA missing from the trust store, a hostname mismatch included, which adding a CA would not fix.",
+          "location": [
+            {
+              "path": "src/autoforge/doctor.py",
+              "lines": null
+            },
+            {
+              "path": "src/autoforge/github.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 3,
+            "finding": "R3-F1",
+            "discovered": "2026-11-23",
+            "fix": "f47a59a37b0558cd038c4e80e3262f299198a4cd"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit f47a59a37b0558cd038c4e80e3262f299198a4cd that names R3-F1: its message and its diff"
+            }
+          ]
+        },
+        "r4-f1-probe-shape": {
+          "severity": "medium",
+          "class": "correctness",
+          "introduced": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+          "summary": "doctor's exact-read probe reports OK for any JSON object, so a stand-in answering HTTP 200 with {} passes, and its 404 fails with no remedy.",
+          "location": [
+            {
+              "path": "src/autoforge/doctor.py",
+              "lines": null
+            },
+            {
+              "path": "src/autoforge/github.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "later_review",
+            "round": 4,
+            "finding": "R4-F1",
+            "discovered": "2026-11-23",
+            "fix": "b6e62d546013e76bfb72c648d69721d981f2a357"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit b6e62d546013e76bfb72c648d69721d981f2a357 that names R4-F1: its message and its diff"
+            }
+          ]
+        },
+        "r4-f2-k13-inventory": {
+          "severity": "low",
+          "class": "specification",
+          "introduced": "046bbb1212cf1d517ab0d6c09661d3714561c1a7",
+          "summary": "github-safety.md's inventory of the exact read's create read-backs leaves out K13's audit comment, which takes an exact read; the round 2 FIX added the inventory.",
+          "location": [
+            {
+              "path": "docs/agent-guides/github-safety.md",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "later_review",
+            "round": 4,
+            "finding": "R4-F2",
+            "discovered": "2026-11-23",
+            "fix": "d8c8fcce8262148c5830976f6c4799a9c8b8c930"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit d8c8fcce8262148c5830976f6c4799a9c8b8c930 that names R4-F2: its message and its diff"
+            }
+          ]
+        }
+      },
+      "negative": null,
+      "withheld": [
+        "f47a59a37b0558cd038c4e80e3262f299198a4cd",
+        "b6e62d546013e76bfb72c648d69721d981f2a357",
+        "d8c8fcce8262148c5830976f6c4799a9c8b8c930",
+        "e86e606b0a21782d0d99308306c7d81206f27421"
+      ]
+    },
+    "pr539-round4": {
+      "stratum": "reviewed_defect",
+      "cluster": "issue-329",
+      "provenance": {
+        "source": "pr_branch",
+        "issue": 329,
+        "pr": 539,
+        "round": 4,
+        "selection": "seed rule 1: the first parent of a FIX commit whose subject names round n's findings is round n's reviewed head",
+        "note": "The FIX commits name PR #539. Main merged issue #329 later as e86e606b (#540), a different implementation. PR numbers are as the commits state them, unverified against GitHub."
+      },
+      "review": {
+        "base_ref": "main",
+        "merge_base": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
+        "head": "f47a59a37b0558cd038c4e80e3262f299198a4cd",
+        "tree": "2d9d7875bf3aab0d0cb9d26f124d30c8d81159d3",
+        "cutoff": "2026-11-23T20:03:19Z"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "851e88768fa91f55037234fdc9096b73e0799b91",
+          "uv.lock": "cfd7509d4b0d8cef54b4d7302098dd7cd85c3ba1"
+        },
+        "validation": [
+          "make check"
+        ]
+      },
+      "context": [
+        {
+          "id": "issue",
+          "kind": "issue",
+          "ref": "#329 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        },
+        {
+          "id": "pr-body",
+          "kind": "pr_body",
+          "ref": "#539 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        }
+      ],
+      "actors": [
+        "autoforge-producer",
+        "autoforge-reviewer",
+        "autoforge-fixer"
+      ],
+      "risk": {
+        "stratum": "critical",
+        "rationale": "GitHub read-back verification and the credential it sends (data integrity, credentials)"
+      },
+      "defects": {
+        "r4-f1-probe-shape": {
+          "severity": "medium",
+          "class": "correctness",
+          "introduced": "89126296ebd914c2921e98b6cdc22ed60d548e9a",
+          "summary": "doctor's exact-read probe reports OK for any JSON object, so a stand-in answering HTTP 200 with {} passes, and its 404 fails with no remedy.",
+          "location": [
+            {
+              "path": "src/autoforge/doctor.py",
+              "lines": null
+            },
+            {
+              "path": "src/autoforge/github.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 4,
+            "finding": "R4-F1",
+            "discovered": "2026-11-23",
+            "fix": "b6e62d546013e76bfb72c648d69721d981f2a357"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit b6e62d546013e76bfb72c648d69721d981f2a357 that names R4-F1: its message and its diff"
+            }
+          ]
+        },
+        "r4-f2-k13-inventory": {
+          "severity": "low",
+          "class": "specification",
+          "introduced": "046bbb1212cf1d517ab0d6c09661d3714561c1a7",
+          "summary": "github-safety.md's inventory of the exact read's create read-backs leaves out K13's audit comment, which takes an exact read; the round 2 FIX added the inventory.",
+          "location": [
+            {
+              "path": "docs/agent-guides/github-safety.md",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 4,
+            "finding": "R4-F2",
+            "discovered": "2026-11-23",
+            "fix": "d8c8fcce8262148c5830976f6c4799a9c8b8c930"
+          },
+          "labels": [
+            {
+              "by": "rev-r1-seed-curator",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-11-27",
+              "artifact": "the FIX commit d8c8fcce8262148c5830976f6c4799a9c8b8c930 that names R4-F2: its message and its diff"
+            }
+          ]
+        }
+      },
+      "negative": null,
+      "withheld": [
+        "b6e62d546013e76bfb72c648d69721d981f2a357",
+        "d8c8fcce8262148c5830976f6c4799a9c8b8c930",
+        "e86e606b0a21782d0d99308306c7d81206f27421"
+      ]
+    },
+    "pr540-squash": {
+      "stratum": "hard_negative",
+      "cluster": "issue-329",
+      "provenance": {
+        "source": "squash",
+        "issue": 329,
+        "pr": 540,
+        "round": null,
+        "selection": "seed rule 2: the squash commit on main that merged the issue of a seed defect case, on the same surface",
+        "note": "Squash commit of #540: its parent is main's head when it merged, so its diff is the merged change, not necessarily what the last review read."
+      },
+      "review": {
+        "base_ref": "main",
+        "merge_base": "aa7b42cefbeefb04748b933a42974f51f78a22a6",
+        "head": "e86e606b0a21782d0d99308306c7d81206f27421",
+        "tree": "ff320ab92fe73550984937d30532ec2c4c1b956f",
+        "cutoff": "2026-11-24T04:33:42Z"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "851e88768fa91f55037234fdc9096b73e0799b91",
+          "uv.lock": "cfd7509d4b0d8cef54b4d7302098dd7cd85c3ba1"
+        },
+        "validation": [
+          "make check"
+        ]
+      },
+      "context": [
+        {
+          "id": "issue",
+          "kind": "issue",
+          "ref": "#329 as of the cutoff",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        },
+        {
+          "id": "pr-body",
+          "kind": "pr_body",
+          "ref": "#540 as merged",
+          "observed_at": null,
+          "status": "not_captured",
+          "text": null,
+          "sha256": null
+        }
+      ],
+      "actors": [
+        "autoforge-producer",
+        "autoforge-reviewer",
+        "autoforge-fixer",
+        "merging-maintainer"
+      ],
+      "risk": {
+        "stratum": "critical",
+        "rationale": "GitHub read-back verification and the credential it sends (data integrity, credentials)"
+      },
+      "defects": {},
+      "negative": {
+        "observed_through": "2026-11-27",
+        "labels": [
+          {
+            "by": "rev-r1-seed-curator",
+            "role": "curator",
+            "verdict": "unknown",
+            "decided": "2026-11-27",
+            "artifact": "candidate negative on the surface of pr539-round1 to pr539-round4: no defect registered, and no later commit on main through e3443d30 names #329 or #540; no independent pass yet"
+          }
+        ]
+      },
+      "withheld": []
+    }
+  }
+}
