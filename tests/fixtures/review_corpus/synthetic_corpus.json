@@ -1,0 +1,851 @@
+{
+  "format": "autoforge-review-corpus",
+  "version": 1,
+  "mode": "synthetic",
+  "name": "synthetic",
+  "release": 1,
+  "frozen": "2026-06-30",
+  "repository": {
+    "slug": "example/synthetic",
+    "root": "3615886fe2041359f9b62b592b3fce6ed505327b",
+    "refs": {
+      "main": "31284817382850100a0450693dc8b05357641cd2"
+    },
+    "environment": {
+      "files": [
+        "pyproject.toml",
+        "uv.lock"
+      ],
+      "validation": [
+        "make check"
+      ],
+      "validation_scope": "full"
+    },
+    "visibility": "synthetic"
+  },
+  "cases": {
+    "alpha-defect": {
+      "stratum": "reviewed_defect",
+      "cluster": "alpha",
+      "provenance": {
+        "source": "synthetic",
+        "issue": 1,
+        "pr": null,
+        "round": 1,
+        "selection": "synthetic fixture: hand-built to cover each stratum and label outcome",
+        "note": "Stand-in object ids; no git object exists for any of them.",
+        "base_evidence": "synthetic",
+        "merge_commit": null
+      },
+      "review": {
+        "base_ref": "main",
+        "base_tip": "056fa986778a889e468abfe76a0f517c657b9ba2",
+        "merge_base": "056fa986778a889e468abfe76a0f517c657b9ba2",
+        "head": "5a73afb9449777adb9bece8d94ec4639cffddaca",
+        "cutoff": "2026-05-01T12:00:00Z",
+        "base_tree": "bdfa1fb0d3d91c0d04d304fd17b6a9b4873e02a4",
+        "merge_base_tree": "bdfa1fb0d3d91c0d04d304fd17b6a9b4873e02a4",
+        "head_tree": "ab308425d2cf9e726259cca28393c790ef7a2c28"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "4a3b1e0d95246fe3e45cbbd84c76a7df21881dde",
+          "uv.lock": "62a5b4b3f2d73502b21c41e413cc69de57337ea7"
+        },
+        "validation": [
+          "make check"
+        ],
+        "validation_scope": "full"
+      },
+      "context": {
+        "inventory": {
+          "status": "complete",
+          "taken": "2026-06-28T00:00:00Z",
+          "artifact": "synthetic: the listing of synthetic issue 1 as of the cutoff",
+          "sources": [
+            "issue/1",
+            "issue/1/comment/1"
+          ],
+          "edit_history_verified": true
+        },
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "source": "issue/1",
+            "ref": "synthetic issue alpha",
+            "observed_at": "2026-04-30T09:00:00Z",
+            "status": "captured",
+            "text": "Synthetic issue alpha: read a lock file and refuse a stale writer.",
+            "sha256": "4355276ce961ca2f4c31aefb6a65997d6a742b168a804c14bb52fffd2eb60799",
+            "edited_at": null
+          },
+          {
+            "id": "comment-1",
+            "kind": "issue_comment",
+            "source": "issue/1/comment/1",
+            "ref": "synthetic issue alpha, comment 1",
+            "observed_at": "2026-05-01T12:00:00Z",
+            "status": "captured",
+            "text": "Synthetic comment posted exactly at the cutoff, which is inclusive.",
+            "sha256": "23d785b3ed353235836e1f966523f75909fd0bff753615e8bac73a07876d45ad",
+            "edited_at": null
+          }
+        ]
+      },
+      "actors": [
+        "producer-alpha",
+        "reviewer-alpha",
+        "fixer-alpha"
+      ],
+      "risk": {
+        "stratum": "elevated",
+        "rationale": "persistence: the change writes a lock file"
+      },
+      "exposure": {
+        "possible_from": "2026-05-01",
+        "public_by": null,
+        "artifact": "synthetic: the candidate's code first existed at its head, on its cutoff day"
+      },
+      "defects": {
+        "alpha-d1": {
+          "severity": "high",
+          "class": "correctness",
+          "introduced": "5a73afb9449777adb9bece8d94ec4639cffddaca",
+          "summary": "The writer keeps a stale lock after a crash.",
+          "location": [
+            {
+              "path": "src/alpha.py",
+              "lines": [
+                10,
+                24
+              ]
+            }
+          ],
+          "discovery": {
+            "source": "same_review",
+            "round": 1,
+            "finding": "R1-F1",
+            "discovered": "2026-05-01",
+            "fix": "cef08c729419cecdc8385d9c3f8f542c2a924d4e",
+            "merged": null,
+            "evidence_status": "synthetic",
+            "artifact": "synthetic: alpha-defect/alpha-d1"
+          },
+          "labels": [
+            {
+              "by": "curator-1",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-06-20",
+              "artifact": "synthetic: fix commit and its regression test"
+            },
+            {
+              "by": "adjudicator-1",
+              "role": "adjudicator",
+              "verdict": "confirmed",
+              "decided": "2026-06-21",
+              "artifact": "synthetic: regression test fails at the head"
+            }
+          ]
+        },
+        "alpha-d2": {
+          "severity": "critical",
+          "class": "security",
+          "introduced": "5a73afb9449777adb9bece8d94ec4639cffddaca",
+          "summary": "Two writers can hold the lock at once.",
+          "location": [
+            {
+              "path": "src/alpha.py",
+              "lines": [
+                30,
+                41
+              ]
+            }
+          ],
+          "discovery": {
+            "source": "later_review",
+            "round": 2,
+            "finding": "R2-F1",
+            "discovered": "2026-05-03",
+            "fix": "f6717d15bff3e9275193a5903e2302d08f0239c7",
+            "merged": null,
+            "evidence_status": "synthetic",
+            "artifact": "synthetic: alpha-defect/alpha-d2"
+          },
+          "labels": [
+            {
+              "by": "adjudicator-1",
+              "role": "adjudicator",
+              "verdict": "confirmed",
+              "decided": "2026-06-21",
+              "artifact": "synthetic: two-process reproduction"
+            },
+            {
+              "by": "adjudicator-2",
+              "role": "adjudicator",
+              "verdict": "confirmed",
+              "decided": "2026-06-22",
+              "artifact": "synthetic: independent reproduction"
+            }
+          ]
+        },
+        "alpha-d3": {
+          "severity": "medium",
+          "class": "reliability",
+          "introduced": "5a73afb9449777adb9bece8d94ec4639cffddaca",
+          "summary": "A full disk is reported as a missing lock.",
+          "location": [
+            {
+              "path": "src/alpha.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "later_review",
+            "round": 3,
+            "finding": "R3-F2",
+            "discovered": "2026-05-05",
+            "fix": null,
+            "merged": null,
+            "evidence_status": "synthetic",
+            "artifact": null
+          },
+          "labels": [
+            {
+              "by": "adjudicator-1",
+              "role": "adjudicator",
+              "verdict": "confirmed",
+              "decided": "2026-06-21",
+              "artifact": "synthetic: ENOSPC injection"
+            },
+            {
+              "by": "adjudicator-2",
+              "role": "adjudicator",
+              "verdict": "rejected",
+              "decided": "2026-06-22",
+              "artifact": "synthetic: the error names the disk"
+            }
+          ]
+        }
+      },
+      "negative": null,
+      "withheld": [
+        "cef08c729419cecdc8385d9c3f8f542c2a924d4e",
+        "f6717d15bff3e9275193a5903e2302d08f0239c7",
+        "750422069a4cce20a2c8928b5b28667fcd80c8a0"
+      ],
+      "post_cutoff_refs": []
+    },
+    "alpha-negative": {
+      "stratum": "hard_negative",
+      "cluster": "alpha",
+      "provenance": {
+        "source": "synthetic",
+        "issue": 1,
+        "pr": null,
+        "round": 4,
+        "selection": "synthetic fixture: hand-built to cover each stratum and label outcome",
+        "note": "Stand-in object ids; no git object exists for any of them.",
+        "base_evidence": "synthetic",
+        "merge_commit": null
+      },
+      "review": {
+        "base_ref": "main",
+        "base_tip": "86e6b188bf20f4f19f6bbbfc9661b05b3c7e8a40",
+        "merge_base": "86e6b188bf20f4f19f6bbbfc9661b05b3c7e8a40",
+        "head": "9407bc268551c87a4beea4cc6529f23d1ab8542d",
+        "cutoff": "2026-05-01T13:00:00Z",
+        "base_tree": "8f21e697fa2821ded6cbe6efa102b92c92388686",
+        "merge_base_tree": "8f21e697fa2821ded6cbe6efa102b92c92388686",
+        "head_tree": "46174a1eb4a1aeb853097cb211cd9d381dc9186c"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "2d752a02fad0d8d4fc9ff203b0db856bdbe21cd2",
+          "uv.lock": "9fe25598116dff13a7a690be644a0b6bf94c1f7b"
+        },
+        "validation": [
+          "make check"
+        ],
+        "validation_scope": "full"
+      },
+      "context": {
+        "inventory": {
+          "status": "complete",
+          "taken": "2026-06-28T00:00:00Z",
+          "artifact": "synthetic: the listing of synthetic issue 1 as of the cutoff",
+          "sources": [
+            "issue/1"
+          ],
+          "edit_history_verified": true
+        },
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "source": "issue/1",
+            "ref": "synthetic issue alpha",
+            "observed_at": "2026-04-30T09:00:00Z",
+            "status": "captured",
+            "text": "Synthetic issue alpha, as the last round read it.",
+            "sha256": "5a372c4cdebffd5c954eb020d345bc21c6988968d3af99bb9568b07063cd4131",
+            "edited_at": null
+          }
+        ]
+      },
+      "actors": [
+        "producer-alpha",
+        "reviewer-alpha",
+        "fixer-alpha"
+      ],
+      "risk": {
+        "stratum": "elevated",
+        "rationale": "persistence: the same lock file after its fixes"
+      },
+      "exposure": {
+        "possible_from": "2026-05-01",
+        "public_by": null,
+        "artifact": "synthetic: the candidate's code first existed at its head, on its cutoff day"
+      },
+      "defects": {},
+      "negative": {
+        "observed_through": "2026-06-30",
+        "labels": [
+          {
+            "by": "adjudicator-2",
+            "role": "adjudicator",
+            "verdict": "clean",
+            "decided": "2026-06-22",
+            "artifact": "synthetic: independent pass, no defect"
+          }
+        ],
+        "oracle_status": "pass"
+      },
+      "withheld": [],
+      "post_cutoff_refs": []
+    },
+    "beta-escape": {
+      "stratum": "escape",
+      "cluster": "beta",
+      "provenance": {
+        "source": "synthetic",
+        "issue": 2,
+        "pr": null,
+        "round": null,
+        "selection": "synthetic fixture: hand-built to cover each stratum and label outcome",
+        "note": "Stand-in object ids; no git object exists for any of them.",
+        "base_evidence": "synthetic",
+        "merge_commit": null
+      },
+      "review": {
+        "base_ref": "main",
+        "base_tip": "2f0d6da5aff22684931a383d999aa7ae4b20da29",
+        "merge_base": "2f0d6da5aff22684931a383d999aa7ae4b20da29",
+        "head": "dfc15e8fbd6ff870fe37c7311acab43e4d31d7fb",
+        "cutoff": "2026-05-10T08:00:00Z",
+        "base_tree": "75ca10afdc13591c63fbf66b4fe37fb1067537cb",
+        "merge_base_tree": "75ca10afdc13591c63fbf66b4fe37fb1067537cb",
+        "head_tree": "b1ed76d93afe592c753b43acdcd3581b0920257d"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "8266d041450db140adf0c93c2f56006fcf0455ca",
+          "uv.lock": "48439462450e0bbd543e6e15f2530229d5db4aa8"
+        },
+        "validation": [
+          "make check"
+        ],
+        "validation_scope": "full"
+      },
+      "context": {
+        "inventory": {
+          "status": "complete",
+          "taken": "2026-06-28T00:00:00Z",
+          "artifact": "synthetic: the listing of synthetic issue 2 as of the cutoff",
+          "sources": [
+            "issue/2"
+          ],
+          "edit_history_verified": true
+        },
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "source": "issue/2",
+            "ref": "synthetic issue beta",
+            "observed_at": "2026-05-09T10:00:00Z",
+            "status": "captured",
+            "text": "Synthetic issue beta: authorize a merge from a certificate.",
+            "sha256": "bcf67d4cc446a95f78dfe32d1998bee8daaa6cf0cb1e4708528acce5c1b2591f",
+            "edited_at": null
+          }
+        ]
+      },
+      "actors": [
+        "producer-beta",
+        "reviewer-beta",
+        "fixer-beta"
+      ],
+      "risk": {
+        "stratum": "critical",
+        "rationale": "authorization: the change decides a merge"
+      },
+      "exposure": {
+        "possible_from": "2026-05-10",
+        "public_by": null,
+        "artifact": "synthetic: the candidate's code first existed at its head, on its cutoff day"
+      },
+      "defects": {
+        "beta-d1": {
+          "severity": "critical",
+          "class": "security",
+          "introduced": "dfc15e8fbd6ff870fe37c7311acab43e4d31d7fb",
+          "summary": "A certificate of another head authorizes the merge.",
+          "location": [
+            {
+              "path": "src/beta.py",
+              "lines": [
+                5,
+                9
+              ]
+            }
+          ],
+          "discovery": {
+            "source": "post_merge",
+            "round": null,
+            "finding": null,
+            "discovered": "2026-06-01",
+            "fix": "5a68eb368c71f2d19379dff55a5c403824a54612",
+            "merged": null,
+            "evidence_status": "synthetic",
+            "artifact": "synthetic: beta-escape/beta-d1"
+          },
+          "labels": [
+            {
+              "by": "adjudicator-1",
+              "role": "adjudicator",
+              "verdict": "confirmed",
+              "decided": "2026-06-21",
+              "artifact": "synthetic: oracle assertion"
+            },
+            {
+              "by": "adjudicator-3",
+              "role": "adjudicator",
+              "verdict": "confirmed",
+              "decided": "2026-06-23",
+              "artifact": "synthetic: independent oracle run"
+            }
+          ]
+        },
+        "beta-d2": {
+          "severity": "low",
+          "class": "maintainability",
+          "introduced": "dfc15e8fbd6ff870fe37c7311acab43e4d31d7fb",
+          "summary": "The refusal's message names the wrong field.",
+          "location": [
+            {
+              "path": "src/beta.py",
+              "lines": [
+                12,
+                12
+              ]
+            }
+          ],
+          "discovery": {
+            "source": "post_merge",
+            "round": null,
+            "finding": null,
+            "discovered": "2026-06-02",
+            "fix": null,
+            "merged": null,
+            "evidence_status": "synthetic",
+            "artifact": null
+          },
+          "labels": [
+            {
+              "by": "adjudicator-3",
+              "role": "adjudicator",
+              "verdict": "confirmed",
+              "decided": "2026-06-23",
+              "artifact": "synthetic: message comparison"
+            }
+          ]
+        }
+      },
+      "negative": null,
+      "withheld": [
+        "5a68eb368c71f2d19379dff55a5c403824a54612"
+      ],
+      "post_cutoff_refs": []
+    },
+    "beta-clean": {
+      "stratum": "clean",
+      "cluster": "beta",
+      "provenance": {
+        "source": "synthetic",
+        "issue": 3,
+        "pr": null,
+        "round": null,
+        "selection": "synthetic fixture: hand-built to cover each stratum and label outcome",
+        "note": "Stand-in object ids; no git object exists for any of them.",
+        "base_evidence": "synthetic",
+        "merge_commit": null
+      },
+      "review": {
+        "base_ref": "main",
+        "base_tip": "c63d39d974534e3146ebb03068b4e3bb1eb6d32d",
+        "merge_base": "c63d39d974534e3146ebb03068b4e3bb1eb6d32d",
+        "head": "06622316c49a2305f2fce902335498766e5b9e46",
+        "cutoff": "2026-06-15T08:00:00Z",
+        "base_tree": "13c1b067bb2d2e8c2bb2ede3ceae425bf5b6287a",
+        "merge_base_tree": "13c1b067bb2d2e8c2bb2ede3ceae425bf5b6287a",
+        "head_tree": "bbc704d85188983df737c106d05f9564f304924b"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "48659acd642c2a55f545a210435f7727fb9a8058",
+          "uv.lock": "2bdddf61771a92f388017fc158979a086c93a1f1"
+        },
+        "validation": [
+          "make check"
+        ],
+        "validation_scope": "full"
+      },
+      "context": {
+        "inventory": {
+          "status": "complete",
+          "taken": "2026-06-28T00:00:00Z",
+          "artifact": "synthetic: the listing of synthetic issue 3 as of the cutoff",
+          "sources": [
+            "issue/3"
+          ],
+          "edit_history_verified": true
+        },
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "source": "issue/3",
+            "ref": "synthetic issue beta 2",
+            "observed_at": "2026-06-14T10:00:00Z",
+            "status": "captured",
+            "text": "Synthetic issue beta 2: rename a configuration key.",
+            "sha256": "01eae681bc4489b2da6b49dc12907b54cc39eb38a87ba92312e94a37d6ca1a27",
+            "edited_at": null
+          }
+        ]
+      },
+      "actors": [
+        "producer-beta",
+        "reviewer-beta",
+        "fixer-beta"
+      ],
+      "risk": {
+        "stratum": "routine",
+        "rationale": "configuration rename with its migration"
+      },
+      "exposure": {
+        "possible_from": "2026-06-15",
+        "public_by": null,
+        "artifact": "synthetic: the candidate's code first existed at its head, on its cutoff day"
+      },
+      "defects": {},
+      "negative": {
+        "observed_through": "2026-06-30",
+        "labels": [
+          {
+            "by": "adjudicator-1",
+            "role": "adjudicator",
+            "verdict": "clean",
+            "decided": "2026-06-25",
+            "artifact": "synthetic: independent pass, no defect"
+          }
+        ],
+        "oracle_status": "pass"
+      },
+      "withheld": [],
+      "post_cutoff_refs": []
+    },
+    "gamma-revert": {
+      "stratum": "revert",
+      "cluster": "gamma",
+      "provenance": {
+        "source": "synthetic",
+        "issue": 4,
+        "pr": null,
+        "round": 1,
+        "selection": "synthetic fixture: hand-built to cover each stratum and label outcome",
+        "note": "Stand-in object ids; no git object exists for any of them.",
+        "base_evidence": "synthetic",
+        "merge_commit": null
+      },
+      "review": {
+        "base_ref": "main",
+        "base_tip": "db7d3f5fb31236944adf13ef9cb464cb339581d3",
+        "merge_base": "db7d3f5fb31236944adf13ef9cb464cb339581d3",
+        "head": "8c3fb2c2584573e3f2cc47bb68fb5af847a482de",
+        "cutoff": "2026-04-01T08:00:00Z",
+        "base_tree": "a6a932f7d46e8217381af7174404e952418e0b88",
+        "merge_base_tree": "a6a932f7d46e8217381af7174404e952418e0b88",
+        "head_tree": "488fa48d0e11c45fc54c15e2c1310fb7b425dc57"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "69bb1b11b82182a234df2245645adad814dcf336",
+          "uv.lock": "613f6bfd380b3c7fdcef9e43b5ba591dffd75fda"
+        },
+        "validation": [
+          "make check"
+        ],
+        "validation_scope": "full"
+      },
+      "context": {
+        "inventory": {
+          "status": "complete",
+          "taken": "2026-06-28T00:00:00Z",
+          "artifact": "synthetic: the listing of synthetic issue 4 as of the cutoff",
+          "sources": [
+            "issue/4"
+          ],
+          "edit_history_verified": true
+        },
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "source": "issue/4",
+            "ref": "synthetic issue gamma",
+            "observed_at": "2026-03-30T10:00:00Z",
+            "status": "captured",
+            "text": "Synthetic issue gamma: paginate a listing.",
+            "sha256": "9ba6550b67c24fb4fa1aff3b01a562db633a91ad119bb31c54bbb3b9cbb0638c",
+            "edited_at": null
+          }
+        ]
+      },
+      "actors": [
+        "producer-gamma",
+        "reviewer-gamma",
+        "fixer-gamma"
+      ],
+      "risk": {
+        "stratum": "routine",
+        "rationale": "a read-only listing"
+      },
+      "exposure": {
+        "possible_from": "2026-04-01",
+        "public_by": null,
+        "artifact": "synthetic: the candidate's code first existed at its head, on its cutoff day"
+      },
+      "defects": {
+        "gamma-d1": {
+          "severity": "medium",
+          "class": "correctness",
+          "introduced": "8c3fb2c2584573e3f2cc47bb68fb5af847a482de",
+          "summary": "The last page is dropped.",
+          "location": [
+            {
+              "path": "src/gamma.py",
+              "lines": [
+                40,
+                52
+              ]
+            }
+          ],
+          "discovery": {
+            "source": "revert",
+            "round": null,
+            "finding": null,
+            "discovered": "2026-04-10",
+            "fix": "7eb7352db2d1fbe9b37f4ee26611d8af50256d63",
+            "merged": null,
+            "evidence_status": "synthetic",
+            "artifact": "synthetic: gamma-revert/gamma-d1"
+          },
+          "labels": [
+            {
+              "by": "adjudicator-2",
+              "role": "adjudicator",
+              "verdict": "confirmed",
+              "decided": "2026-06-22",
+              "artifact": "synthetic: the revert and its failing case"
+            }
+          ]
+        },
+        "gamma-d2": {
+          "severity": "high",
+          "class": "specification",
+          "introduced": "8c3fb2c2584573e3f2cc47bb68fb5af847a482de",
+          "summary": "An empty page ends the listing early.",
+          "location": [
+            {
+              "path": "src/gamma.py",
+              "lines": [
+                44,
+                46
+              ]
+            }
+          ],
+          "discovery": {
+            "source": "later_review",
+            "round": 2,
+            "finding": "R2-F1",
+            "discovered": "2026-04-02",
+            "fix": null,
+            "merged": null,
+            "evidence_status": "synthetic",
+            "artifact": null
+          },
+          "labels": [
+            {
+              "by": "curator-1",
+              "role": "curator",
+              "verdict": "confirmed",
+              "decided": "2026-06-20",
+              "artifact": "synthetic: the round's finding"
+            },
+            {
+              "by": "adjudicator-3",
+              "role": "adjudicator",
+              "verdict": "rejected",
+              "decided": "2026-06-23",
+              "artifact": "synthetic: the API never returns an empty page before the last"
+            }
+          ]
+        },
+        "gamma-d3": {
+          "severity": "critical",
+          "class": "security",
+          "introduced": "8c3fb2c2584573e3f2cc47bb68fb5af847a482de",
+          "summary": "A page token from another listing is accepted.",
+          "location": [
+            {
+              "path": "src/gamma.py",
+              "lines": null
+            }
+          ],
+          "discovery": {
+            "source": "post_merge",
+            "round": null,
+            "finding": null,
+            "discovered": "2026-04-20",
+            "fix": null,
+            "merged": null,
+            "evidence_status": "synthetic",
+            "artifact": null
+          },
+          "labels": [
+            {
+              "by": "adjudicator-1",
+              "role": "adjudicator",
+              "verdict": "confirmed",
+              "decided": "2026-06-21",
+              "artifact": "synthetic: one reproduction, unreviewed"
+            }
+          ]
+        }
+      },
+      "negative": null,
+      "withheld": [
+        "7eb7352db2d1fbe9b37f4ee26611d8af50256d63"
+      ],
+      "post_cutoff_refs": []
+    },
+    "gamma-clean": {
+      "stratum": "clean",
+      "cluster": "gamma",
+      "provenance": {
+        "source": "synthetic",
+        "issue": 5,
+        "pr": null,
+        "round": null,
+        "selection": "synthetic fixture: hand-built to cover each stratum and label outcome",
+        "note": "Stand-in object ids; no git object exists for any of them.",
+        "base_evidence": "synthetic",
+        "merge_commit": null
+      },
+      "review": {
+        "base_ref": "main",
+        "base_tip": "8dd71aee086e2f7e22aed9d7d32731095fb8a670",
+        "merge_base": "8dd71aee086e2f7e22aed9d7d32731095fb8a670",
+        "head": "723698fbb81868374f3b77066118f4a4efeefc9c",
+        "cutoff": "2026-04-01T09:00:00Z",
+        "base_tree": "7bf16fbb67ea8956f28f4030f83df449a5bec46b",
+        "merge_base_tree": "7bf16fbb67ea8956f28f4030f83df449a5bec46b",
+        "head_tree": "b9170283176194a8b63b492ca5b14b53daca4a34"
+      },
+      "environment": {
+        "files": {
+          "pyproject.toml": "9863b2c7d946c2e0f57164043ad4cdc73b83f611",
+          "uv.lock": "ccd4b428ed7f821a7da48075a6563b7a7bdbbf9d"
+        },
+        "validation": [
+          "make check"
+        ],
+        "validation_scope": "full"
+      },
+      "context": {
+        "inventory": {
+          "status": "complete",
+          "taken": "2026-06-28T00:00:00Z",
+          "artifact": "synthetic: the listing of synthetic issue 5 as of the cutoff",
+          "sources": [
+            "issue/5"
+          ],
+          "edit_history_verified": true
+        },
+        "items": [
+          {
+            "id": "issue",
+            "kind": "issue",
+            "source": "issue/5",
+            "ref": "synthetic issue gamma 2",
+            "observed_at": "2026-03-31T10:00:00Z",
+            "status": "captured",
+            "text": "Synthetic issue gamma 2: document the listing's limits.",
+            "sha256": "79f93d64d4c4a4810c8489dd5ecaab9a5c3a24d0ef71cabd84a3ac1b39aab4e4",
+            "edited_at": null
+          }
+        ]
+      },
+      "actors": [
+        "producer-gamma",
+        "reviewer-gamma",
+        "fixer-gamma"
+      ],
+      "risk": {
+        "stratum": "routine",
+        "rationale": "documentation and a bound check"
+      },
+      "exposure": {
+        "possible_from": "2026-04-01",
+        "public_by": null,
+        "artifact": "synthetic: the candidate's code first existed at its head, on its cutoff day"
+      },
+      "defects": {},
+      "negative": {
+        "observed_through": "2026-05-16",
+        "labels": [
+          {
+            "by": "curator-1",
+            "role": "curator",
+            "verdict": "clean",
+            "decided": "2026-06-20",
+            "artifact": "synthetic: proposed"
+          },
+          {
+            "by": "adjudicator-2",
+            "role": "adjudicator",
+            "verdict": "clean",
+            "decided": "2026-06-22",
+            "artifact": "synthetic: independent pass, no defect"
+          }
+        ],
+        "oracle_status": "pass"
+      },
+      "withheld": [],
+      "post_cutoff_refs": []
+    }
+  }
+}
