@@ -184,9 +184,16 @@ def corpus_digest(corpus: dict) -> str:
 # -- reviewer-visible boundary & deterministic O(N) leakage checks ------------
 
 
+REVIEWER_CONTEXT_FIELDS = ("id", "kind", "source", "text", "sha256")
+
+
 def project_reviewer_input(case: dict) -> dict:
     """Strict allow-list projection of everything a reviewer is given.
 
+    Each context item carries its captured ``text`` (``None`` when it was not
+    captured) beside the ``sha256`` that binds it, so the exported input alone
+    reproduces the frozen context: the reviewer needs neither the private
+    corpus nor live GitHub, whose text may have changed after the cutoff.
     Excludes ``ref``, provenance notes, withheld commits, post-cutoff refs,
     actors, risk, exposure, stratum, defects, and negative outcomes.
     """
@@ -196,8 +203,7 @@ def project_reviewer_input(case: dict) -> dict:
         "review": dict(case["review"]),
         "environment": dict(case["environment"]),
         "context": [
-            {key: item[key] for key in ("id", "kind", "source", "sha256")}
-            for item in case["context"]["items"]
+            {key: item[key] for key in REVIEWER_CONTEXT_FIELDS} for item in case["context"]["items"]
         ],
     }
 

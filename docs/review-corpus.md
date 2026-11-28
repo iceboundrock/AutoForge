@@ -36,7 +36,7 @@ A corpus JSON file pins repository metadata, frozen ref tips, declared validatio
 
 This specification separates **what offline tooling enforces deterministically** from **what requires external capture and human adjudication (#592)**:
 
-1. **Reviewer-visible allow-list projection (`project_reviewer_input`):** Returns only `format`, `version`, `review`, `environment`, and `{id, kind, source, sha256}` per context item. Curator metadata (`ref`, provenance notes, `withheld`, `post_cutoff_refs`, `actors`, `risk`, `exposure`, `stratum`, `defects`, `negative`) is strictly excluded from `project_reviewer_input` and `input_digest`.
+1. **Reviewer-visible allow-list projection (`project_reviewer_input`):** Returns only `format`, `version`, `review`, `environment`, and `{id, kind, source, text, sha256}` per context item. The captured `text` travels with the digest that binds it (`null` for an uncaptured item), so `export-input` alone reproduces the frozen context: a reviewer needs neither the private corpus, which holds the ground truth, nor live GitHub, whose text may have been edited after the cutoff. Curator metadata (`ref`, provenance notes, `withheld`, `post_cutoff_refs`, `actors`, `risk`, `exposure`, `stratum`, `defects`, `negative`) is strictly excluded from `project_reviewer_input` and `input_digest`.
 2. **Deterministic O(N) leakage checks (`check_text_leakage`):**
    - `observed_at <= cutoff` and (if present) `edited_at <= cutoff` for every captured context item; `sha256` must match item `text`.
    - Required singular items (`issue` when `provenance.issue` is set; `pr_body` when `provenance.pr` is set or source is `pr_branch`/`squash`/`merge_pr`) must be present; when `inventory.status == "complete"`, `sources` must match the exact set of captured item sources and `cutoff <= taken`. A case is `runnable` only when every context item is captured and the inventory records `edit_history_verified: true`; a complete inventory with unverified edit history validates but leaves the case unrunnable, because a null `edited_at` does not show that no edit happened after the cutoff.
@@ -105,4 +105,4 @@ Fixture SHA-256:
 
 - `autoforge_seed.json`: `3ada1901e6daec2616133cb26d20d81f6425bb182f6597e9e44b4b2dfe0099e0`
 - `synthetic_corpus.json`: `0241b055e229ab522d7be6b75e9a3e7742dba54f1b3dc561bc359370ea178feb`
-- `synthetic_submissions.json`: `16a0e088fe9efa4e6eced4b142ef822bbf3a4616512cd60d851365e58d974edf`
+- `synthetic_submissions.json`: `83108542999112b40838fee1f3345d7955fa0ca902fe6b469fc7f9223f5572e7`

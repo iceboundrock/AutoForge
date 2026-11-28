@@ -466,11 +466,37 @@ def test_project_reviewer_input_excludes_ref_and_ground_truth(syn_corpus):
     proj = rc.project_reviewer_input(raw_case)
     assert set(proj) == {"format", "version", "review", "environment", "context"}
     for item in proj["context"]:
-        assert set(item) == {"id", "kind", "source", "sha256"}
+        assert set(item) == {"id", "kind", "source", "text", "sha256"}
     # Still passes check_corpus because `ref` is outside reviewer input!
     d_with_sha = rc.check_corpus(syn_corpus).cases["alpha-defect"].input
     raw_case["context"]["items"][0]["ref"] = "other ref"
     assert rc.check_corpus(syn_corpus).cases["alpha-defect"].input == d_with_sha
+
+
+def test_exported_input_alone_reproduces_the_frozen_context(syn_corpus, capsys):
+    # The reviewer receives the captured snapshot bytes, bound by their digests,
+    # so neither the private corpus nor live GitHub is needed to rebuild them.
+    raw_case = syn_corpus["cases"]["alpha-defect"]
+    assert rc.main(["export-input", str(rc.SYNTHETIC_CORPUS), "alpha-defect"]) == 0
+    exported = json.loads(capsys.readouterr().out)
+    frozen = {item["id"]: item["text"] for item in raw_case["context"]["items"]}
+    assert frozen and all(text is not None for text in frozen.values())
+    rebuilt = {item["id"]: item["text"] for item in exported["context"]}
+    assert rebuilt == frozen
+    for item in exported["context"]:
+        assert sha256(item["text"].encode("utf-8")).hexdigest() == item["sha256"]
+    # The digest binds the text: an edited snapshot is a different frozen input.
+    before = rc.input_digest(raw_case)
+    raw_case["context"]["items"][0]["text"] += " (edited)"
+    assert rc.input_digest(raw_case) != before
+    # Nothing outside the allow-list (labels, curator refs, ground truth) leaks.
+    for item in exported["context"]:
+        assert set(item) == set(rc.REVIEWER_CONTEXT_FIELDS)
+    blob = json.dumps(exported)
+    for withheld in raw_case["withheld"]:
+        assert withheld not in blob
+    for defect in raw_case["defects"].values():
+        assert defect["summary"] not in blob
 
 
 @pytest.mark.parametrize("field", ["text", "base_ref", "env_file", "validation", "id"])
@@ -1481,6 +1507,9 @@ def test_cli_subcommands_and_error_redaction(tmp_path, capsys):
     assert rc.main(["export-input", str(rc.SYNTHETIC_CORPUS), "alpha-defect"]) == 0
     exported = json.loads(capsys.readouterr().out)
     assert set(exported) == {"format", "version", "review", "environment", "context"}
+    assert exported == rc.project_reviewer_input(
+        rc.read_json(rc.SYNTHETIC_CORPUS)["cases"]["alpha-defect"]
+    )
 
     bad = tmp_path / "secret.json"
     bad.write_text('{"SECRET_TOKEN_SHOULD_NOT_ECHO": 1}', encoding="utf-8")
