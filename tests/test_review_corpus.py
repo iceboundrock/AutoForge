@@ -620,6 +620,80 @@ def test_cross_case_future_round_sha_leakage_refused(tmp_path):
         rc.check_corpus(c)
 
 
+def test_cross_case_leakage_refuses_a_later_intermediate_introduction(tmp_path):
+    """A later round of two commits, B then its head C, registers a defect B
+    introduced. Round 1's text naming B is refused although B is neither round
+    2's head nor withheld anywhere; naming a later introduction round 1's own
+    candidate holds (its head) is not."""
+    h = _make_hist_repo(tmp_path)
+    repo = h["repo"]
+    _git(repo, "checkout", "-q", "-b", "pr2-round2", h["pr2_head"])
+    text = (repo / "src/a.py").read_text(encoding="utf-8")
+    (repo / "src/a.py").write_text(text.replace("line3 = 3", "line3 = 0  # bug"), encoding="utf-8")
+    _git(repo, "commit", "-qam", "feat: round 2 part 1", dt="2026-01-04T03:00:00Z")
+    intermediate = _git(repo, "rev-parse", "HEAD")
+    (repo / "notes.txt").write_text("notes\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "feat: round 2 part 2", dt="2026-01-04T04:00:00Z")
+    round2_head = _git(repo, "rev-parse", "HEAD")
+    assert intermediate != round2_head
+
+    c = _hist_branch_corpus(h)
+    r2 = deepcopy(c["cases"]["pr2-r1"])
+    r2["provenance"]["round"] = 2
+    r2["review"]["head"] = round2_head
+    r2["review"]["head_tree"] = h["tree"](round2_head)
+    r2["review"]["cutoff"] = "2026-01-04T05:00:00Z"
+    r2["environment"]["files"] = {
+        "pyproject.toml": h["blob"](round2_head, "pyproject.toml"),
+        "uv.lock": h["blob"](round2_head, "uv.lock"),
+    }
+    r2["context"]["inventory"]["taken"] = "2026-01-04T06:00:00Z"
+    r2["withheld"] = []
+
+    def round2_defect(introduced: str, line: int, finding: str) -> dict:
+        return {
+            "severity": "low",
+            "class": "correctness",
+            "introduced": introduced,
+            "summary": f"wrong line{line}",
+            "location": [{"path": "src/a.py", "lines": [line, line]}],
+            "discovery": {
+                "source": "same_review",
+                "round": 2,
+                "finding": finding,
+                "discovered": "2026-01-05",
+                "fix": None,
+                "merged": None,
+                "evidence_status": "provisional",
+                "artifact": None,
+            },
+            "labels": [_label("adj1", "confirmed", decided="2026-01-10")],
+        }
+
+    r2["defects"] = {
+        "d-pr2-early": round2_defect(h["pr2_head"], 2, "R2-F1"),
+        "d-pr2-late": round2_defect(intermediate, 3, "R2-F2"),
+    }
+    c["cases"]["pr2-r2"] = r2
+
+    def round1_names(commit: str) -> dict:
+        named = deepcopy(c)
+        item = named["cases"]["pr2-r1"]["context"]["items"][0]
+        item["text"] = f"See {commit[:7]}."
+        item["sha256"] = sha256(item["text"].encode()).hexdigest()
+        return named
+
+    # Both rounds are valid and verify, so only the leakage rule tells them apart.
+    present = round1_names(h["pr2_head"])
+    rc.check_corpus(present)
+    report = rc.verify(present, repo)
+    assert report["ok"], report
+
+    with pytest.raises(rc.CorpusError, match="withheld commit"):
+        rc.check_corpus(round1_names(intermediate))
+
+
 # -- C. Batched read-only Git verification ------------------------------------
 
 

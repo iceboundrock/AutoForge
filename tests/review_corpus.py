@@ -1002,13 +1002,32 @@ def check_discoveries(corpus: dict, cases: dict[str, Case]) -> None:
             )
 
 
+def present_commits(case: dict) -> set[str]:
+    """Commits a case's own pins place in its candidate: its review revisions
+    and the commits that introduced its registered defects."""
+    review = case["review"]
+    present = {review["head"], review["base_tip"], review["merge_base"]}
+    present.update(defect["introduced"] for defect in case["defects"].values())
+    return present
+
+
 def check_cross_case_leakage(corpus: dict, cases: dict[str, Case]) -> None:
     """An earlier round of the same PR (or issue when PR is null) cannot contain
-    commits introduced/reviewed/withheld by a later round or merge."""
+    commits introduced/reviewed/withheld by a later round or merge.
+
+    A later round may hold several commits, so a later defect's ``introduced``
+    can be an intermediate commit that is neither that round's head nor in any
+    withheld list. It is forbidden too unless the earlier case's own pins place
+    it in the earlier candidate (``present_commits``). Offline this cannot see
+    ancestry, so it fails closed: a commit already in the earlier head that
+    introduces a defect the later round registers is a defect the earlier
+    candidate holds as well, and registering it in the earlier case admits it.
+    """
     raw_cases = corpus["cases"]
     items = sorted(raw_cases.items())
     for cid, raw_c in items:
         case = cases[cid]
+        present = present_commits(raw_c)
         future_shas: set[str] = set()
         for other_id, other_raw in items:
             if other_id == cid:
@@ -1025,6 +1044,11 @@ def check_cross_case_leakage(corpus: dict, cases: dict[str, Case]) -> None:
             if other_raw["provenance"]["merge_commit"] is not None:
                 future_shas.add(other_raw["provenance"]["merge_commit"])
             future_shas.update(other_raw["withheld"])
+            future_shas.update(
+                defect["introduced"]
+                for defect in other_raw["defects"].values()
+                if defect["introduced"] not in present
+            )
         if future_shas:
             check_text_leakage(list(reviewer_text(raw_c)), future_shas, ())
 
