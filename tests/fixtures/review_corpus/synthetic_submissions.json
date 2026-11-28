@@ -1,0 +1,456 @@
+{
+  "format": "autoforge-review-submissions",
+  "version": 1,
+  "mode": "synthetic",
+  "corpus": "a7b14320f4f91522842093c3a07e4f732512335d68b7d447feb2d121e498aab3",
+  "frozen": "2026-07-15",
+  "baseline": "baseline",
+  "plan": {
+    "cases": [
+      "alpha-defect",
+      "alpha-negative",
+      "beta-clean",
+      "beta-escape",
+      "gamma-clean",
+      "gamma-revert"
+    ],
+    "seeds": [
+      1
+    ]
+  },
+  "variants": {
+    "baseline": {
+      "identity": "reviewer-baseline",
+      "provider": "synthetic-provider",
+      "provider_version": "0.0.0",
+      "model": "synthetic-model-a",
+      "effort": "high",
+      "knowledge_cutoff": "2026-04-15",
+      "prompt": {
+        "template": "src/autoforge/prompts/review.md",
+        "sha256": "a7ad1a45ea11148067814aa6ba5604aa49991268d203980794d5553b3914af51"
+      },
+      "controller": "17ec869c7b44e17aa8f26eda5548624a0ab96cfc",
+      "sandbox": "disabled"
+    },
+    "variant-a": {
+      "identity": "reviewer-variant-a",
+      "provider": "synthetic-provider",
+      "provider_version": "0.0.0",
+      "model": "synthetic-model-b",
+      "effort": "high",
+      "knowledge_cutoff": null,
+      "prompt": {
+        "template": "src/autoforge/prompts/review.md",
+        "sha256": "7f7202edde668991b55c77bb0b3437571a3be6931c0a08e224abc7431102fa95"
+      },
+      "controller": "17ec869c7b44e17aa8f26eda5548624a0ab96cfc",
+      "sandbox": "disabled"
+    }
+  },
+  "runs": [
+    {
+      "variant": "baseline",
+      "case": "alpha-defect",
+      "seed": 1,
+      "input": "0e5c7bf75b404f4411a7df78e746a287066c1a18bc29494430e71a9c7d82ef19",
+      "pins_sha256": "c008d791ea0080cd667836e3ac37ff667536afdc3e439b64293650e51eca82ef",
+      "status": "completed",
+      "exclusion": null,
+      "cost_microusd": 1000,
+      "findings": [
+        {
+          "id": "F1",
+          "classification": "blocked",
+          "title": "stale lock after a crash",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "match",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": "alpha-d1"
+            }
+          ]
+        },
+        {
+          "id": "F2",
+          "classification": "non-blocked",
+          "title": "lock path not configurable",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "false",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": null
+            }
+          ]
+        },
+        {
+          "id": "F3",
+          "classification": "nit",
+          "title": "unclear error wording",
+          "location": "src/x.py:1",
+          "labels": []
+        }
+      ]
+    },
+    {
+      "variant": "baseline",
+      "case": "alpha-negative",
+      "seed": 1,
+      "input": "a341c6ef4ee72af1db3c058e05c05da72b2a3f4e9639a4ce74bcab12d1d83565",
+      "pins_sha256": "c008d791ea0080cd667836e3ac37ff667536afdc3e439b64293650e51eca82ef",
+      "status": "completed",
+      "exclusion": null,
+      "cost_microusd": 1000,
+      "findings": [
+        {
+          "id": "F1",
+          "classification": "blocked",
+          "title": "stale lock after a crash",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "false",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "baseline",
+      "case": "beta-escape",
+      "seed": 1,
+      "input": "b679d76253cff928903276462f2e6e1001dcd4e5feb74acf56819e95004c6ff5",
+      "pins_sha256": "c008d791ea0080cd667836e3ac37ff667536afdc3e439b64293650e51eca82ef",
+      "status": "completed",
+      "exclusion": null,
+      "cost_microusd": 1000,
+      "findings": [
+        {
+          "id": "F1",
+          "classification": "blocked",
+          "title": "refusal names the wrong field",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "match",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": "beta-d2"
+            }
+          ]
+        },
+        {
+          "id": "F2",
+          "classification": "non-blocked",
+          "title": "message field is wrong",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "match",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": "beta-d2"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "baseline",
+      "case": "beta-clean",
+      "seed": 1,
+      "input": "1a5d857e781f1a850770d7fc43b387b130a0f06055f0785cc8052a7595045c4e",
+      "pins_sha256": "c008d791ea0080cd667836e3ac37ff667536afdc3e439b64293650e51eca82ef",
+      "status": "completed",
+      "exclusion": null,
+      "cost_microusd": 1000,
+      "findings": [
+        {
+          "id": "F1",
+          "classification": "nit",
+          "title": "old key still accepted",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "false",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "baseline",
+      "case": "gamma-revert",
+      "seed": 1,
+      "input": "83107151aa7331b71e85071373c4a57bd1f2fb7c3a6b77254f65630c257b6bef",
+      "pins_sha256": "c008d791ea0080cd667836e3ac37ff667536afdc3e439b64293650e51eca82ef",
+      "status": "completed",
+      "exclusion": null,
+      "cost_microusd": 1000,
+      "findings": [
+        {
+          "id": "F1",
+          "classification": "blocked",
+          "title": "last page dropped",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "match",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": "gamma-d1"
+            }
+          ]
+        },
+        {
+          "id": "F2",
+          "classification": "non-blocked",
+          "title": "empty page ends early",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "match",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": "gamma-d2"
+            }
+          ]
+        },
+        {
+          "id": "F3",
+          "classification": "nit",
+          "title": "foreign page token",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "match",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": "gamma-d3"
+            },
+            {
+              "by": "adjudicator-5",
+              "role": "adjudicator",
+              "verdict": "match",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": "gamma-d3"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "baseline",
+      "case": "gamma-clean",
+      "seed": 1,
+      "input": "720975224cd9d7284cddfbdd2a8b0e09e40e064ac7e8813efe9fe5cbe09596ea",
+      "pins_sha256": "c008d791ea0080cd667836e3ac37ff667536afdc3e439b64293650e51eca82ef",
+      "status": "completed",
+      "exclusion": null,
+      "cost_microusd": 1000,
+      "findings": []
+    },
+    {
+      "variant": "variant-a",
+      "case": "alpha-defect",
+      "seed": 1,
+      "input": "0e5c7bf75b404f4411a7df78e746a287066c1a18bc29494430e71a9c7d82ef19",
+      "pins_sha256": "0f59a15e1fe1fd97836b7350aaebcfac6518de8f838ad790065b10a70cd1b303",
+      "status": "completed",
+      "exclusion": null,
+      "cost_microusd": 2000,
+      "findings": [
+        {
+          "id": "F1",
+          "classification": "blocked",
+          "title": "two writers hold the lock",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "match",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": "alpha-d2"
+            },
+            {
+              "by": "adjudicator-5",
+              "role": "adjudicator",
+              "verdict": "match",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": "alpha-d2"
+            }
+          ]
+        },
+        {
+          "id": "F2",
+          "classification": "non-blocked",
+          "title": "stale lock after a crash",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "match",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": "alpha-d1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "variant-a",
+      "case": "alpha-negative",
+      "seed": 1,
+      "input": "a341c6ef4ee72af1db3c058e05c05da72b2a3f4e9639a4ce74bcab12d1d83565",
+      "pins_sha256": "0f59a15e1fe1fd97836b7350aaebcfac6518de8f838ad790065b10a70cd1b303",
+      "status": "completed",
+      "exclusion": null,
+      "cost_microusd": 2000,
+      "findings": []
+    },
+    {
+      "variant": "variant-a",
+      "case": "beta-escape",
+      "seed": 1,
+      "input": "b679d76253cff928903276462f2e6e1001dcd4e5feb74acf56819e95004c6ff5",
+      "pins_sha256": "0f59a15e1fe1fd97836b7350aaebcfac6518de8f838ad790065b10a70cd1b303",
+      "status": "completed",
+      "exclusion": null,
+      "cost_microusd": 2000,
+      "findings": [
+        {
+          "id": "F1",
+          "classification": "blocked",
+          "title": "certificate of another head",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "match",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": "beta-d1"
+            },
+            {
+              "by": "adjudicator-5",
+              "role": "adjudicator",
+              "verdict": "match",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": "beta-d1"
+            }
+          ]
+        },
+        {
+          "id": "F2",
+          "classification": "nit",
+          "title": "possible race in the check",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "unknown",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "variant-a",
+      "case": "beta-clean",
+      "seed": 1,
+      "input": "1a5d857e781f1a850770d7fc43b387b130a0f06055f0785cc8052a7595045c4e",
+      "pins_sha256": "0f59a15e1fe1fd97836b7350aaebcfac6518de8f838ad790065b10a70cd1b303",
+      "status": "completed",
+      "exclusion": null,
+      "cost_microusd": 2000,
+      "findings": []
+    },
+    {
+      "variant": "variant-a",
+      "case": "gamma-revert",
+      "seed": 1,
+      "input": "83107151aa7331b71e85071373c4a57bd1f2fb7c3a6b77254f65630c257b6bef",
+      "pins_sha256": "0f59a15e1fe1fd97836b7350aaebcfac6518de8f838ad790065b10a70cd1b303",
+      "status": "completed",
+      "exclusion": null,
+      "cost_microusd": 2000,
+      "findings": [
+        {
+          "id": "F1",
+          "classification": "blocked",
+          "title": "listing is not cached",
+          "location": "src/x.py:1",
+          "labels": [
+            {
+              "by": "adjudicator-4",
+              "role": "adjudicator",
+              "verdict": "false",
+              "decided": "2026-07-10",
+              "artifact": "synthetic: blinded match against the registered defects",
+              "defect": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "variant-a",
+      "case": "gamma-clean",
+      "seed": 1,
+      "input": "720975224cd9d7284cddfbdd2a8b0e09e40e064ac7e8813efe9fe5cbe09596ea",
+      "pins_sha256": "0f59a15e1fe1fd97836b7350aaebcfac6518de8f838ad790065b10a70cd1b303",
+      "status": "completed",
+      "exclusion": null,
+      "cost_microusd": null,
+      "findings": [
+        {
+          "id": "F1",
+          "classification": "non-blocked",
+          "title": "limit may be off by one",
+          "location": "src/x.py:1",
+          "labels": []
+        }
+      ]
+    }
+  ]
+}

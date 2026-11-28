@@ -627,6 +627,13 @@ the evaluation protocol (#318)        test_evaluation.py (the pins, what arms ho
 troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
                                       a test that exists; the guide's links and the links
                                       into it resolve)
+review corpus and benchmark (#356)    test_review_corpus.py (closed schema v1, reviewer-input
+                                      allow-list projection, O(N) SHA/cutoff leakage checks,
+                                      batched read-only git verification across pr_branch /
+                                      squash / merge_pr, cross-case identity invariants,
+                                      independent adjudication + 2-adjudicator critical
+                                      rules, Option 3A recall bounds, cluster bootstrap,
+                                      work limits, seed verification, doc SHA-256 pins)
 ```
 
 Add a new test next to the behaviour's existing file; create a new file only
