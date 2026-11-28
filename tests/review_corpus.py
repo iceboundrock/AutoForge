@@ -444,6 +444,11 @@ class Corpus:
     digest: str
     cases: dict[str, Case] = field(default_factory=dict)
 
+    @cached_property
+    def actors(self) -> frozenset[str]:
+        """Every case's actors: none of them may label any case of the corpus."""
+        return corpus_actors(self.cases)
+
 
 def required_context(origin: dict) -> set[str]:
     required: set[str] = set()
@@ -1004,6 +1009,17 @@ def check_cross_case_leakage(corpus: dict, cases: dict[str, Case]) -> None:
             check_text_leakage(list(reviewer_text(raw_c)), future_shas, ())
 
 
+def corpus_actors(cases: dict[str, Case]) -> frozenset[str]:
+    return frozenset().union(*(case.actors for case in cases.values()))
+
+
+def check_independence(cases: dict[str, Case]) -> None:
+    """Bar every case's actors from labelling any case, not only their own."""
+    actors = corpus_actors(cases)
+    for case in cases.values():
+        require(not actors & case.labelers, "an actor cannot adjudicate")
+
+
 def check_corpus(corpus: object) -> Corpus:
     closed(corpus, CORPUS_FIELDS)
     doc: dict = corpus  # type: ignore[assignment]
@@ -1063,6 +1079,7 @@ def check_corpus(corpus: object) -> Corpus:
     check_discoveries(doc, cases)
     check_cross_case_leakage(doc, cases)
     check_clusters(doc, cases)
+    check_independence(cases)
 
     inputs = [c.input for c in cases.values()]
     require(len(set(inputs)) == len(inputs), "two cases with one review input")
@@ -1744,7 +1761,7 @@ def check_run(
             finding["labels"],
             MATCH_VERDICTS,
             frozen=frozen,
-            barred=barred | case.actors,
+            barred=barred | corpus.actors,
             match=case.defects,
             since=case.cutoff.date(),
         )

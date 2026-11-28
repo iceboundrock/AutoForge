@@ -1095,6 +1095,31 @@ def test_adjudication_independence_and_arbiter_constraints(syn_corpus, syn_subs)
     assert rc.settle(unvoted_arb) == ("match", "alpha-d1")
 
 
+def test_an_actor_of_any_case_cannot_adjudicate_another(syn_corpus, syn_subs):
+    # An actor of another thread's case votes on alpha-defect's defect
+    other_thread = deepcopy(syn_corpus)
+    other_thread["cases"]["alpha-defect"]["defects"]["alpha-d1"]["labels"].append(
+        _label("reviewer-beta", "confirmed", decided="2026-06-21")
+    )
+    with pytest.raises(rc.CorpusError, match="an actor cannot adjudicate"):
+        rc.check_corpus(other_thread)
+
+    # A later round of the same thread: its own actor settles an earlier round's negative
+    later_round = deepcopy(syn_corpus)
+    later_round["cases"]["alpha-negative"]["actors"].append("late-fixer")
+    later_round["cases"]["alpha-defect"]["defects"]["alpha-d1"]["labels"].append(
+        _label("late-fixer", "confirmed", decided="2026-06-21")
+    )
+    with pytest.raises(rc.CorpusError, match="an actor cannot adjudicate"):
+        rc.check_corpus(later_round)
+
+    # An actor of another case cannot match a run's finding either
+    subs = deepcopy(syn_subs)
+    subs["runs"][0]["findings"][0]["labels"][0]["by"] = "reviewer-gamma"
+    with pytest.raises(rc.CorpusError, match="an actor cannot adjudicate"):
+        rc.check_submissions(rc.check_corpus(syn_corpus), subs)
+
+
 def test_rejected_defect_excluded_from_exposure_and_refuted_negative_unrunnable(syn_corpus):
     # NEW-8a: gamma-revert has gamma-d2 (rejected, 2026-04-02) and gamma-d1 (confirmed, 2026-04-10).
     # Moving gamma-d1/d3 to 2026-04-20 means rejected gamma-d2 must NOT pull Case.public earlier.
