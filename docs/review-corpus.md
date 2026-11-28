@@ -14,7 +14,7 @@ A corpus JSON file pins repository metadata, frozen ref tips, declared validatio
 - **Topologies & Provenance (`provenance` + `review`):**
   - `pr_branch`: a review round (`issue >= 1`, `round >= 1`) on a PR branch. `review` pins `base_ref`, `base_tip`, `merge_base`, `head`, `base_tree`, `merge_base_tree`, `head_tree`, and UTC `cutoff`. `base_evidence` is `"recorded"` (evidenced review-time boundary) or `"provisional"` (derived from git committer times; never runnable).
   - `squash`: a one-parent squash commit on `base_ref` (`pr >= 1`, `round: null`, `base_evidence: "squash_parent"`, `base_tip == merge_base`, `merge_commit in (null, head)`).
-  - `merge_pr`: a two-parent merge commit on `base_ref` (`pr >= 1`, `round: null`, `base_evidence: "merge_parent"`, `merge_commit` non-null with parents `(base_tip, head)`).
+  - `merge_pr`: a two-parent merge commit on `base_ref` (`pr >= 1`, `round: null`, `base_evidence: "merge_parent"`, `merge_commit` non-null with parents `(base_tip, head)`). Every defect of a `merge_pr` case is located by its lines, and `verify` requires each located block of the head to appear exactly once in the merge commit's own tree: parent topology alone does not show that a conflict resolution kept the defect, so a defect the merge resolved away never counts as landed with the PR, even when a later commit reintroduces the lines a still-later fix changes.
   - `synthetic`: stand-in hashes for offline arithmetic tests (`mode: "synthetic"`, `base_evidence: "synthetic"`).
 - **Strata:**
   - `reviewed_defect`: candidate reviewed at a round holding at least one `same_review` or `later_review` defect.

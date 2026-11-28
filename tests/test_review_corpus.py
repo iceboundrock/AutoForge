@@ -581,6 +581,105 @@ def test_cross_case_future_round_sha_leakage_refused(tmp_path):
 # -- C. Batched read-only Git verification ------------------------------------
 
 
+def _merge_pr_case(
+    h: dict,
+    *,
+    pr: int,
+    issue: int,
+    base_tip: str,
+    merge_base: str,
+    head: str,
+    merge_commit: str,
+    cutoff: str,
+    opened: str,
+    defect: tuple[str, str, str, str, str],
+    decided: str,
+    withheld: list[str],
+) -> dict:
+    """A merge_pr case whose one defect, at line 2 of ``path``, a later commit fixes."""
+    key, path, source, discovered, fix = defect
+    tree, blob = h["tree"], h["blob"]
+    return {
+        "stratum": "revert" if source == "revert" else "escape",
+        "cluster": f"cl-pr{pr}",
+        "provenance": {
+            "source": "merge_pr",
+            "issue": issue,
+            "pr": pr,
+            "round": None,
+            "base_evidence": "merge_parent",
+            "merge_commit": merge_commit,
+            "selection": "test",
+            "note": "",
+        },
+        "review": {
+            "base_ref": "main",
+            "base_tip": base_tip,
+            "merge_base": merge_base,
+            "head": head,
+            "base_tree": tree(base_tip),
+            "merge_base_tree": tree(merge_base),
+            "head_tree": tree(head),
+            "cutoff": cutoff,
+        },
+        "environment": {
+            "files": {
+                "pyproject.toml": blob(head, "pyproject.toml"),
+                "uv.lock": blob(head, "uv.lock"),
+            },
+            "validation_scope": "full",
+            "validation": ["make check"],
+        },
+        "context": {
+            "inventory": {
+                "status": "complete",
+                "taken": cutoff[:11] + "01:00:00Z",
+                "artifact": "inv",
+                "edit_history_verified": True,
+                "sources": [f"issue/{issue}", f"pr/{pr}"],
+            },
+            "items": [
+                _item(
+                    "issue",
+                    "issue",
+                    f"issue/{issue}",
+                    f"Add {path}.",
+                    observed_at=f"{opened}T00:00:00Z",
+                ),
+                _item(
+                    "pr-body", "pr_body", f"pr/{pr}", f"PR {pr}.", observed_at=f"{opened}T02:00:00Z"
+                ),
+            ],
+        },
+        "actors": ["producer", "reviewer", "fixer"],
+        "risk": {"stratum": "routine", "rationale": "test"},
+        "exposure": {"possible_from": opened, "public_by": None, "artifact": "git"},
+        "defects": {
+            key: {
+                "severity": "high",
+                "class": "reliability",
+                "introduced": head,
+                "summary": f"bad {path}",
+                "location": [{"path": path, "lines": [2, 2]}],
+                "discovery": {
+                    "source": source,
+                    "round": None,
+                    "finding": None,
+                    "discovered": discovered,
+                    "fix": fix,
+                    "merged": None,
+                    "evidence_status": "recorded",
+                    "artifact": f"{source} commit",
+                },
+                "labels": [_label("adj1", "confirmed", decided=decided)],
+            }
+        },
+        "negative": None,
+        "withheld": withheld,
+        "post_cutoff_refs": [],
+    }
+
+
 def test_verify_all_three_topologies_and_post_merge_lineage(tmp_path):
     h = _make_hist_repo(tmp_path)
     c = _hist_branch_corpus(h)
@@ -668,84 +767,100 @@ def test_verify_all_three_topologies_and_post_merge_lineage(tmp_path):
     }
 
     # Add 2-parent merge_pr case (PR #3) with revert defect fixed at revert3
-    c["cases"]["pr3-merge"] = {
-        "stratum": "revert",
-        "cluster": "cl-pr3",
-        "provenance": {
-            "source": "merge_pr",
-            "issue": 10,
-            "pr": 3,
-            "round": None,
-            "base_evidence": "merge_parent",
-            "merge_commit": h["merge3"],
-            "selection": "test",
-            "note": "",
-        },
-        "review": {
-            "base_ref": "main",
-            "base_tip": h["pr3_base"],
-            "merge_base": h["post_fix2"],
-            "head": h["pr3_head"],
-            "base_tree": tree(h["pr3_base"]),
-            "merge_base_tree": tree(h["post_fix2"]),
-            "head_tree": tree(h["pr3_head"]),
-            "cutoff": "2026-01-11T00:00:00Z",
-        },
-        "environment": {
-            "files": {
-                "pyproject.toml": blob(h["pr3_head"], "pyproject.toml"),
-                "uv.lock": blob(h["pr3_head"], "uv.lock"),
-            },
-            "validation_scope": "full",
-            "validation": ["make check"],
-        },
-        "context": {
-            "inventory": {
-                "status": "complete",
-                "taken": "2026-01-11T01:00:00Z",
-                "artifact": "inv",
-                "edit_history_verified": True,
-                "sources": ["issue/10", "pr/3"],
-            },
-            "items": [
-                _item(
-                    "issue", "issue", "issue/10", "Add b.py.", observed_at="2026-01-10T00:00:00Z"
-                ),
-                _item("pr-body", "pr_body", "pr/3", "PR 3.", observed_at="2026-01-10T02:00:00Z"),
-            ],
-        },
-        "actors": ["producer", "reviewer", "fixer"],
-        "risk": {"stratum": "routine", "rationale": "test"},
-        "exposure": {"possible_from": "2026-01-10", "public_by": None, "artifact": "git"},
-        "defects": {
-            "d-m3-1": {
-                "severity": "high",
-                "class": "reliability",
-                "introduced": h["pr3_head"],
-                "summary": "bad b.py",
-                "location": [{"path": "src/b.py", "lines": [2, 2]}],
-                "discovery": {
-                    "source": "revert",
-                    "round": None,
-                    "finding": None,
-                    "discovered": "2026-01-12",
-                    "fix": h["revert3"],
-                    "merged": None,
-                    "evidence_status": "recorded",
-                    "artifact": "revert commit",
-                },
-                "labels": [_label("adj1", "confirmed", decided="2026-01-15")],
-            }
-        },
-        "negative": None,
-        "withheld": [h["revert3"]],
-        "post_cutoff_refs": [],
-    }
+    c["cases"]["pr3-merge"] = _merge_pr_case(
+        h,
+        pr=3,
+        issue=10,
+        base_tip=h["pr3_base"],
+        merge_base=h["post_fix2"],
+        head=h["pr3_head"],
+        merge_commit=h["merge3"],
+        cutoff="2026-01-11T00:00:00Z",
+        opened="2026-01-10",
+        defect=("d-m3-1", "src/b.py", "revert", "2026-01-12", h["revert3"]),
+        decided="2026-01-15",
+        withheld=[h["revert3"]],
+    )
 
     res = rc.verify(c, h["repo"])
     assert res["ok"] is True
     assert all(v["ok"] for v in res["cases"].values())
     assert rc.score(c, _subs_for(c), h["repo"])["verified"]["ok"] is True
+
+
+def test_verify_refuses_a_merge_pr_defect_its_merge_resolved_away(tmp_path):
+    """A conflict resolution that drops the defect leaves nothing that landed with the PR.
+
+    PR #4's head adds ``bad = 2``; the base adds ``good = 2`` at the same place,
+    and the merge resolves the conflict to the base's side. A later commit
+    reintroduces ``bad = 2`` and a still-later one fixes it, so the fix
+    changes the head's lines; only the merge's own tree shows the defect never
+    landed with the PR.
+    """
+    h = _make_hist_repo(tmp_path)
+    repo = h["repo"]
+    fork = h["revert3"]
+    _git(repo, "checkout", "-b", "pr4", fork)
+    (repo / "src/c.py").write_text("ok = 1\nbad = 2\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: pr4 head", dt="2026-01-13T01:00:00Z")
+    pr4_head = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "checkout", "main")
+    (repo / "src/c.py").write_text("ok = 1\ngood = 2\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: c.py on main", dt="2026-01-13T02:00:00Z")
+    pr4_base = _git(repo, "rev-parse", "HEAD")
+
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-X",
+        "ours",
+        "-m",
+        "Merge pull request #4",
+        "pr4",
+        dt="2026-01-14T00:00:00Z",
+    )
+    merge4 = _git(repo, "rev-parse", "HEAD")
+    assert (repo / "src/c.py").read_text(encoding="utf-8") == "ok = 1\ngood = 2\n"
+
+    (repo / "src/c.py").write_text("ok = 1\nbad = 2\n", encoding="utf-8")
+    _git(repo, "commit", "-am", "reintroduce bad", dt="2026-01-15T00:00:00Z")
+    reintroduced = _git(repo, "rev-parse", "HEAD")
+    (repo / "src/c.py").write_text("ok = 1\nfixed = 2\n", encoding="utf-8")
+    _git(repo, "commit", "-am", "fix: bad", dt="2026-01-16T00:00:00Z")
+    fix4 = _git(repo, "rev-parse", "HEAD")
+
+    c = _hist_branch_corpus(h)
+    c["repository"]["refs"]["main"] = fix4
+    c["cases"]["pr4-merge"] = _merge_pr_case(
+        h,
+        pr=4,
+        issue=40,
+        base_tip=pr4_base,
+        merge_base=fork,
+        head=pr4_head,
+        merge_commit=merge4,
+        cutoff="2026-01-14T00:00:00Z",
+        opened="2026-01-13",
+        defect=("d-m4-1", "src/c.py", "post_merge", "2026-01-16", fix4),
+        decided="2026-01-20",
+        withheld=[reintroduced, fix4],
+    )
+    rc.check_corpus(c)
+
+    res = rc.verify(c, h["repo"])
+    assert res["ok"] is False
+    assert res["cases"]["pr4-merge"]["failed"] == ["defect d-m4-1 survives its merge"]
+    assert res["cases"]["pr2-r1"]["ok"] is True
+
+    # A whole-file location names no block whose survival the merge tree could show.
+    whole = deepcopy(c)
+    whole["cases"]["pr4-merge"]["defects"]["d-m4-1"]["location"][0]["lines"] = None
+    with pytest.raises(rc.CorpusError, match="a merge_pr defect is located by its lines"):
+        rc.check_corpus(whole)
 
 
 def test_verify_refuses_tampered_git_pins_and_bad_lineage(tmp_path):

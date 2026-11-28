@@ -585,6 +585,11 @@ def check_defect(
     if found["fix"] is not None:
         fix = object_id(found["fix"])
         require(fix in withheld, "a fix is withheld from the reviewer")
+    if origin["source"] == "merge_pr":
+        require(
+            all(place["lines"] is not None for place in d["location"]),
+            "a merge_pr defect is located by its lines",
+        )
     if found["merged"] is not None:
         merged = object_id(found["merged"])
         require(
@@ -1512,6 +1517,20 @@ def verify_case(git: Git, case: dict, repository: dict) -> list[str]:
         introduced_stamps.append(intro_obj.committed)
         check(git.is_ancestor(introduced, head), f"defect {key} introduced in head")
         check(git.is_ancestor(introduced, base) is False, f"defect {key} above the merge base")
+        if source == "merge_pr":
+            # Parent topology does not prove a conflict resolution kept the
+            # head's lines: the defect landed with the PR only if the merge's
+            # own tree still holds each located block exactly once.
+            check(
+                all(
+                    found_once(
+                        git.file_lines(origin["merge_commit"], place["path"]),
+                        located(git, head, place) or [],
+                    )
+                    for place in defect["location"]
+                ),
+                f"defect {key} survives its merge",
+            )
 
         fix, merged = defect["discovery"]["fix"], defect["discovery"]["merged"]
         if fix is not None:
