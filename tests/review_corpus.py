@@ -261,6 +261,15 @@ def source_kind(source: object) -> tuple[str, str | None, int | None]:
 LABEL_FIELDS = "by role verdict decided artifact"
 
 
+def canonical_identity(value: str) -> str:
+    """Canonical key for an actor, variant, or adjudicator identity.
+
+    GitHub logins are case-insensitive; strip surrounding whitespace and
+    casefold so mixed-case aliases compare equal everywhere.
+    """
+    return value.strip().casefold()
+
+
 def counted(label: dict, role: str) -> bool:
     return label["role"] == role and label["verdict"] != "unknown"
 
@@ -288,7 +297,7 @@ def check_labels(
         decided = day(label["decided"])
         require(decided <= frozen, "label decided after the freeze")
         require(since is None or since <= decided, "label decided before its case's cutoff")
-        who = label["by"].strip()
+        who = canonical_identity(label["by"])
         require(who not in barred, "an actor cannot adjudicate")
         require(who not in seen, "one label per identity")
         seen.add(who)
@@ -311,6 +320,11 @@ def settle(labels: Sequence[dict], need: Callable[[object], int] = lambda _: 1):
     agree, and the chosen verdict must have at least ``max(1, need(verdict))``
     adjudicator votes (preventing unvoted or single-vote critical outcomes).
     """
+    seen: set[str] = set()
+    for label in labels:
+        who = canonical_identity(label["by"])
+        require(who not in seen, "one label per identity")
+        seen.add(who)
     votes = Counter(verdict_of(label) for label in labels if counted(label, "adjudicator"))
     arbiters = {verdict_of(label) for label in labels if counted(label, "arbiter")}
     if arbiters:
@@ -726,7 +740,7 @@ def check_case(
         isinstance(actors, list) and actors and all(nonempty(a) for a in actors),
         "historical actors",
     )
-    barred = frozenset(a.strip() for a in actors)
+    barred = frozenset(canonical_identity(a) for a in actors)
     require(len(barred) == len(actors), "historical actor repeated")
 
     risk = case["risk"]
@@ -842,7 +856,7 @@ def check_case(
         round=origin["round"],
         cutoff=cutoff,
         actors=barred,
-        labelers=frozenset(lbl["by"].strip() for lbl in all_labels),
+        labelers=frozenset(canonical_identity(lbl["by"]) for lbl in all_labels),
         defects=defects,
         negative=negative,
         runnable=runnable,
@@ -1698,7 +1712,7 @@ def check_variant(name: object, variant: object) -> str:
     relative_path(v["prompt"]["template"])
     digest64(v["prompt"]["sha256"], "prompt digest")
     object_id(v["controller"])
-    return v["identity"].strip()
+    return canonical_identity(v["identity"])
 
 
 def finding_verdict(finding: dict, case: Case) -> tuple[str, str, str | None]:
@@ -1802,7 +1816,7 @@ def check_submissions(corpus: Corpus, submissions: object) -> list[Run]:
     require(len(set(identities)) == len(identities), "variant identity repeated")
     require(sub["baseline"] in variants, "the baseline is a registered variant")
     require(isinstance(sub["runs"], list), "runs")
-    barred = frozenset(identities)
+    barred = frozenset(identities) | frozenset(canonical_identity(name) for name in variants)
     for case in corpus.cases.values():
         require(not barred & case.labelers, "a reviewer variant cannot label the corpus")
     pins = {name: pins_digest(variant) for name, variant in variants.items()}

@@ -1120,6 +1120,89 @@ def test_an_actor_of_any_case_cannot_adjudicate_another(syn_corpus, syn_subs):
         rc.check_submissions(rc.check_corpus(syn_corpus), subs)
 
 
+def test_identities_are_canonicalized_case_insensitively(syn_corpus, syn_subs):
+    # Same-case actor mixed-case alias on a defect label and a negative label
+    same_defect = deepcopy(syn_corpus)
+    same_defect["cases"]["alpha-defect"]["defects"]["alpha-d1"]["labels"].append(
+        _label("Producer-Alpha", "confirmed", decided="2026-06-21")
+    )
+    with pytest.raises(rc.CorpusError, match="an actor cannot adjudicate"):
+        rc.check_corpus(same_defect)
+
+    same_negative = deepcopy(syn_corpus)
+    same_negative["cases"]["alpha-negative"]["negative"]["labels"].append(
+        _label("PRODUCER-ALPHA", "clean", decided="2026-06-21")
+    )
+    with pytest.raises(rc.CorpusError, match="an actor cannot adjudicate"):
+        rc.check_corpus(same_negative)
+
+    # Cross-case actor mixed-case alias on a defect label and a finding-match label
+    cross_defect = deepcopy(syn_corpus)
+    cross_defect["cases"]["alpha-defect"]["defects"]["alpha-d1"]["labels"].append(
+        _label("Reviewer-Beta", "confirmed", decided="2026-06-21")
+    )
+    with pytest.raises(rc.CorpusError, match="an actor cannot adjudicate"):
+        rc.check_corpus(cross_defect)
+
+    cross_finding = deepcopy(syn_subs)
+    cross_finding["runs"][0]["findings"][0]["labels"][0]["by"] = "Reviewer-Gamma"
+    with pytest.raises(rc.CorpusError, match="an actor cannot adjudicate"):
+        rc.check_submissions(rc.check_corpus(syn_corpus), cross_finding)
+
+    # Duplicate actors differing only by case
+    dup_actor = deepcopy(syn_corpus)
+    dup_actor["cases"]["alpha-defect"]["actors"].append("Producer-Alpha")
+    with pytest.raises(rc.CorpusError, match="historical actor repeated"):
+        rc.check_corpus(dup_actor)
+
+    # Two critical votes from the same account with different casing (Alice / alice)
+    dup_critical_defect = deepcopy(syn_corpus)
+    dup_critical_defect["cases"]["alpha-defect"]["defects"]["alpha-d2"]["labels"] = [
+        _label("Alice", "confirmed", decided="2026-06-21"),
+        _label("alice", "confirmed", decided="2026-06-21"),
+    ]
+    with pytest.raises(rc.CorpusError, match="one label per identity"):
+        rc.check_corpus(dup_critical_defect)
+
+    dup_critical_match = deepcopy(syn_subs)
+    dup_critical_match["runs"][8]["findings"][0]["labels"] = [
+        _label("Alice", "match", defect="beta-d1", decided="2026-07-10", with_defect=True),
+        _label("alice", "match", defect="beta-d1", decided="2026-07-10", with_defect=True),
+    ]
+    with pytest.raises(rc.CorpusError, match="one label per identity"):
+        rc.check_submissions(rc.check_corpus(syn_corpus), dup_critical_match)
+
+    with pytest.raises(rc.CorpusError, match="one label per identity"):
+        rc.settle(
+            [_label("Alice", "confirmed"), _label("alice", "confirmed")],
+            rc.critical_needs_two("critical"),
+        )
+
+    # Variant identity and variant name mixed-case aliases on corpus and finding labels
+    for alias in ("Reviewer-Baseline", "Baseline"):
+        var_corpus = deepcopy(syn_corpus)
+        var_corpus["cases"]["alpha-defect"]["defects"]["alpha-d1"]["labels"].append(
+            _label(alias, "confirmed", decided="2026-06-21")
+        )
+        checked_var = rc.check_corpus(var_corpus)
+        subs_var = deepcopy(syn_subs)
+        subs_var["corpus"] = checked_var.digest
+        with pytest.raises(rc.CorpusError, match="variant cannot label the corpus"):
+            rc.check_submissions(checked_var, subs_var)
+
+        var_finding = deepcopy(syn_subs)
+        var_finding["runs"][0]["findings"][0]["labels"][0]["by"] = alias
+        with pytest.raises(rc.CorpusError, match="an actor cannot adjudicate"):
+            rc.check_submissions(rc.check_corpus(syn_corpus), var_finding)
+
+    # Two variants with identities differing only by case
+    dup_var = deepcopy(syn_subs)
+    dup_var["variants"]["baseline"]["identity"] = "Reviewer-Alpha"
+    dup_var["variants"]["variant-a"]["identity"] = "reviewer-alpha"
+    with pytest.raises(rc.CorpusError, match="variant identity repeated"):
+        rc.check_submissions(rc.check_corpus(syn_corpus), dup_var)
+
+
 def test_rejected_defect_excluded_from_exposure_and_refuted_negative_unrunnable(syn_corpus):
     # NEW-8a: gamma-revert has gamma-d2 (rejected, 2026-04-02) and gamma-d1 (confirmed, 2026-04-10).
     # Moving gamma-d1/d3 to 2026-04-20 means rejected gamma-d2 must NOT pull Case.public earlier.
