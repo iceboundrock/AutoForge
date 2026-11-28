@@ -440,6 +440,22 @@ def test_all_null_environment_files_leave_case_unrunnable(syn_corpus):
     assert checked.cases["alpha-defect"].runnable is False
 
 
+def test_unverified_edit_history_leaves_case_unrunnable(syn_corpus, tmp_path):
+    synthetic = deepcopy(syn_corpus)
+    assert rc.check_corpus(synthetic).cases["alpha-defect"].runnable is True
+    synthetic["cases"]["alpha-defect"]["context"]["inventory"]["edit_history_verified"] = False
+    checked = rc.check_corpus(synthetic)
+    assert checked.cases["alpha-defect"].runnable is False
+    assert "alpha-defect" in rc.describe(synthetic)["unplanned"]
+
+    # An otherwise runnable historical case is held to the same rule.
+    h = _make_hist_repo(tmp_path)
+    c = _hist_branch_corpus(h)
+    assert rc.check_corpus(c).cases["pr2-r1"].runnable is True
+    c["cases"]["pr2-r1"]["context"]["inventory"]["edit_history_verified"] = False
+    assert rc.check_corpus(c).cases["pr2-r1"].runnable is False
+
+
 # -- B. Reviewer-visible boundary & O(N) leakage ------------------------------
 
 

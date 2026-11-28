@@ -525,7 +525,9 @@ def check_context(context: object, *, origin: dict, cutoff: datetime, frozen: da
         all(item["source"] is not None for item in items) and set(listed) == sources,
         "the inventory lists exactly the context's sources",
     )
-    return captured
+    # A context whose edit history was not checked cannot show that the reviewer
+    # sees the text as it stood at the cutoff, so it never makes a case runnable.
+    return captured and inventory["edit_history_verified"]
 
 
 def check_defect(
