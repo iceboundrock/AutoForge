@@ -1104,7 +1104,7 @@ def test_an_actor_of_any_case_cannot_adjudicate_another(syn_corpus, syn_subs):
     with pytest.raises(rc.CorpusError, match="an actor cannot adjudicate"):
         rc.check_corpus(other_thread)
 
-    # A later round of the same thread: its own actor settles an earlier round's negative
+    # A later round of the same thread: its own actor settles an earlier round's defect
     later_round = deepcopy(syn_corpus)
     later_round["cases"]["alpha-negative"]["actors"].append("late-fixer")
     later_round["cases"]["alpha-defect"]["defects"]["alpha-d1"]["labels"].append(
